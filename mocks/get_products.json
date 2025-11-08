@@ -1,0 +1,33 @@
+{
+  "method": "GET",
+  "path": "/products",
+  "status": 200,
+  "response": {
+    "products": [
+      {
+        "id": 101,
+        "name": "Laptop Pro",
+        "price": 1299.99,
+        "category": "Electronics",
+        "inStock": true
+      },
+      {
+        "id": 102,
+        "name": "Wireless Mouse",
+        "price": 29.99,
+        "category": "Accessories",
+        "inStock": true
+      },
+      {
+        "id": 103,
+        "name": "USB-C Cable",
+        "price": 12.99,
+        "category": "Accessories",
+        "inStock": false
+      }
+    ],
+    "page": 1,
+    "totalPages": 1,
+    "totalItems": 3
+  }
+}
