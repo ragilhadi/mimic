@@ -1,21 +1,17 @@
 services:
   mimic:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: mimic:latest
     container_name: mimic
     ports:
-      - "8033:8033"
+      - "${PORT:-8080}:${PORT:-8080}"
     volumes:
       - ./mocks:/app/mocks:ro
     environment:
-      - MOCKS_DIR=/app/mocks
-      - PORT=8033
-      - RUST_LOG=info
+      - PORT=${PORT:-8080}
+      - RUST_LOG=${RUST_LOG:-info}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8033/health"]
+      test: ["CMD", "sh", "-c", "wget -q --spider http://localhost:$${PORT:-8080}/health || exit 1"]
       interval: 30s
       timeout: 3s
       retries: 3
