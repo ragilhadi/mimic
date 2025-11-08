@@ -26,7 +26,7 @@ async fn main() {
 
     // Hardcoded mocks directory - Docker volume mount handles the path mapping
     const MOCKS_DIR: &str = "/app/mocks";
-    
+
     // Get port from environment variable
     let port = env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
@@ -59,11 +59,9 @@ async fn main() {
     info!("📋 Health check available at http://{}/health", addr);
 
     // Start server
-    axum::serve(listener, app)
-        .await
-        .unwrap_or_else(|e| {
-            panic!("Server error: {}", e);
-        });
+    axum::serve(listener, app).await.unwrap_or_else(|e| {
+        panic!("Server error: {}", e);
+    });
 }
 
 fn create_router(state: AppState) -> Router {
@@ -78,10 +76,9 @@ fn create_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,mimic=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mimic=debug"));
 
     tracing_subscriber::registry()
         .with(filter)

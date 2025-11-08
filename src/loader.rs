@@ -8,7 +8,6 @@ use tracing::{error, info, warn};
 #[cfg(test)]
 use serde_json::json;
 
-
 pub fn load_mocks(mocks_dir: &str) -> MockStore {
     let mut mocks = HashMap::new();
     let path = Path::new(mocks_dir);
@@ -49,7 +48,10 @@ pub fn load_mocks(mocks_dir: &str) -> MockStore {
                 let key = create_mock_key(&mock.method, &mock.path);
                 info!(
                     "Loaded mock: {} {} -> {} (from {:?})",
-                    mock.method, mock.path, mock.status, file_path.file_name()
+                    mock.method,
+                    mock.path,
+                    mock.status,
+                    file_path.file_name()
                 );
                 mocks.insert(key, mock);
                 loaded_count += 1;

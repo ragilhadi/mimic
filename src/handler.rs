@@ -7,18 +7,12 @@ use axum::{
 use serde_json::json;
 use tracing::{debug, info};
 
-
 #[derive(Clone)]
 pub struct AppState {
     pub mocks: MockStore,
 }
 
-
-pub async fn handle_request(
-    method: Method,
-    uri: Uri,
-    State(state): State<AppState>,
-) -> Response {
+pub async fn handle_request(method: Method, uri: Uri, State(state): State<AppState>) -> Response {
     let path = uri.path();
     let method_str = method.as_str();
 
@@ -30,10 +24,7 @@ pub async fn handle_request(
     // Try to find matching mock
     match state.mocks.get(&key) {
         Some(mock) => {
-            info!(
-                "Mock matched: {} {} -> {}",
-                method_str, path, mock.status
-            );
+            info!("Mock matched: {} {} -> {}", method_str, path, mock.status);
 
             // Convert status code
             let status = StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK);
@@ -57,7 +48,6 @@ pub async fn handle_request(
         }
     }
 }
-
 
 pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({

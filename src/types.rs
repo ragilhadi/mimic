@@ -10,7 +10,6 @@ pub struct MockConfig {
     pub response: serde_json::Value,
 }
 
-
 pub type MockStore = Arc<HashMap<String, MockConfig>>;
 
 pub fn create_mock_key(method: &str, path: &str) -> String {
@@ -25,7 +24,10 @@ mod tests {
     fn test_create_mock_key() {
         assert_eq!(create_mock_key("get", "/users"), "GET:/users");
         assert_eq!(create_mock_key("POST", "/login"), "POST:/login");
-        assert_eq!(create_mock_key("put", "/api/v1/products"), "PUT:/api/v1/products");
+        assert_eq!(
+            create_mock_key("put", "/api/v1/products"),
+            "PUT:/api/v1/products"
+        );
     }
 
     #[test]
