@@ -61,12 +61,10 @@ pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Val
 mod tests {
     use super::*;
     use crate::types::MockConfig;
-    use axum::body::Body;
-    use axum::http::{Method, Request};
+    use axum::http::Method;
     use http_body_util::BodyExt;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tower::ServiceExt;
 
     fn create_test_state() -> AppState {
         let mut mocks = HashMap::new();
