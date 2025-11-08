@@ -24,19 +24,21 @@ async fn main() {
 
     info!("🧩 Starting Mimic Mock API Server");
 
-    // Get configuration from environment variables
-    let mocks_dir = env::var("MOCKS_DIR").unwrap_or_else(|_| "/app/mocks".to_string());
+    // Hardcoded mocks directory - Docker volume mount handles the path mapping
+    const MOCKS_DIR: &str = "/app/mocks";
+    
+    // Get port from environment variable
     let port = env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
         .unwrap_or(8080);
 
     info!("Configuration:");
-    info!("  Mocks directory: {}", mocks_dir);
+    info!("  Mocks directory: {}", MOCKS_DIR);
     info!("  Port: {}", port);
 
     // Load mock configurations
-    let mocks = load_mocks(&mocks_dir);
+    let mocks = load_mocks(MOCKS_DIR);
     info!("Loaded {} mock(s)", mocks.len());
 
     // Create application state

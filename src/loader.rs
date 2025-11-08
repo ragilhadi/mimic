@@ -5,6 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+#[cfg(test)]
+use serde_json::json;
+
 
 pub fn load_mocks(mocks_dir: &str) -> MockStore {
     let mut mocks = HashMap::new();
@@ -85,10 +88,6 @@ fn load_single_mock(file_path: &Path) -> Result<MockConfig, Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Note: Tests requiring tempfile are commented out
-    // To enable, add to Cargo.toml: tempfile = "3"
-    
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
@@ -156,5 +155,128 @@ mod tests {
     fn test_load_mocks_nonexistent_directory() {
         let store = load_mocks("/nonexistent/path");
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_load_mocks_invalid_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let mocks_path = temp_dir.path().to_str().unwrap();
+
+        // Create invalid JSON file
+        let mut invalid_file = File::create(temp_dir.path().join("invalid.json")).unwrap();
+        invalid_file.write_all(b"{ invalid json }").unwrap();
+
+        // Should handle error gracefully
+        let store = load_mocks(mocks_path);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_load_mocks_empty_method() {
+        let temp_dir = TempDir::new().unwrap();
+        let mocks_path = temp_dir.path().to_str().unwrap();
+
+        let mock = r#"{
+            "method": "",
+            "path": "/test",
+            "status": 200,
+            "response": {}
+        }"#;
+
+        let mut file = File::create(temp_dir.path().join("empty_method.json")).unwrap();
+        file.write_all(mock.as_bytes()).unwrap();
+
+        let store = load_mocks(mocks_path);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_load_mocks_empty_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let mocks_path = temp_dir.path().to_str().unwrap();
+
+        let mock = r#"{
+            "method": "GET",
+            "path": "",
+            "status": 200,
+            "response": {}
+        }"#;
+
+        let mut file = File::create(temp_dir.path().join("empty_path.json")).unwrap();
+        file.write_all(mock.as_bytes()).unwrap();
+
+        let store = load_mocks(mocks_path);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_load_mocks_multiple_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let mocks_path = temp_dir.path().to_str().unwrap();
+
+        // Create multiple valid mock files
+        for i in 1..=5 {
+            let mock = format!(
+                r#"{{
+                    "method": "GET",
+                    "path": "/api/v{}",
+                    "status": 200,
+                    "response": {{"version": {}}}
+                }}"#,
+                i, i
+            );
+            let mut file = File::create(temp_dir.path().join(format!("mock{}.json", i))).unwrap();
+            file.write_all(mock.as_bytes()).unwrap();
+        }
+
+        let store = load_mocks(mocks_path);
+        assert_eq!(store.len(), 5);
+    }
+
+    #[test]
+    fn test_load_mocks_file_not_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("not_a_dir.txt");
+        File::create(&file_path).unwrap();
+
+        let store = load_mocks(file_path.to_str().unwrap());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_load_single_mock_valid() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.json");
+
+        let mock = r#"{
+            "method": "POST",
+            "path": "/api/test",
+            "status": 201,
+            "response": {"success": true}
+        }"#;
+
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(mock.as_bytes()).unwrap();
+
+        let result = load_single_mock(&file_path);
+        assert!(result.is_ok());
+
+        let mock_config = result.unwrap();
+        assert_eq!(mock_config.method, "POST");
+        assert_eq!(mock_config.path, "/api/test");
+        assert_eq!(mock_config.status, 201);
+    }
+
+    #[test]
+    fn test_create_mock_key_from_config() {
+        let mock = MockConfig {
+            method: "PUT".to_string(),
+            path: "/api/users/1".to_string(),
+            status: 200,
+            response: json!({}),
+        };
+
+        let key = create_mock_key(&mock.method, &mock.path);
+        assert_eq!(key, "PUT:/api/users/1");
     }
 }
