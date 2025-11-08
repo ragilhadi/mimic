@@ -115,12 +115,12 @@ docker-build:
 
 docker-compose-up:
 	@echo "Starting with docker-compose..."
-	docker-compose up -d
+	docker compose up -d
 	@echo "Container running. Check with: docker-compose ps"
 
 docker-compose-down:
 	@echo "Stopping docker-compose services..."
-	docker-compose down
+	docker compose down
 
 docker-run: docker-build
 	@echo "Running Docker container..."
