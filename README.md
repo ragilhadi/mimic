@@ -13,8 +13,10 @@
 - 📁 **File-Based Configuration** - Define mocks in simple JSON files
 - 🔄 **Hot Reload** - Changes to mock files are reflected immediately
 - 🐳 **Docker Ready** - Pre-built images available on Docker Hub
-- ✅ **Well Tested** - 35+ unit tests with 90% code coverage
+- ✅ **Well Tested** - 44+ unit tests with high code coverage
 - 🔧 **Easy to Use** - Simple configuration, no complex setup
+- ⚙️ **Configurable Body Consumption** - Control request body handling per endpoint
+- 📤 **File Upload Support** - Handle multipart/form-data with `consume_body` option
 
 ---
 
@@ -139,6 +141,9 @@ Mimic reads mock definitions from JSON files in the `/app/mocks` directory (or `
 - `path` - URL path (e.g., `/users`, `/api/v1/products`)
 - `status` - HTTP status code (200, 201, 404, 500, etc.)
 - `response` - JSON response body (can be object, array, or null)
+- `consume_body` - (Optional) Boolean to control request body consumption (default: `false`)
+  - `true` - Consume request body (required for file uploads, multipart/form-data)
+  - `false` - Skip body consumption (faster, default behavior)
 
 ---
 
@@ -244,6 +249,45 @@ curl http://localhost:8080/error
 ```bash
 curl -X DELETE http://localhost:8080/users/123
 ```
+
+### Example 5: File Upload with consume_body
+
+**File**: `mocks/ocr_image.json`
+
+```json
+{
+  "method": "POST",
+  "path": "/ocr-image",
+  "status": 200,
+  "consume_body": true,
+  "response": {
+    "status": "SUCCESS",
+    "text": "Extracted text from image",
+    "confidence": 0.95,
+    "detected_text": [
+      {
+        "text": "Hello World",
+        "bbox": [10, 20, 100, 40]
+      }
+    ]
+  }
+}
+```
+
+**Usage:**
+```bash
+# Upload image file
+curl -X POST http://localhost:8080/ocr-image \
+  -F "image=@document.jpg" \
+  -F "language=en"
+```
+
+**Note:** Set `consume_body: true` for endpoints that handle:
+- File uploads (images, documents, etc.)
+- Multipart/form-data requests
+- Large request payloads
+
+Without `consume_body: true`, clients may encounter "Broken Pipe" errors when sending large files.
 
 ---
 
@@ -434,6 +478,67 @@ Use this endpoint for:
 - Kubernetes liveness/readiness probes
 - Load balancer health checks
 - Monitoring systems
+
+---
+
+## ⚙️ Request Body Consumption
+
+Mimic supports configurable request body consumption per endpoint via the `consume_body` field.
+
+### Default Behavior
+
+**By default, `consume_body` is `false`** (fast performance):
+- Mimic responds immediately without reading the request body
+- Optimal for endpoints that don't need the body
+- Best performance and lowest memory usage
+
+### When to Use consume_body: true
+
+Set `consume_body: true` for endpoints that handle:
+
+1. **File Uploads**
+   ```json
+   {
+     "method": "POST",
+     "path": "/upload-document",
+     "status": 200,
+     "consume_body": true,
+     "response": {"uploaded": true}
+   }
+   ```
+
+2. **Multipart/Form-Data**
+   ```json
+   {
+     "method": "POST",
+     "path": "/ocr-image",
+     "status": 200,
+     "consume_body": true,
+     "response": {"text": "extracted text"}
+   }
+   ```
+
+3. **Large Payloads**
+   - Prevents "Broken Pipe" errors
+   - Required when clients send large request bodies
+   - Critical for image/document processing endpoints
+
+### Performance Comparison
+
+| consume_body | Speed | Memory | Use Case |
+|--------------|-------|--------|----------|
+| `false` (default) | ⚡ Fastest | Minimal | No body expected |
+| `true` | Standard | Temporary spike | File uploads, large payloads |
+
+**Example:**
+```bash
+# Works with consume_body: true
+curl -X POST http://localhost:8080/ocr-image \
+  -F "image=@large-document.jpg"
+
+# Works with consume_body: false (default)
+curl -X POST http://localhost:8080/trigger-job
+```
 
 ---
 

@@ -1,284 +1,246 @@
-use crate::types::{create_mock_key, MockConfig, MockStore};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info, warn};
 
-#[cfg(test)]
-use serde_json::json;
-
-pub fn load_mocks(mocks_dir: &str) -> MockStore {
-    let mut mocks = HashMap::new();
-    let path = Path::new(mocks_dir);
-
-    if !path.exists() {
-        error!("Mocks directory does not exist: {}", mocks_dir);
-        return Arc::new(mocks);
-    }
-
-    if !path.is_dir() {
-        error!("Mocks path is not a directory: {}", mocks_dir);
-        return Arc::new(mocks);
-    }
-
-    info!("Loading mocks from directory: {}", mocks_dir);
-
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(e) => {
-            error!("Failed to read mocks directory: {}", e);
-            return Arc::new(mocks);
-        }
-    };
-
-    let mut loaded_count = 0;
-    let mut error_count = 0;
-
-    for entry in entries.flatten() {
-        let file_path = entry.path();
-
-        // Only process .json files
-        if file_path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-
-        match load_single_mock(&file_path) {
-            Ok(mock) => {
-                let key = create_mock_key(&mock.method, &mock.path);
-                info!(
-                    "Loaded mock: {} {} -> {} (from {:?})",
-                    mock.method,
-                    mock.path,
-                    mock.status,
-                    file_path.file_name()
-                );
-                mocks.insert(key, mock);
-                loaded_count += 1;
-            }
-            Err(e) => {
-                warn!("Failed to load mock from {:?}: {}", file_path, e);
-                error_count += 1;
-            }
-        }
-    }
-
-    info!(
-        "Mock loading complete: {} loaded, {} errors",
-        loaded_count, error_count
-    );
-
-    Arc::new(mocks)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockConfig {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub response: serde_json::Value,
+    #[serde(default = "default_consume_body")]
+    pub consume_body: bool,
 }
 
-fn load_single_mock(file_path: &Path) -> Result<MockConfig, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(file_path)?;
-    let mock: MockConfig = serde_json::from_str(&content)?;
+fn default_consume_body() -> bool {
+    false
+}
 
-    // Validate required fields
-    if mock.method.is_empty() {
-        return Err("Mock method cannot be empty".into());
-    }
+pub type MockStore = Arc<HashMap<String, MockConfig>>;
 
-    if mock.path.is_empty() {
-        return Err("Mock path cannot be empty".into());
-    }
-
-    Ok(mock)
+pub fn create_mock_key(method: &str, path: &str) -> String {
+    format!("{}:{}", method.to_uppercase(), path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
-    use tempfile::TempDir;
-    #[test]
-    fn test_load_mocks_from_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let mocks_path = temp_dir.path().to_str().unwrap();
 
-        // Create test mock files
-        let mock1 = r#"{
+    #[test]
+    fn test_create_mock_key() {
+        assert_eq!(create_mock_key("get", "/users"), "GET:/users");
+        assert_eq!(create_mock_key("POST", "/login"), "POST:/login");
+        assert_eq!(
+            create_mock_key("put", "/api/v1/products"),
+            "PUT:/api/v1/products"
+        );
+    }
+
+    #[test]
+    fn test_create_mock_key_lowercase_conversion() {
+        assert_eq!(create_mock_key("get", "/test"), "GET:/test");
+        assert_eq!(create_mock_key("post", "/test"), "POST:/test");
+        assert_eq!(create_mock_key("delete", "/test"), "DELETE:/test");
+        assert_eq!(create_mock_key("patch", "/test"), "PATCH:/test");
+    }
+
+    #[test]
+    fn test_create_mock_key_with_query_params() {
+        assert_eq!(
+            create_mock_key("GET", "/users?page=1&limit=10"),
+            "GET:/users?page=1&limit=10"
+        );
+    }
+
+    #[test]
+    fn test_create_mock_key_with_special_chars() {
+        assert_eq!(create_mock_key("GET", "/users/123"), "GET:/users/123");
+        assert_eq!(create_mock_key("GET", "/api/v1/users"), "GET:/api/v1/users");
+        assert_eq!(create_mock_key("GET", "/users-list"), "GET:/users-list");
+    }
+
+    #[test]
+    fn test_mock_config_serialization() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/test",
+            "status": 200,
+            "response": {"message": "success"}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "GET");
+        assert_eq!(config.path, "/test");
+        assert_eq!(config.status, 200);
+    }
+
+    #[test]
+    fn test_mock_config_deserialization() {
+        let config = MockConfig {
+            method: "POST".to_string(),
+            path: "/api/users".to_string(),
+            status: 201,
+            response: serde_json::json!({"id": 1, "name": "Alice"}),
+            consume_body: true,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: MockConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.method, "POST");
+        assert_eq!(deserialized.path, "/api/users");
+        assert_eq!(deserialized.status, 201);
+        assert_eq!(deserialized.response["id"], 1);
+    }
+
+    #[test]
+    fn test_mock_config_with_null_response() {
+        let json = r#"{
+            "method": "DELETE",
+            "path": "/users/1",
+            "status": 204,
+            "response": null
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "DELETE");
+        assert_eq!(config.status, 204);
+        assert!(config.response.is_null());
+    }
+
+    #[test]
+    fn test_mock_config_with_array_response() {
+        let json = r#"{
             "method": "GET",
             "path": "/users",
             "status": 200,
-            "response": {"users": []}
+            "response": [{"id": 1}, {"id": 2}]
         }"#;
 
-        let mock2 = r#"{
-            "method": "POST",
-            "path": "/login",
-            "status": 201,
-            "response": {"token": "abc123"}
-        }"#;
-
-        let mut file1 = File::create(temp_dir.path().join("get_users.json")).unwrap();
-        file1.write_all(mock1.as_bytes()).unwrap();
-
-        let mut file2 = File::create(temp_dir.path().join("post_login.json")).unwrap();
-        file2.write_all(mock2.as_bytes()).unwrap();
-
-        // Load mocks
-        let store = load_mocks(mocks_path);
-
-        assert_eq!(store.len(), 2);
-        assert!(store.contains_key("GET:/users"));
-        assert!(store.contains_key("POST:/login"));
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert!(config.response.is_array());
+        assert_eq!(config.response.as_array().unwrap().len(), 2);
     }
 
     #[test]
-    fn test_load_mocks_ignores_non_json_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let mocks_path = temp_dir.path().to_str().unwrap();
-
-        let mock = r#"{
+    fn test_mock_config_with_nested_response() {
+        let json = r#"{
             "method": "GET",
-            "path": "/test",
+            "path": "/api/data",
             "status": 200,
-            "response": {}
+            "response": {
+                "data": {
+                    "user": {
+                        "id": 1,
+                        "profile": {
+                            "name": "Alice"
+                        }
+                    }
+                }
+            }
         }"#;
 
-        // Create JSON file
-        let mut json_file = File::create(temp_dir.path().join("test.json")).unwrap();
-        json_file.write_all(mock.as_bytes()).unwrap();
-
-        // Create non-JSON file
-        let mut txt_file = File::create(temp_dir.path().join("readme.txt")).unwrap();
-        txt_file.write_all(b"This should be ignored").unwrap();
-
-        let store = load_mocks(mocks_path);
-
-        assert_eq!(store.len(), 1);
-        assert!(store.contains_key("GET:/test"));
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.response["data"]["user"]["profile"]["name"], "Alice");
     }
 
     #[test]
-    fn test_load_mocks_nonexistent_directory() {
-        let store = load_mocks("/nonexistent/path");
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn test_load_mocks_invalid_json() {
-        let temp_dir = TempDir::new().unwrap();
-        let mocks_path = temp_dir.path().to_str().unwrap();
-
-        // Create invalid JSON file
-        let mut invalid_file = File::create(temp_dir.path().join("invalid.json")).unwrap();
-        invalid_file.write_all(b"{ invalid json }").unwrap();
-
-        // Should handle error gracefully
-        let store = load_mocks(mocks_path);
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn test_load_mocks_empty_method() {
-        let temp_dir = TempDir::new().unwrap();
-        let mocks_path = temp_dir.path().to_str().unwrap();
-
-        let mock = r#"{
-            "method": "",
-            "path": "/test",
-            "status": 200,
-            "response": {}
-        }"#;
-
-        let mut file = File::create(temp_dir.path().join("empty_method.json")).unwrap();
-        file.write_all(mock.as_bytes()).unwrap();
-
-        let store = load_mocks(mocks_path);
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn test_load_mocks_empty_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let mocks_path = temp_dir.path().to_str().unwrap();
-
-        let mock = r#"{
-            "method": "GET",
-            "path": "",
-            "status": 200,
-            "response": {}
-        }"#;
-
-        let mut file = File::create(temp_dir.path().join("empty_path.json")).unwrap();
-        file.write_all(mock.as_bytes()).unwrap();
-
-        let store = load_mocks(mocks_path);
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn test_load_mocks_multiple_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let mocks_path = temp_dir.path().to_str().unwrap();
-
-        // Create multiple valid mock files
-        for i in 1..=5 {
-            let mock = format!(
-                r#"{{
-                    "method": "GET",
-                    "path": "/api/v{}",
-                    "status": 200,
-                    "response": {{"version": {}}}
-                }}"#,
-                i, i
-            );
-            let mut file = File::create(temp_dir.path().join(format!("mock{}.json", i))).unwrap();
-            file.write_all(mock.as_bytes()).unwrap();
-        }
-
-        let store = load_mocks(mocks_path);
-        assert_eq!(store.len(), 5);
-    }
-
-    #[test]
-    fn test_load_mocks_file_not_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("not_a_dir.txt");
-        File::create(&file_path).unwrap();
-
-        let store = load_mocks(file_path.to_str().unwrap());
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn test_load_single_mock_valid() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test.json");
-
-        let mock = r#"{
-            "method": "POST",
-            "path": "/api/test",
-            "status": 201,
-            "response": {"success": true}
-        }"#;
-
-        let mut file = File::create(&file_path).unwrap();
-        file.write_all(mock.as_bytes()).unwrap();
-
-        let result = load_single_mock(&file_path);
-        assert!(result.is_ok());
-
-        let mock_config = result.unwrap();
-        assert_eq!(mock_config.method, "POST");
-        assert_eq!(mock_config.path, "/api/test");
-        assert_eq!(mock_config.status, 201);
-    }
-
-    #[test]
-    fn test_create_mock_key_from_config() {
-        let mock = MockConfig {
-            method: "PUT".to_string(),
-            path: "/api/users/1".to_string(),
+    fn test_mock_config_clone() {
+        let config = MockConfig {
+            method: "GET".to_string(),
+            path: "/test".to_string(),
             status: 200,
-            response: json!({}),
+            response: serde_json::json!({"test": true}),
+            consume_body: true,
         };
 
-        let key = create_mock_key(&mock.method, &mock.path);
-        assert_eq!(key, "PUT:/api/users/1");
+        let cloned = config.clone();
+        assert_eq!(cloned.method, config.method);
+        assert_eq!(cloned.path, config.path);
+        assert_eq!(cloned.status, config.status);
+    }
+
+    #[test]
+    fn test_mock_store_operations() {
+        let mut map = HashMap::new();
+        map.insert(
+            "GET:/test".to_string(),
+            MockConfig {
+                method: "GET".to_string(),
+                path: "/test".to_string(),
+                status: 200,
+                response: serde_json::json!({}),
+                consume_body: true,
+            },
+        );
+
+        let store: MockStore = Arc::new(map);
+        assert_eq!(store.len(), 1);
+        assert!(store.contains_key("GET:/test"));
+        assert!(!store.contains_key("POST:/test"));
+    }
+
+    #[test]
+    fn test_mock_config_with_consume_body_true() {
+        let json = r#"{
+            "method": "POST",
+            "path": "/upload",
+            "status": 200,
+            "response": {"uploaded": true},
+            "consume_body": true
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.path, "/upload");
+        assert_eq!(config.status, 200);
+        assert_eq!(config.consume_body, true);
+    }
+
+    #[test]
+    fn test_mock_config_with_consume_body_false() {
+        let json = r#"{
+            "method": "POST",
+            "path": "/no-consume",
+            "status": 200,
+            "response": {"message": "ok"},
+            "consume_body": false
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.path, "/no-consume");
+        assert_eq!(config.consume_body, false);
+    }
+
+    #[test]
+    fn test_mock_config_without_consume_body_defaults_to_false() {
+        // Test that consume_body defaults to false when not specified in JSON
+        let json = r#"{
+            "method": "POST",
+            "path": "/default",
+            "status": 201,
+            "response": {"created": true}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.path, "/default");
+        assert_eq!(config.status, 201);
+        assert_eq!(config.consume_body, false); // Should default to false (fast by default)
+    }
+
+    #[test]
+    fn test_mock_config_serialization_with_consume_body() {
+        let config = MockConfig {
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            status: 200,
+            response: serde_json::json!({"test": true}),
+            consume_body: false,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"consume_body\":false"));
     }
 }
