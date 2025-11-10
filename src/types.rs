@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(config.method, "POST");
         assert_eq!(config.path, "/upload");
         assert_eq!(config.status, 200);
-        assert_eq!(config.consume_body, true);
+        assert!(config.consume_body);
     }
 
     #[test]
@@ -210,7 +210,7 @@ mod tests {
         let config: MockConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.method, "POST");
         assert_eq!(config.path, "/no-consume");
-        assert_eq!(config.consume_body, false);
+        assert!(!config.consume_body);
     }
 
     #[test]
@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(config.method, "POST");
         assert_eq!(config.path, "/default");
         assert_eq!(config.status, 201);
-        assert_eq!(config.consume_body, false); // Should default to false (fast by default)
+        assert!(!config.consume_body); // Should default to false (fast by default)
     }
 
     #[test]

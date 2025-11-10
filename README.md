@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/ragilhadi/mimic/workflows/Unit%20Tests/badge.svg)](https://github.com/ragilhadi/mimic/actions)
 [![Docker](https://img.shields.io/docker/v/ragilhadi/mimic?label=docker)](https://hub.docker.com/r/ragilhadi/mimic)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Mimic** is a fast, lightweight HTTP mock server built with Rust and Axum. Perfect for testing, development, and API prototyping. Define your mock responses in simple JSON files and let Mimic handle the rest.
 
