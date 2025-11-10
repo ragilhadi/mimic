@@ -27,7 +27,7 @@ pub async fn handle_request(
 
     // Create lookup key first to check if we should consume body
     let key = create_mock_key(method_str, path);
-    
+
     // Check if we should consume the request body based on mock configuration
     let should_consume = state
         .mocks

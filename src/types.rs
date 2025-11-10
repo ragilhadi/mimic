@@ -8,6 +8,12 @@ pub struct MockConfig {
     pub path: String,
     pub status: u16,
     pub response: serde_json::Value,
+    #[serde(default = "default_consume_body")]
+    pub consume_body: bool,
+}
+
+fn default_consume_body() -> bool {
+    false
 }
 
 pub type MockStore = Arc<HashMap<String, MockConfig>>;
@@ -75,6 +81,7 @@ mod tests {
             path: "/api/users".to_string(),
             status: 201,
             response: serde_json::json!({"id": 1, "name": "Alice"}),
+            consume_body: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -144,6 +151,7 @@ mod tests {
             path: "/test".to_string(),
             status: 200,
             response: serde_json::json!({"test": true}),
+            consume_body: true,
         };
 
         let cloned = config.clone();
@@ -162,6 +170,7 @@ mod tests {
                 path: "/test".to_string(),
                 status: 200,
                 response: serde_json::json!({}),
+                consume_body: true,
             },
         );
 
@@ -169,5 +178,69 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(store.contains_key("GET:/test"));
         assert!(!store.contains_key("POST:/test"));
+    }
+
+    #[test]
+    fn test_mock_config_with_consume_body_true() {
+        let json = r#"{
+            "method": "POST",
+            "path": "/upload",
+            "status": 200,
+            "response": {"uploaded": true},
+            "consume_body": true
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.path, "/upload");
+        assert_eq!(config.status, 200);
+        assert_eq!(config.consume_body, true);
+    }
+
+    #[test]
+    fn test_mock_config_with_consume_body_false() {
+        let json = r#"{
+            "method": "POST",
+            "path": "/no-consume",
+            "status": 200,
+            "response": {"message": "ok"},
+            "consume_body": false
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.path, "/no-consume");
+        assert_eq!(config.consume_body, false);
+    }
+
+    #[test]
+    fn test_mock_config_without_consume_body_defaults_to_false() {
+        // Test that consume_body defaults to false when not specified in JSON
+        let json = r#"{
+            "method": "POST",
+            "path": "/default",
+            "status": 201,
+            "response": {"created": true}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.path, "/default");
+        assert_eq!(config.status, 201);
+        assert_eq!(config.consume_body, false); // Should default to false (fast by default)
+    }
+
+    #[test]
+    fn test_mock_config_serialization_with_consume_body() {
+        let config = MockConfig {
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            status: 200,
+            response: serde_json::json!({"test": true}),
+            consume_body: false,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"consume_body\":false"));
     }
 }
