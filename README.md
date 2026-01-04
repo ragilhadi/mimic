@@ -591,20 +591,6 @@ When multiple mocks could match a request, Mimic uses a scoring system:
 
 The mock with the **highest score** wins.
 
-### Testing Advanced Mocks
-
-See `test_advanced_mocks.py` for a complete Python test suite that validates all advanced matching features.
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run tests
-python test_advanced_mocks.py
-```
-
-**For more details**, see [`ADVANCED_MATCHING.md`](ADVANCED_MATCHING.md) for comprehensive documentation.
-
 ---
 
 ## 🎯 Use Cases
