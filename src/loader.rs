@@ -247,6 +247,9 @@ mod tests {
             status: 200,
             response: json!({}),
             consume_body: true,
+            query_params: None,
+            headers: None,
+            body: None,
         };
 
         let key = create_mock_key(&mock.method, &mock.path);

@@ -2,24 +2,202 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// ============================================================================
+// Query Parameter Matching Types
+// ============================================================================
+
+/// Matcher for URL query parameters
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueryParamMatcher {
+    /// Parameters that must match
+    #[serde(default)]
+    pub params: HashMap<String, QueryParamValue>,
+
+    /// If true, request must not have extra params beyond those specified
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// Value matcher for a single query parameter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum QueryParamValue {
+    /// Exact value match (simple string)
+    Exact(String),
+
+    /// Pattern-based matching
+    Pattern(QueryParamPattern),
+}
+
+/// Pattern matching options for query parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryParamPattern {
+    /// Regex pattern match
+    Regex(String),
+    /// Any value (parameter must exist)
+    Any,
+}
+
+// ============================================================================
+// Header Matching Types
+// ============================================================================
+
+/// Matcher for HTTP headers
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HeaderMatcher {
+    /// Headers that must be present and match
+    #[serde(default)]
+    pub required: HashMap<String, HeaderValue>,
+
+    /// Headers that must NOT be present
+    #[serde(default)]
+    pub forbidden: Vec<String>,
+
+    /// If true, request must not have extra headers beyond required
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// Value matcher for a single header
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HeaderValue {
+    /// Exact value match (simple string)
+    Exact(String),
+
+    /// Pattern-based matching
+    Pattern(HeaderPattern),
+}
+
+/// Pattern matching options for headers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderPattern {
+    /// Regex pattern match
+    Regex(String),
+    /// Any value (header must exist)
+    Any,
+    /// Starts with prefix
+    Prefix(String),
+    /// Contains substring
+    Contains(String),
+}
+
+// ============================================================================
+// Body Matching Types
+// ============================================================================
+
+/// Matcher for request body
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BodyMatcher {
+    /// Match JSON body
+    Json(JsonBodyMatcher),
+
+    /// Match text/plain body
+    Text(TextBodyMatcher),
+
+    /// Match form data (application/x-www-form-urlencoded)
+    Form(FormBodyMatcher),
+
+    /// Match any body (just check presence)
+    Any,
+
+    /// Match empty body
+    Empty,
+}
+
+/// JSON body matcher with multiple strategies
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JsonBodyMatcher {
+    /// Exact JSON match (deep equality)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<serde_json::Value>,
+
+    /// Partial match: specified fields must match, others ignored
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<serde_json::Value>,
+
+    /// If true with partial match, reject extra fields
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// Text body matcher
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TextBodyMatcher {
+    /// Exact text match
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<String>,
+
+    /// Contains substring
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+
+    /// Regex pattern
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+}
+
+/// Form data matcher
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FormBodyMatcher {
+    /// Form fields that must match
+    #[serde(default)]
+    pub fields: HashMap<String, String>,
+
+    /// If true, reject extra fields
+    #[serde(default)]
+    pub strict: bool,
+}
+
+// ============================================================================
+// Main Mock Configuration
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MockConfig {
     pub method: String,
     pub path: String,
     pub status: u16,
     pub response: serde_json::Value,
+
     #[serde(default = "default_consume_body")]
     pub consume_body: bool,
+
+    /// Optional query parameter matcher
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParamMatcher>,
+
+    /// Optional header matcher
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HeaderMatcher>,
+
+    /// Optional body matcher
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyMatcher>,
 }
 
 fn default_consume_body() -> bool {
     false
 }
 
+/// Check if a mock has any advanced matchers
+impl MockConfig {
+    #[allow(dead_code)]
+    pub fn has_advanced_matchers(&self) -> bool {
+        self.query_params.is_some() || self.headers.is_some() || self.body.is_some()
+    }
+}
+
 pub type MockStore = Arc<HashMap<String, MockConfig>>;
 
+/// Create a lookup key from method and path (without query string)
 pub fn create_mock_key(method: &str, path: &str) -> String {
-    format!("{}:{}", method.to_uppercase(), path)
+    // Strip query string if present for the key
+    let path_only = path.split('?').next().unwrap_or(path);
+    format!("{}:{}", method.to_uppercase(), path_only)
 }
 
 #[cfg(test)]
@@ -46,9 +224,10 @@ mod tests {
 
     #[test]
     fn test_create_mock_key_with_query_params() {
+        // Query string should be stripped from the key
         assert_eq!(
             create_mock_key("GET", "/users?page=1&limit=10"),
-            "GET:/users?page=1&limit=10"
+            "GET:/users"
         );
     }
 
@@ -82,6 +261,9 @@ mod tests {
             status: 201,
             response: serde_json::json!({"id": 1, "name": "Alice"}),
             consume_body: true,
+            query_params: None,
+            headers: None,
+            body: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -152,6 +334,9 @@ mod tests {
             status: 200,
             response: serde_json::json!({"test": true}),
             consume_body: true,
+            query_params: None,
+            headers: None,
+            body: None,
         };
 
         let cloned = config.clone();
@@ -171,6 +356,9 @@ mod tests {
                 status: 200,
                 response: serde_json::json!({}),
                 consume_body: true,
+                query_params: None,
+                headers: None,
+                body: None,
             },
         );
 
@@ -238,9 +426,105 @@ mod tests {
             status: 200,
             response: serde_json::json!({"test": true}),
             consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"consume_body\":false"));
+    }
+
+    #[test]
+    fn test_mock_config_with_query_params() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/search",
+            "status": 200,
+            "response": {"results": []},
+            "query_params": {
+                "params": {
+                    "q": "test",
+                    "page": "1"
+                },
+                "strict": false
+            }
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "GET");
+        assert!(config.query_params.is_some());
+        let qp = config.query_params.unwrap();
+        assert_eq!(qp.params.len(), 2);
+        assert!(!qp.strict);
+    }
+
+    #[test]
+    fn test_mock_config_with_headers() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/protected",
+            "status": 200,
+            "response": {"data": "secret"},
+            "headers": {
+                "required": {
+                    "authorization": "Bearer token123"
+                },
+                "forbidden": ["x-debug"],
+                "strict": false
+            }
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "GET");
+        assert!(config.headers.is_some());
+        let h = config.headers.unwrap();
+        assert_eq!(h.required.len(), 1);
+        assert_eq!(h.forbidden.len(), 1);
+    }
+
+    #[test]
+    fn test_mock_config_with_json_body_matcher() {
+        let json = r#"{
+            "method": "POST",
+            "path": "/login",
+            "status": 200,
+            "response": {"token": "abc"},
+            "body": {
+                "type": "json",
+                "partial": {"username": "admin"}
+            }
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.method, "POST");
+        assert!(config.body.is_some());
+    }
+
+    #[test]
+    fn test_mock_config_has_advanced_matchers() {
+        let simple = MockConfig {
+            method: "GET".to_string(),
+            path: "/test".to_string(),
+            status: 200,
+            response: serde_json::json!({}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+        };
+        assert!(!simple.has_advanced_matchers());
+
+        let with_query = MockConfig {
+            method: "GET".to_string(),
+            path: "/test".to_string(),
+            status: 200,
+            response: serde_json::json!({}),
+            consume_body: false,
+            query_params: Some(QueryParamMatcher::default()),
+            headers: None,
+            body: None,
+        };
+        assert!(with_query.has_advanced_matchers());
     }
 }

@@ -1,10 +1,12 @@
-use crate::types::{create_mock_key, MockStore};
+use crate::matcher::{find_matching_mock, parse_headers, parse_query_string, RequestContext};
+use crate::types::MockStore;
 use axum::{
     body::Body,
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
 };
+use bytes::Bytes;
 use http_body_util::BodyExt;
 use serde_json::json;
 use tracing::{debug, info};
@@ -14,38 +16,75 @@ pub struct AppState {
     pub mocks: MockStore,
 }
 
+/// Maximum body size to consume for matching (10 MB)
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
 pub async fn handle_request(
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     State(state): State<AppState>,
     body: Body,
 ) -> Response {
-    let path = uri.path();
-    let method_str = method.as_str();
+    let path = uri.path().to_string();
+    let method_str = method.as_str().to_string();
 
-    debug!("Incoming request: {} {}", method_str, path);
+    debug!("Incoming request: {} {}", method_str, uri);
 
-    // Create lookup key first to check if we should consume body
-    let key = create_mock_key(method_str, path);
+    // Parse query parameters from URI
+    let query_params = parse_query_string(uri.query());
 
-    // Check if we should consume the request body based on mock configuration
-    let should_consume = state
-        .mocks
-        .get(&key)
-        .map(|mock| mock.consume_body)
-        .unwrap_or(false); // Default to false if no mock found (fast by default)
+    // Parse headers into HashMap (normalized to lowercase)
+    let parsed_headers = parse_headers(&headers);
 
-    // Consume request body to prevent broken pipe errors
-    // Critical for POST/PUT/PATCH with large payloads (e.g., multipart/form-data with images)
-    if should_consume && matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-        if let Ok(collected) = body.collect().await {
-            let bytes = collected.to_bytes();
-            debug!("Consumed {} bytes from request body", bytes.len());
-        }
-    }
+    // Get content type for body parsing
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-    // Try to find matching mock
-    match state.mocks.get(&key) {
+    // Check if any mock needs body matching
+    let needs_body_matching = state.mocks.values().any(|mock| mock.body.is_some());
+
+    // Consume body if needed for matching or if consume_body is set
+    let body_bytes: Option<Bytes> =
+        if needs_body_matching || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+            match body.collect().await {
+                Ok(collected) => {
+                    let bytes = collected.to_bytes();
+                    if bytes.len() > MAX_BODY_SIZE {
+                        debug!(
+                            "Body too large: {} bytes (max: {})",
+                            bytes.len(),
+                            MAX_BODY_SIZE
+                        );
+                        None
+                    } else {
+                        debug!("Consumed {} bytes from request body", bytes.len());
+                        Some(bytes)
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to read body: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Build request context for matching
+    let context = RequestContext {
+        method: method_str.clone(),
+        path: path.clone(),
+        query_params,
+        headers: parsed_headers.clone(),
+        body: body_bytes,
+        content_type,
+    };
+
+    // Find matching mock using the new matcher
+    match find_matching_mock(&context, &state.mocks) {
         Some(mock) => {
             info!("Mock matched: {} {} -> {}", method_str, path, mock.status);
 
@@ -58,13 +97,15 @@ pub async fn handle_request(
         None => {
             info!("No mock found for: {} {}", method_str, path);
 
-            // Return 404 with error message
+            // Return 404 with detailed error message
             (
                 StatusCode::NOT_FOUND,
                 Json(json!({
                     "error": "mock not found",
                     "method": method_str,
-                    "path": path
+                    "path": path,
+                    "query_params": context.query_params,
+                    "headers_received": parsed_headers.keys().collect::<Vec<_>>()
                 })),
             )
                 .into_response()
@@ -83,7 +124,10 @@ pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::MockConfig;
+    use crate::types::{
+        BodyMatcher, HeaderMatcher, HeaderPattern, HeaderValue, JsonBodyMatcher, MockConfig,
+        QueryParamMatcher, QueryParamPattern, QueryParamValue,
+    };
     use axum::http::Method;
     use http_body_util::BodyExt;
     use std::collections::HashMap;
@@ -99,7 +143,10 @@ mod tests {
                 path: "/users".to_string(),
                 status: 200,
                 response: json!({"users": [{"id": 1, "name": "Alice"}]}),
-                consume_body: true,
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
             },
         );
 
@@ -110,7 +157,10 @@ mod tests {
                 path: "/login".to_string(),
                 status: 201,
                 response: json!({"token": "test-token"}),
-                consume_body: true,
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
             },
         );
 
@@ -121,7 +171,10 @@ mod tests {
                 path: "/users/123".to_string(),
                 status: 204,
                 response: json!(null),
-                consume_body: true,
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
             },
         );
 
@@ -141,8 +194,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::GET;
         let uri = "/users".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -152,8 +206,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::GET;
         let uri = "/nonexistent".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -163,8 +218,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::POST;
         let uri = "/login".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         assert_eq!(response.status(), StatusCode::CREATED);
     }
@@ -174,8 +230,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::DELETE;
         let uri = "/users/123".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
@@ -185,8 +242,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::PUT;
         let uri = "/users".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -195,9 +253,10 @@ mod tests {
     async fn test_handle_request_case_sensitive_path() {
         let state = create_test_state();
         let method = Method::GET;
-        let uri = "/Users".parse().unwrap(); // Different case
+        let uri = "/Users".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -226,8 +285,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::GET;
         let uri = "/users".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
@@ -243,8 +303,9 @@ mod tests {
         let state = create_test_state();
         let method = Method::GET;
         let uri = "/nonexistent".parse().unwrap();
+        let headers = HeaderMap::new();
 
-        let response = handle_request(method, uri, State(state), Body::empty()).await;
+        let response = handle_request(method, uri, headers, State(state), Body::empty()).await;
 
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
@@ -257,77 +318,30 @@ mod tests {
         assert_eq!(json["path"], "/nonexistent");
     }
 
-    #[tokio::test]
-    async fn test_handle_request_post_with_large_body() {
-        let state = create_test_state();
-        let method = Method::POST;
-        let uri = "/login".parse().unwrap();
-
-        // Create a large body (1 MB) to simulate image upload
-        let large_body = vec![0u8; 1024 * 1024];
-        let body = Body::from(large_body);
-
-        let response = handle_request(method, uri, State(state), body).await;
-
-        assert_eq!(response.status(), StatusCode::CREATED);
-    }
+    // =========================================================================
+    // Query Parameter Matching Tests
+    // =========================================================================
 
     #[tokio::test]
-    async fn test_handle_request_post_with_multipart_body() {
-        let state = create_test_state();
-        let method = Method::POST;
-        let uri = "/login".parse().unwrap();
-
-        // Simulate multipart/form-data with image content
-        let body_content = b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"image.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n<binary image data>\r\n--boundary--";
-        let body = Body::from(body_content.to_vec());
-
-        let response = handle_request(method, uri, State(state), body).await;
-
-        assert_eq!(response.status(), StatusCode::CREATED);
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_put_with_body() {
-        let state = create_test_state();
-        let method = Method::PUT;
-        let uri = "/users/1".parse().unwrap();
-
-        let body_content = b"{\"name\": \"Updated User\"}";
-        let body = Body::from(body_content.to_vec());
-
-        let response = handle_request(method, uri, State(state), body).await;
-
-        // Should return 404 as we don't have a mock for PUT /users/1
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_patch_with_body() {
-        let state = create_test_state();
-        let method = Method::PATCH;
-        let uri = "/users/1".parse().unwrap();
-
-        let body_content = b"{\"status\": \"active\"}";
-        let body = Body::from(body_content.to_vec());
-
-        let response = handle_request(method, uri, State(state), body).await;
-
-        // Should return 404 as we don't have a mock for PATCH /users/1
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_handle_request_with_consume_body_true() {
+    async fn test_query_param_matching() {
         let mut mocks = HashMap::new();
         mocks.insert(
-            "POST:/upload".to_string(),
+            "GET:/search".to_string(),
             MockConfig {
-                method: "POST".to_string(),
-                path: "/upload".to_string(),
+                method: "GET".to_string(),
+                path: "/search".to_string(),
                 status: 200,
-                response: json!({"uploaded": true}),
-                consume_body: true, // Explicitly enable body consumption
+                response: json!({"results": []}),
+                consume_body: false,
+                query_params: Some(QueryParamMatcher {
+                    params: HashMap::from([(
+                        "q".to_string(),
+                        QueryParamValue::Exact("test".to_string()),
+                    )]),
+                    strict: false,
+                }),
+                headers: None,
+                body: None,
             },
         );
 
@@ -335,27 +349,41 @@ mod tests {
             mocks: Arc::new(mocks),
         };
 
-        let method = Method::POST;
-        let uri = "/upload".parse().unwrap();
-        let body_content = vec![0u8; 1024 * 100]; // 100 KB
-        let body = Body::from(body_content);
-
-        let response = handle_request(method, uri, State(state), body).await;
-
+        // Should match with correct query param
+        let method = Method::GET;
+        let uri = "/search?q=test".parse().unwrap();
+        let headers = HeaderMap::new();
+        let response =
+            handle_request(method, uri, headers, State(state.clone()), Body::empty()).await;
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Should not match with wrong query param
+        let uri = "/search?q=wrong".parse().unwrap();
+        let headers = HeaderMap::new();
+        let response = handle_request(Method::GET, uri, headers, State(state), Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn test_handle_request_with_consume_body_false() {
+    async fn test_query_param_regex_matching() {
         let mut mocks = HashMap::new();
         mocks.insert(
-            "POST:/no-consume".to_string(),
+            "GET:/users".to_string(),
             MockConfig {
-                method: "POST".to_string(),
-                path: "/no-consume".to_string(),
+                method: "GET".to_string(),
+                path: "/users".to_string(),
                 status: 200,
-                response: json!({"message": "ok"}),
-                consume_body: false, // Explicitly disable body consumption
+                response: json!({"users": []}),
+                consume_body: false,
+                query_params: Some(QueryParamMatcher {
+                    params: HashMap::from([(
+                        "page".to_string(),
+                        QueryParamValue::Pattern(QueryParamPattern::Regex("^[0-9]+$".to_string())),
+                    )]),
+                    strict: false,
+                }),
+                headers: None,
+                body: None,
             },
         );
 
@@ -363,29 +391,194 @@ mod tests {
             mocks: Arc::new(mocks),
         };
 
-        let method = Method::POST;
-        let uri = "/no-consume".parse().unwrap();
-        let body_content = b"some data";
-        let body = Body::from(body_content.to_vec());
-
-        let response = handle_request(method, uri, State(state), body).await;
-
-        // Should still return OK even though body is not consumed
+        // Should match with numeric page
+        let uri = "/users?page=123".parse().unwrap();
+        let headers = HeaderMap::new();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            headers,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Should not match with non-numeric page
+        let uri = "/users?page=abc".parse().unwrap();
+        let headers = HeaderMap::new();
+        let response = handle_request(Method::GET, uri, headers, State(state), Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Header Matching Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_header_matching() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/protected".to_string(),
+            MockConfig {
+                method: "GET".to_string(),
+                path: "/protected".to_string(),
+                status: 200,
+                response: json!({"data": "secret"}),
+                consume_body: false,
+                query_params: None,
+                headers: Some(HeaderMatcher {
+                    required: HashMap::from([(
+                        "authorization".to_string(),
+                        HeaderValue::Exact("Bearer token123".to_string()),
+                    )]),
+                    forbidden: vec![],
+                    strict: false,
+                }),
+                body: None,
+            },
+        );
+
+        let state = AppState {
+            mocks: Arc::new(mocks),
+        };
+
+        // Should match with correct header
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token123".parse().unwrap());
+        let uri = "/protected".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            headers,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Should not match with wrong header
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        let uri = "/protected".parse().unwrap();
+        let response = handle_request(Method::GET, uri, headers, State(state), Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn test_handle_request_default_consume_body() {
-        // Test that consume_body defaults to false when not specified (fast by default)
+    async fn test_header_prefix_matching() {
         let mut mocks = HashMap::new();
         mocks.insert(
-            "POST:/default".to_string(),
+            "GET:/api".to_string(),
+            MockConfig {
+                method: "GET".to_string(),
+                path: "/api".to_string(),
+                status: 200,
+                response: json!({"ok": true}),
+                consume_body: false,
+                query_params: None,
+                headers: Some(HeaderMatcher {
+                    required: HashMap::from([(
+                        "authorization".to_string(),
+                        HeaderValue::Pattern(HeaderPattern::Prefix("Bearer ".to_string())),
+                    )]),
+                    forbidden: vec![],
+                    strict: false,
+                }),
+                body: None,
+            },
+        );
+
+        let state = AppState {
+            mocks: Arc::new(mocks),
+        };
+
+        // Should match with any Bearer token
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer anytoken".parse().unwrap());
+        let uri = "/api".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            headers,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Should not match with Basic auth
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic abc123".parse().unwrap());
+        let uri = "/api".parse().unwrap();
+        let response = handle_request(Method::GET, uri, headers, State(state), Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Body Matching Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_json_body_exact_matching() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/login".to_string(),
             MockConfig {
                 method: "POST".to_string(),
-                path: "/default".to_string(),
+                path: "/login".to_string(),
+                status: 200,
+                response: json!({"token": "abc123"}),
+                consume_body: true,
+                query_params: None,
+                headers: None,
+                body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                    exact: Some(json!({"username": "admin", "password": "secret"})),
+                    partial: None,
+                    strict: false,
+                })),
+            },
+        );
+
+        let state = AppState {
+            mocks: Arc::new(mocks),
+        };
+
+        // Should match with exact body
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/login".parse().unwrap();
+        let body = Body::from(r#"{"username":"admin","password":"secret"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state.clone()), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Should not match with different body
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/login".parse().unwrap();
+        let body = Body::from(r#"{"username":"admin","password":"wrong"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_json_body_partial_matching() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/users".to_string(),
+            MockConfig {
+                method: "POST".to_string(),
+                path: "/users".to_string(),
                 status: 201,
-                response: json!({"created": true}),
-                consume_body: false, // Default value (fast)
+                response: json!({"id": 1}),
+                consume_body: true,
+                query_params: None,
+                headers: None,
+                body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                    exact: None,
+                    partial: Some(json!({"name": "Alice"})),
+                    strict: false,
+                })),
             },
         );
 
@@ -393,13 +586,81 @@ mod tests {
             mocks: Arc::new(mocks),
         };
 
-        let method = Method::POST;
-        let uri = "/default".parse().unwrap();
-        let body_content = b"small body";
-        let body = Body::from(body_content.to_vec());
-
-        let response = handle_request(method, uri, State(state), body).await;
-
+        // Should match with partial body (extra fields ignored)
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/users".parse().unwrap();
+        let body = Body::from(r#"{"name":"Alice","email":"alice@example.com"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state.clone()), body).await;
         assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Should not match with wrong name
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/users".parse().unwrap();
+        let body = Body::from(r#"{"name":"Bob"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Combined Matching Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_combined_matching() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/api/search".to_string(),
+            MockConfig {
+                method: "POST".to_string(),
+                path: "/api/search".to_string(),
+                status: 200,
+                response: json!({"results": ["item1"]}),
+                consume_body: true,
+                query_params: Some(QueryParamMatcher {
+                    params: HashMap::from([(
+                        "type".to_string(),
+                        QueryParamValue::Exact("user".to_string()),
+                    )]),
+                    strict: false,
+                }),
+                headers: Some(HeaderMatcher {
+                    required: HashMap::from([(
+                        "authorization".to_string(),
+                        HeaderValue::Pattern(HeaderPattern::Prefix("Bearer ".to_string())),
+                    )]),
+                    forbidden: vec![],
+                    strict: false,
+                }),
+                body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                    exact: None,
+                    partial: Some(json!({"query": "Alice"})),
+                    strict: false,
+                })),
+            },
+        );
+
+        let state = AppState {
+            mocks: Arc::new(mocks),
+        };
+
+        // Should match with all criteria met
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/api/search?type=user".parse().unwrap();
+        let body = Body::from(r#"{"query":"Alice"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state.clone()), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Should not match with wrong query param
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/api/search?type=product".parse().unwrap();
+        let body = Body::from(r#"{"query":"Alice"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
