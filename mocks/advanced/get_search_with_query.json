@@ -1,0 +1,21 @@
+{
+  "method": "GET",
+  "path": "/search",
+  "status": 200,
+  "query_params": {
+    "params": {
+      "q": "test",
+      "page": "1"
+    },
+    "strict": false
+  },
+  "response": {
+    "results": [
+      {"id": 1, "title": "Test Result 1"},
+      {"id": 2, "title": "Test Result 2"}
+    ],
+    "query": "test",
+    "page": 1,
+    "total": 2
+  }
+}

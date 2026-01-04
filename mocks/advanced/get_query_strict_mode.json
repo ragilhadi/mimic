@@ -1,0 +1,20 @@
+{
+  "method": "GET",
+  "path": "/strict-search",
+  "status": 200,
+  "query_params": {
+    "params": {
+      "q": "test",
+      "page": "1"
+    },
+    "strict": true
+  },
+  "response": {
+    "results": [
+      {"id": 1, "title": "Strict Mode Result"}
+    ],
+    "message": "This endpoint rejects requests with extra query parameters",
+    "strict_mode": true,
+    "allowed_params": ["q", "page"]
+  }
+}

@@ -6,21 +6,22 @@
 
 **Mimic** is a fast, lightweight HTTP mock server built with Rust and Axum. Perfect for testing, development, and API prototyping. Define your mock responses in simple JSON files and let Mimic handle the rest.
 
-## ✨ Features
+## Features
 
-- 🚀 **Blazing Fast** - Built with Rust and Axum for maximum performance
-- 💾 **Ultra Lightweight** - Only **1.66 MiB** memory usage
-- 📁 **File-Based Configuration** - Define mocks in simple JSON files
-- 🔄 **Hot Reload** - Changes to mock files are reflected immediately
-- 🐳 **Docker Ready** - Pre-built images available on Docker Hub
-- ✅ **Well Tested** - 44+ unit tests with high code coverage
-- 🔧 **Easy to Use** - Simple configuration, no complex setup
-- ⚙️ **Configurable Body Consumption** - Control request body handling per endpoint
-- 📤 **File Upload Support** - Handle multipart/form-data with `consume_body` option
+- **Blazing Fast** - Built with Rust and Axum for maximum performance
+- **Ultra Lightweight** - Only **1.66 MiB** memory usage
+- **File-Based Configuration** - Define mocks in simple JSON files
+- **Hot Reload** - Changes to mock files are reflected immediately
+- **Docker Ready** - Pre-built images available on Docker Hub
+- **Well Tested** - 60+ unit tests with high code coverage
+- **Easy to Use** - Simple configuration, no complex setup
+- **Configurable Body Consumption** - Control request body handling per endpoint
+- **File Upload Support** - Handle multipart/form-data with `consume_body` option
+- **Advanced Matching** - Match on query params, headers, and request body
 
 ---
 
-## 📊 Performance
+## Performance
 
 Mimic is incredibly efficient and lightweight:
 
@@ -288,6 +289,321 @@ curl -X POST http://localhost:8080/ocr-image \
 - Large request payloads
 
 Without `consume_body: true`, clients may encounter "Broken Pipe" errors when sending large files.
+
+---
+
+## 🎯 Advanced Matching
+
+Mimic supports advanced request matching beyond just HTTP method and path. You can match requests based on **query parameters**, **headers**, and **request body** content.
+
+### Query Parameter Matching
+
+Match requests based on URL query string parameters:
+
+**File**: `mocks/get_search.json`
+
+```json
+{
+  "method": "GET",
+  "path": "/search",
+  "status": 200,
+  "query_params": {
+    "params": {
+      "q": "test",
+      "page": "1"
+    },
+    "strict": false
+  },
+  "response": {
+    "results": [
+      {"id": 1, "title": "Test Result 1"},
+      {"id": 2, "title": "Test Result 2"}
+    ],
+    "query": "test",
+    "page": 1
+  }
+}
+```
+
+**Usage:**
+```bash
+# Matches - exact params
+curl "http://localhost:8080/search?q=test&page=1"
+
+# Matches - extra params ignored (strict=false)
+curl "http://localhost:8080/search?q=test&page=1&extra=value"
+
+# Doesn't match - wrong value
+curl "http://localhost:8080/search?q=wrong&page=1"  # Returns 404
+```
+
+**Advanced Query Patterns:**
+
+```json
+{
+  "query_params": {
+    "params": {
+      "page": {"regex": "^[0-9]+$"},
+      "limit": {"regex": "^(10|20|50|100)$"},
+      "status": {"any": null}
+    },
+    "strict": false
+  }
+}
+```
+
+- **Exact match**: `"param": "value"`
+- **Regex match**: `"param": {"regex": "^pattern$"}`
+- **Any value**: `"param": {"any": null}` (param must exist)
+- **Strict mode**: `"strict": true` (rejects extra params)
+
+### Header Matching
+
+Match requests based on HTTP headers:
+
+**File**: `mocks/get_protected.json`
+
+```json
+{
+  "method": "GET",
+  "path": "/api/protected",
+  "status": 200,
+  "headers": {
+    "required": {
+      "authorization": {
+        "prefix": "Bearer "
+      }
+    },
+    "forbidden": [],
+    "strict": false
+  },
+  "response": {
+    "data": "This is protected content",
+    "user": {
+      "id": 1,
+      "role": "admin"
+    }
+  }
+}
+```
+
+**Usage:**
+```bash
+# Matches - valid Bearer token
+curl -H "Authorization: Bearer my_token" http://localhost:8080/api/protected
+
+# Doesn't match - missing header
+curl http://localhost:8080/api/protected  # Returns 404
+
+# Doesn't match - wrong prefix
+curl -H "Authorization: Basic token" http://localhost:8080/api/protected  # Returns 404
+```
+
+**Advanced Header Patterns:**
+
+```json
+{
+  "headers": {
+    "required": {
+      "authorization": "Bearer token123",
+      "content-type": {"contains": "json"},
+      "x-api-key": {"regex": "^[A-Za-z0-9]{32}$"},
+      "accept": {"any": null}
+    },
+    "forbidden": ["x-debug", "x-internal"],
+    "strict": false
+  }
+}
+```
+
+- **Exact match**: `"header": "value"`
+- **Prefix match**: `"header": {"prefix": "Bearer "}`
+- **Contains**: `"header": {"contains": "substring"}`
+- **Regex match**: `"header": {"regex": "^pattern$"}`
+- **Any value**: `"header": {"any": null}`
+- **Forbidden headers**: Headers that must NOT be present
+- **Case-insensitive**: Header names are case-insensitive (per HTTP spec)
+
+### Request Body Matching
+
+Match requests based on JSON, text, or form data in the request body:
+
+#### JSON Body Matching
+
+**File**: `mocks/post_login.json`
+
+```json
+{
+  "method": "POST",
+  "path": "/api/login",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": "application/json"
+    }
+  },
+  "body": {
+    "type": "json",
+    "partial": {
+      "username": "admin",
+      "password": "secret123"
+    }
+  },
+  "response": {
+    "success": true,
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "user": {
+      "id": 1,
+      "username": "admin",
+      "role": "admin"
+    }
+  }
+}
+```
+
+**Usage:**
+```bash
+# Matches - exact credentials
+curl -X POST http://localhost:8080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"secret123"}'
+
+# Matches - extra fields ignored (partial matching)
+curl -X POST http://localhost:8080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"secret123","remember_me":true}'
+
+# Doesn't match - wrong password
+curl -X POST http://localhost:8080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"wrong"}'  # Returns 404
+```
+
+**JSON Body Options:**
+
+```json
+{
+  "body": {
+    "type": "json",
+    "exact": {"key": "value"},      // Entire body must match exactly
+    "partial": {"name": "Alice"},   // Specified fields must match
+    "strict": false                 // If true with partial, reject extra fields
+  }
+}
+```
+
+#### Text Body Matching
+
+```json
+{
+  "body": {
+    "type": "text",
+    "contains": "search term"
+  }
+}
+```
+
+**Text Body Options:**
+- **Exact**: `"exact": "exact string"`
+- **Contains**: `"contains": "substring"`
+- **Regex**: `"regex": "^pattern$"`
+
+#### Form Body Matching
+
+```json
+{
+  "body": {
+    "type": "form",
+    "fields": {
+      "username": "admin",
+      "password": "secret"
+    },
+    "strict": false
+  }
+}
+```
+
+### Combined Matching
+
+Combine all matching types for precise mock selection:
+
+**File**: `mocks/post_search_combined.json`
+
+```json
+{
+  "method": "POST",
+  "path": "/api/search",
+  "status": 200,
+  "query_params": {
+    "params": {
+      "type": "user"
+    }
+  },
+  "headers": {
+    "required": {
+      "authorization": {"prefix": "Bearer "},
+      "content-type": "application/json"
+    }
+  },
+  "body": {
+    "type": "json",
+    "partial": {
+      "query": "Alice"
+    }
+  },
+  "response": {
+    "results": [
+      {
+        "id": 1,
+        "name": "Alice Johnson",
+        "email": "alice@example.com"
+      }
+    ],
+    "total": 1
+  }
+}
+```
+
+**Usage:**
+```bash
+curl -X POST "http://localhost:8080/api/search?type=user" \
+  -H "Authorization: Bearer my_token" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Alice","filters":{"active":true}}'
+```
+
+This mock only matches when **all** criteria are met:
+1. ✅ Method is POST
+2. ✅ Path is `/api/search`
+3. ✅ Query param `type=user`
+4. ✅ Authorization header starts with "Bearer "
+5. ✅ Content-Type is application/json
+6. ✅ Body contains `{"query": "Alice"}`
+
+### Match Priority
+
+When multiple mocks could match a request, Mimic uses a scoring system:
+
+- **Base score**: Method + Path match (1000 points)
+- **Query params**: +100 points per matched param
+- **Headers**: +50 points per matched header
+- **Body**: +500 points if body matches
+
+The mock with the **highest score** wins.
+
+### Testing Advanced Mocks
+
+See `test_advanced_mocks.py` for a complete Python test suite that validates all advanced matching features.
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run tests
+python test_advanced_mocks.py
+```
+
+**For more details**, see [`ADVANCED_MATCHING.md`](ADVANCED_MATCHING.md) for comprehensive documentation.
 
 ---
 
@@ -636,12 +952,10 @@ Built with:
 
 ## 🗺️ Roadmap
 
-- [ ] WebSocket support
-- [ ] Request body matching
-- [ ] Query parameter matching
-- [ ] Header matching
+- [x] Request body matching
+- [x] Query parameter matching
+- [x] Header matching
 - [ ] Response delays
-- [ ] Request logging
 - [ ] Admin UI
 - [ ] Hot reload for mock files
 

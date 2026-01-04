@@ -1,0 +1,23 @@
+{
+  "method": "GET",
+  "path": "/products",
+  "status": 200,
+  "query_params": {
+    "params": {
+      "category": {"regex": "^(electronics|books|clothing)$"},
+      "price_min": {"regex": "^[0-9]+$"},
+      "price_max": {"regex": "^[0-9]+$"}
+    },
+    "strict": false
+  },
+  "response": {
+    "products": [
+      {"id": 1, "name": "Product 1", "category": "electronics", "price": 299},
+      {"id": 2, "name": "Product 2", "category": "electronics", "price": 499}
+    ],
+    "filters_applied": {
+      "category": "electronics",
+      "price_range": "validated_with_regex"
+    }
+  }
+}

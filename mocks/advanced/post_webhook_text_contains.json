@@ -1,0 +1,20 @@
+{
+  "method": "POST",
+  "path": "/webhook",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": {"contains": "text"}
+    }
+  },
+  "body": {
+    "type": "text",
+    "contains": "event_type=payment"
+  },
+  "response": {
+    "status": "received",
+    "message": "Webhook processed successfully",
+    "event": "payment",
+    "timestamp": "2024-01-04T12:00:00Z"
+  }
+}

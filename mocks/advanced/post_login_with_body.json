@@ -1,0 +1,27 @@
+{
+  "method": "POST",
+  "path": "/api/login",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": "application/json"
+    }
+  },
+  "body": {
+    "type": "json",
+    "partial": {
+      "username": "admin",
+      "password": "secret123"
+    }
+  },
+  "response": {
+    "success": true,
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFkbWluIiwiaWF0IjoxNTE2MjM5MDIyfQ",
+    "user": {
+      "id": 1,
+      "username": "admin",
+      "role": "admin"
+    },
+    "expiresIn": 3600
+  }
+}

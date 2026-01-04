@@ -1,0 +1,20 @@
+{
+  "method": "POST",
+  "path": "/webhook/pattern",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": "text/plain",
+      "x-webhook-signature": {"regex": "^sha256=[a-f0-9]{64}$"}
+    }
+  },
+  "body": {
+    "type": "text",
+    "regex": "^event_type=(payment|refund)&amount=[0-9]+$"
+  },
+  "response": {
+    "status": "received",
+    "message": "Regex pattern matched webhook",
+    "matched": "regex_pattern"
+  }
+}

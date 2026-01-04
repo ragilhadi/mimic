@@ -1,0 +1,19 @@
+{
+  "method": "POST",
+  "path": "/webhook/exact",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": "text/plain"
+    }
+  },
+  "body": {
+    "type": "text",
+    "exact": "event_type=user_created&user_id=123&timestamp=2024-01-04"
+  },
+  "response": {
+    "status": "received",
+    "message": "Exact webhook match processed",
+    "matched": "exact_text"
+  }
+}

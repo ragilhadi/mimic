@@ -1,0 +1,24 @@
+{
+  "method": "POST",
+  "path": "/form/login",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": "application/x-www-form-urlencoded"
+    }
+  },
+  "body": {
+    "type": "form",
+    "fields": {
+      "username": "admin",
+      "password": "secret123"
+    },
+    "strict": false
+  },
+  "response": {
+    "success": true,
+    "message": "Form login successful",
+    "session_id": "form_session_abc123",
+    "redirect": "/dashboard"
+  }
+}

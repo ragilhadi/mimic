@@ -1,0 +1,16 @@
+{
+  "method": "GET",
+  "path": "/api/content",
+  "status": 200,
+  "headers": {
+    "required": {
+      "content-type": {"contains": "json"},
+      "accept": {"contains": "application"}
+    }
+  },
+  "response": {
+    "content": "This endpoint matches headers with 'contains' pattern",
+    "matched_headers": ["content-type", "accept"],
+    "pattern": "contains"
+  }
+}
