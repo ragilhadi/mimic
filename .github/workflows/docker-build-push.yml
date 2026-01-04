@@ -3,9 +3,13 @@ name: Build and Push Mimic
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'vars/version'
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+    paths:
+      - 'vars/version'
 
 env:
   REGISTRY: docker.io
