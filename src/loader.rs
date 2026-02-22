@@ -20,13 +20,22 @@ pub fn load_mocks(path: &str) -> MockStore {
         return Arc::new(HashMap::new());
     }
 
-    let mut mocks = HashMap::new();
+    let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
 
     if path_obj.is_file() {
         // Load single file
         if let Ok(mock) = load_single_mock(path_obj) {
             let key = create_mock_key(&mock.method, &mock.path);
-            mocks.insert(key, mock);
+            let entry = mocks.entry(key).or_default();
+            if !entry.is_empty() {
+                warn!(
+                    "Multiple mocks registered for {} {}: {} total",
+                    mock.method,
+                    mock.path,
+                    entry.len() + 1
+                );
+            }
+            entry.push(mock);
         }
     } else if path_obj.is_dir() {
         // Load all JSON files from directory
@@ -40,7 +49,16 @@ pub fn load_mocks(path: &str) -> MockStore {
                         if let Ok(mock) = load_single_mock(&entry_path) {
                             let key = create_mock_key(&mock.method, &mock.path);
                             debug!("Loaded mock: {} -> {}", key, entry_path.display());
-                            mocks.insert(key, mock);
+                            let entry = mocks.entry(key).or_default();
+                            if !entry.is_empty() {
+                                warn!(
+                                    "Multiple mocks registered for {} {}: {} total",
+                                    mock.method,
+                                    mock.path,
+                                    entry.len() + 1
+                                );
+                            }
+                            entry.push(mock);
                         }
                     }
                 }
@@ -254,5 +272,39 @@ mod tests {
 
         let key = create_mock_key(&mock.method, &mock.path);
         assert_eq!(key, "PUT:/api/users/1");
+    }
+
+    #[test]
+    fn test_load_mocks_multiple_files_same_path_retained() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        // Two mocks for the same METHOD:PATH (intended for body matching)
+        let mock_admin = r#"{
+            "method": "POST",
+            "path": "/login",
+            "status": 200,
+            "response": {"role": "admin"},
+            "body": {"type": "json", "partial": {"role": "admin"}}
+        }"#;
+
+        let mock_user = r#"{
+            "method": "POST",
+            "path": "/login",
+            "status": 200,
+            "response": {"role": "user"},
+            "body": {"type": "json", "partial": {"role": "user"}}
+        }"#;
+
+        let mut file1 = File::create(dir_path.join("login_admin.json")).unwrap();
+        file1.write_all(mock_admin.as_bytes()).unwrap();
+
+        let mut file2 = File::create(dir_path.join("login_user.json")).unwrap();
+        file2.write_all(mock_user.as_bytes()).unwrap();
+
+        let store = load_mocks(dir_path.to_str().unwrap());
+        // One unique key, but two mocks stored under it
+        assert_eq!(store.len(), 1);
+        assert_eq!(store["POST:/login"].len(), 2);
     }
 }
