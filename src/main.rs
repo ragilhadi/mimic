@@ -7,7 +7,7 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use handler::{handle_request, health_check, AppState};
+use handler::{admin_dashboard, clear_requests, handle_request, health_check, list_requests, AppState};
 use loader::load_mocks;
 use std::env;
 use tower_http::trace::TraceLayer;
@@ -43,7 +43,11 @@ async fn main() {
     info!("Loaded {} mock(s)", mocks.len());
 
     // Create application state
-    let state = AppState { mocks };
+    let state = AppState {
+        mocks,
+        request_log: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
 
     // Build router
     let app = create_router(state);
@@ -69,6 +73,9 @@ fn create_router(state: AppState) -> Router {
     Router::new()
         // Health check endpoint
         .route("/health", get(health_check))
+        // Admin dashboard and request history API
+        .route("/admin/dashboard", get(admin_dashboard))
+        .route("/admin/requests", get(list_requests).delete(clear_requests))
         // Catch-all route for mock requests
         .fallback(any(handle_request))
         // Add state
@@ -98,16 +105,22 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
+    fn test_state() -> AppState {
+        AppState {
+            mocks: Arc::new(HashMap::new()),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
-        let state = AppState {
-            mocks: Arc::new(HashMap::new()),
-        };
-        let app = create_router(state);
+        let app = create_router(test_state());
 
         let response = app
             .oneshot(
@@ -124,10 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fallback_route() {
-        let state = AppState {
-            mocks: Arc::new(HashMap::new()),
-        };
-        let app = create_router(state);
+        let app = create_router(test_state());
 
         let response = app
             .oneshot(
@@ -141,5 +151,66 @@ mod tests {
 
         // Should return 404 from mock handler
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_admin_requests_endpoint() {
+        let app = create_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/requests")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_admin_requests_delete() {
+        let app = create_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/requests")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_admin_dashboard_endpoint() {
+        let app = create_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body_str.contains("Mimic"));
+        assert!(body_str.contains("/admin/requests"));
     }
 }

@@ -1,0 +1,6 @@
+{
+  "method": "GET",
+  "path": "/api/users",
+  "status": 200,
+  "response": {"users": [{"id": 1, "name": "Alice"}]}
+}

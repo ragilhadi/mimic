@@ -1,19 +1,25 @@
 use crate::matcher::{find_matching_mock, parse_headers, parse_query_string, RequestContext};
-use crate::types::MockStore;
+use crate::types::{MockStore, RequestLog, RequestRecord};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode, Uri},
-    response::{IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Response},
 };
 use bytes::Bytes;
+use chrono::Utc;
 use http_body_util::BodyExt;
+use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 #[derive(Clone)]
 pub struct AppState {
     pub mocks: MockStore,
+    pub request_log: RequestLog,
+    pub request_counter: Arc<AtomicU64>,
 }
 
 /// Maximum body size to consume for matching (10 MB)
@@ -92,14 +98,21 @@ pub async fn handle_request(
         Some(mock) => {
             info!("Mock matched: {} {} -> {}", method_str, path, mock.status);
 
-            // Convert status code
             let status = StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK);
+            let matched_key = format!("{}:{}", method_str, path);
+
+            // Record the request
+            record_request(&state, context, Some(matched_key), mock.status).await;
 
             // Return configured response
             (status, Json(mock.response.clone())).into_response()
         }
         None => {
             info!("No mock found for: {} {}", method_str, path);
+
+            // Record the request (clone query_params for use in error response)
+            let query_params_clone = context.query_params.clone();
+            record_request(&state, context, None, 404).await;
 
             // Return 404 with detailed error message
             (
@@ -108,7 +121,7 @@ pub async fn handle_request(
                     "error": "mock not found",
                     "method": method_str,
                     "path": path,
-                    "query_params": context.query_params,
+                    "query_params": query_params_clone,
                     "headers_received": parsed_headers.keys().collect::<Vec<_>>()
                 })),
             )
@@ -125,6 +138,94 @@ pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Val
     }))
 }
 
+/// Headers whose values should be redacted in recorded requests
+const SENSITIVE_HEADERS: &[&str] = &["authorization", "cookie", "set-cookie"];
+
+/// Record a request into the request log, redacting sensitive headers
+async fn record_request(
+    state: &AppState,
+    context: RequestContext,
+    matched_mock: Option<String>,
+    response_status: u16,
+) {
+    let redacted_headers = context
+        .headers
+        .into_iter()
+        .map(|(k, v)| {
+            if SENSITIVE_HEADERS.contains(&k.as_str()) {
+                (k, "[REDACTED]".to_string())
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+
+    let mut record = RequestRecord {
+        id: 0,
+        timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        method: context.method,
+        path: context.path,
+        query_params: context.query_params,
+        headers: redacted_headers,
+        body: context.body.and_then(|b| String::from_utf8(b.to_vec()).ok()),
+        matched_mock,
+        response_status,
+    };
+    let mut log = state.request_log.write().await;
+    record.id = state.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    log.push(record);
+}
+
+#[derive(Deserialize, Default)]
+pub struct RequestFilter {
+    pub path: Option<String>,
+    pub method: Option<String>,
+    pub status: Option<u16>,
+}
+
+pub async fn list_requests(
+    State(state): State<AppState>,
+    Query(filter): Query<RequestFilter>,
+) -> Json<serde_json::Value> {
+    let log = state.request_log.read().await;
+    let filtered: Vec<&RequestRecord> = log
+        .iter()
+        .filter(|r| {
+            if let Some(ref p) = filter.path {
+                if &r.path != p {
+                    return false;
+                }
+            }
+            if let Some(ref m) = filter.method {
+                if !r.method.eq_ignore_ascii_case(m) {
+                    return false;
+                }
+            }
+            if let Some(s) = filter.status {
+                if r.response_status != s {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    Json(json!({
+        "count": filtered.len(),
+        "requests": filtered
+    }))
+}
+
+pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
+    let mut log = state.request_log.write().await;
+    log.clear();
+    StatusCode::NO_CONTENT
+}
+
+pub async fn admin_dashboard() -> Html<&'static str> {
+    Html(include_str!("../static/dashboard.html"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +236,7 @@ mod tests {
     use axum::http::Method;
     use http_body_util::BodyExt;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     fn create_test_state() -> AppState {
@@ -184,12 +286,16 @@ mod tests {
 
         AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn create_empty_state() -> AppState {
         AppState {
             mocks: Arc::new(HashMap::new()),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -351,6 +457,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with correct query param
@@ -393,6 +501,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with numeric page
@@ -445,6 +555,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with correct header
@@ -495,6 +607,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with any Bearer token
@@ -546,6 +660,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with exact body
@@ -588,6 +704,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with partial body (extra fields ignored)
@@ -647,6 +765,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with all criteria met
@@ -713,6 +833,8 @@ mod tests {
 
         let state = AppState {
             mocks: Arc::new(mocks),
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Request with admin role should return admin mock
@@ -738,5 +860,237 @@ mod tests {
         let bytes = resp_body.collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["role"], "user");
+    }
+
+    // =========================================================================
+    // Request History API Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_list_requests_empty() {
+        let state = create_empty_state();
+        let filter = Query(RequestFilter::default());
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 0);
+        assert_eq!(response.0["requests"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_request_recording() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter::default());
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 1);
+        let requests = response.0["requests"].as_array().unwrap();
+        assert_eq!(requests[0]["id"], 1);
+        assert_eq!(requests[0]["method"], "GET");
+        assert_eq!(requests[0]["path"], "/users");
+        assert_eq!(requests[0]["response_status"], 200);
+        assert_eq!(requests[0]["matched_mock"], "GET:/users");
+    }
+
+    #[tokio::test]
+    async fn test_request_recording_not_found() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/nonexistent".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter::default());
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 1);
+        let requests = response.0["requests"].as_array().unwrap();
+        assert_eq!(requests[0]["response_status"], 404);
+        assert!(requests[0]["matched_mock"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_request_filtering_by_path() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let _ = handle_request(
+            Method::POST,
+            "/login".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter {
+            path: Some("/users".to_string()),
+            method: None,
+            status: None,
+        });
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 1);
+        assert_eq!(response.0["requests"][0]["path"], "/users");
+    }
+
+    #[tokio::test]
+    async fn test_request_filtering_by_method() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let _ = handle_request(
+            Method::POST,
+            "/login".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter {
+            path: None,
+            method: Some("POST".to_string()),
+            status: None,
+        });
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 1);
+        assert_eq!(response.0["requests"][0]["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn test_request_filtering_by_status() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let _ = handle_request(
+            Method::GET,
+            "/missing".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter {
+            path: None,
+            method: None,
+            status: Some(404),
+        });
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 1);
+        assert_eq!(response.0["requests"][0]["response_status"], 404);
+    }
+
+    #[tokio::test]
+    async fn test_clear_requests() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        {
+            let log = state.request_log.read().await;
+            assert_eq!(log.len(), 1);
+        }
+
+        let status = clear_requests(State(state.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let filter = Query(RequestFilter::default());
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_request_ids_increment() {
+        let state = create_test_state();
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let _ = handle_request(
+            Method::POST,
+            "/login".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter::default());
+        let response = list_requests(State(state), filter).await;
+        assert_eq!(response.0["count"], 2);
+        assert_eq!(response.0["requests"][0]["id"], 1);
+        assert_eq!(response.0["requests"][1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_sensitive_headers_redacted() {
+        let state = create_test_state();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
+        headers.insert("cookie", "session=abc123".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let _ = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let filter = Query(RequestFilter::default());
+        let response = list_requests(State(state), filter).await;
+        let requests = response.0["requests"].as_array().unwrap();
+        let recorded_headers = requests[0]["headers"].as_object().unwrap();
+        assert_eq!(recorded_headers["authorization"], "[REDACTED]");
+        assert_eq!(recorded_headers["cookie"], "[REDACTED]");
+        assert_eq!(recorded_headers["content-type"], "application/json");
     }
 }
