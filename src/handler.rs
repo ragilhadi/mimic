@@ -11,12 +11,15 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 #[derive(Clone)]
 pub struct AppState {
     pub mocks: MockStore,
     pub request_log: RequestLog,
+    pub request_counter: Arc<AtomicU64>,
 }
 
 /// Maximum body size to consume for matching (10 MB)
@@ -99,8 +102,8 @@ pub async fn handle_request(
             let matched_key = format!("{}:{}", method_str, path);
 
             // Record the request
-            let record = RequestRecord {
-                id: 0, // will be assigned below
+            let mut record = RequestRecord {
+                id: 0,
                 timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 method: method_str,
                 path,
@@ -112,9 +115,7 @@ pub async fn handle_request(
             };
             {
                 let mut log = state.request_log.write().await;
-                let id = log.len() as u64 + 1;
-                let mut record = record;
-                record.id = id;
+                record.id = state.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 log.push(record);
             }
 
@@ -125,7 +126,7 @@ pub async fn handle_request(
             info!("No mock found for: {} {}", method_str, path);
 
             // Record the request
-            let record = RequestRecord {
+            let mut record = RequestRecord {
                 id: 0,
                 timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 method: method_str.clone(),
@@ -138,9 +139,7 @@ pub async fn handle_request(
             };
             {
                 let mut log = state.request_log.write().await;
-                let id = log.len() as u64 + 1;
-                let mut record = record;
-                record.id = id;
+                record.id = state.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 log.push(record);
             }
 
@@ -224,6 +223,7 @@ mod tests {
     use axum::http::Method;
     use http_body_util::BodyExt;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     fn create_test_state() -> AppState {
@@ -274,6 +274,7 @@ mod tests {
         AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -281,6 +282,7 @@ mod tests {
         AppState {
             mocks: Arc::new(HashMap::new()),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -443,6 +445,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with correct query param
@@ -486,6 +489,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with numeric page
@@ -539,6 +543,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with correct header
@@ -590,6 +595,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with any Bearer token
@@ -642,6 +648,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with exact body
@@ -685,6 +692,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with partial body (extra fields ignored)
@@ -745,6 +753,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Should match with all criteria met
@@ -812,6 +821,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(mocks),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
         };
 
         // Request with admin role should return admin mock

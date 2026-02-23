@@ -46,6 +46,7 @@ async fn main() {
     let state = AppState {
         mocks,
         request_log: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // Build router
@@ -113,6 +114,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(HashMap::new()),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let app = create_router(state);
 
@@ -134,6 +136,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(HashMap::new()),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let app = create_router(state);
 
@@ -156,6 +159,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(HashMap::new()),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let app = create_router(state);
 
@@ -181,6 +185,7 @@ mod tests {
         let state = AppState {
             mocks: Arc::new(HashMap::new()),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let app = create_router(state);
 
