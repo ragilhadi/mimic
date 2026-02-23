@@ -44,7 +44,11 @@ pub async fn handle_request(
         .map(|s| s.to_string());
 
     // Check if any mock needs body matching
-    let needs_body_matching = state.mocks.values().flatten().any(|mock| mock.body.is_some());
+    let needs_body_matching = state
+        .mocks
+        .values()
+        .flatten()
+        .any(|mock| mock.body.is_some());
 
     // Consume body if needed for matching or if consume_body is set
     let body_bytes: Option<Bytes> =
@@ -716,8 +720,7 @@ mod tests {
         headers.insert("content-type", "application/json".parse().unwrap());
         let uri = "/login".parse().unwrap();
         let body = Body::from(r#"{"role":"admin"}"#);
-        let response =
-            handle_request(Method::POST, uri, headers, State(state.clone()), body).await;
+        let response = handle_request(Method::POST, uri, headers, State(state.clone()), body).await;
         assert_eq!(response.status(), StatusCode::OK);
         let (_, resp_body) = response.into_parts();
         let bytes = resp_body.collect().await.unwrap().to_bytes();
