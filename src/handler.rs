@@ -171,6 +171,7 @@ async fn record_request(
         matched_mock,
         response_status,
     };
+    // IDs are unique but may not be strictly sequential under concurrent load
     let mut log = state.request_log.write().await;
     record.id = state.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
     log.push(record);

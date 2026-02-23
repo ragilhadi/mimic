@@ -103,6 +103,7 @@ tbody td{padding:.6rem 1rem;font-size:.85rem;vertical-align:top}
 <script>
 (function(){
   const API = '/admin/requests';
+  const REFRESH_INTERVAL_MS = 3000;
   let refreshTimer = null;
   let expandedRows = new Set();
 
@@ -234,7 +235,7 @@ tbody td{padding:.6rem 1rem;font-size:.85rem;vertical-align:top}
   // Auto-refresh
   function startAutoRefresh(){
     stopAutoRefresh();
-    refreshTimer = setInterval(fetchRequests, 3000);
+    refreshTimer = setInterval(fetchRequests, REFRESH_INTERVAL_MS);
   }
   function stopAutoRefresh(){
     if(refreshTimer){ clearInterval(refreshTimer); refreshTimer=null; }
