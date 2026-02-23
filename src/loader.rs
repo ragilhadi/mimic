@@ -62,10 +62,11 @@ fn collect_json_files(dir: &Path, mocks: &mut HashMap<String, Vec<MockConfig>>) 
                         let entry = mocks.entry(key).or_default();
                         if !entry.is_empty() {
                             warn!(
-                                "Multiple mocks registered for {} {}: {} total",
+                                "Multiple mocks registered for {} {}: {} total (file: {})",
                                 mock.method,
                                 mock.path,
-                                entry.len() + 1
+                                entry.len() + 1,
+                                entry_path.display()
                             );
                         }
                         entry.push(mock);
