@@ -191,7 +191,7 @@ impl MockConfig {
     }
 }
 
-pub type MockStore = Arc<HashMap<String, MockConfig>>;
+pub type MockStore = Arc<HashMap<String, Vec<MockConfig>>>;
 
 /// Create a lookup key from method and path (without query string)
 pub fn create_mock_key(method: &str, path: &str) -> String {
@@ -350,7 +350,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "GET:/test".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "GET".to_string(),
                 path: "/test".to_string(),
                 status: 200,
@@ -359,11 +359,12 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
-            },
+            }],
         );
 
         let store: MockStore = Arc::new(map);
         assert_eq!(store.len(), 1);
+        assert_eq!(store["GET:/test"].len(), 1);
         assert!(store.contains_key("GET:/test"));
         assert!(!store.contains_key("POST:/test"));
     }

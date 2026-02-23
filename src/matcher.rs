@@ -528,19 +528,15 @@ pub fn find_matching_mock(context: &RequestContext, mocks: &MockStore) -> Option
     let mut candidates: Vec<MatchResult> = Vec::new();
 
     // Find all mocks that match method and path
-    for (_key, mock) in mocks.iter() {
-        // Check if method and base path match
-        let mock_key = crate::types::create_mock_key(&mock.method, &mock.path);
-        if mock_key != base_key {
-            continue;
-        }
-
-        // Calculate match score
-        if let Some(score) = calculate_match_score(context, mock) {
-            candidates.push(MatchResult {
-                mock: mock.clone(),
-                score,
-            });
+    if let Some(mock_list) = mocks.get(&base_key) {
+        for mock in mock_list {
+            // Calculate match score
+            if let Some(score) = calculate_match_score(context, mock) {
+                candidates.push(MatchResult {
+                    mock: mock.clone(),
+                    score,
+                });
+            }
         }
     }
 

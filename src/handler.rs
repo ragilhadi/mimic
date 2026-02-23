@@ -44,7 +44,11 @@ pub async fn handle_request(
         .map(|s| s.to_string());
 
     // Check if any mock needs body matching
-    let needs_body_matching = state.mocks.values().any(|mock| mock.body.is_some());
+    let needs_body_matching = state
+        .mocks
+        .values()
+        .flatten()
+        .any(|mock| mock.body.is_some());
 
     // Consume body if needed for matching or if consume_body is set
     let body_bytes: Option<Bytes> =
@@ -138,7 +142,7 @@ mod tests {
 
         mocks.insert(
             "GET:/users".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "GET".to_string(),
                 path: "/users".to_string(),
                 status: 200,
@@ -147,12 +151,12 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
-            },
+            }],
         );
 
         mocks.insert(
             "POST:/login".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "POST".to_string(),
                 path: "/login".to_string(),
                 status: 201,
@@ -161,12 +165,12 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
-            },
+            }],
         );
 
         mocks.insert(
             "DELETE:/users/123".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "DELETE".to_string(),
                 path: "/users/123".to_string(),
                 status: 204,
@@ -175,7 +179,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
-            },
+            }],
         );
 
         AppState {
@@ -327,7 +331,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "GET:/search".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "GET".to_string(),
                 path: "/search".to_string(),
                 status: 200,
@@ -342,7 +346,7 @@ mod tests {
                 }),
                 headers: None,
                 body: None,
-            },
+            }],
         );
 
         let state = AppState {
@@ -369,7 +373,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "GET:/users".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "GET".to_string(),
                 path: "/users".to_string(),
                 status: 200,
@@ -384,7 +388,7 @@ mod tests {
                 }),
                 headers: None,
                 body: None,
-            },
+            }],
         );
 
         let state = AppState {
@@ -420,7 +424,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "GET:/protected".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "GET".to_string(),
                 path: "/protected".to_string(),
                 status: 200,
@@ -436,7 +440,7 @@ mod tests {
                     strict: false,
                 }),
                 body: None,
-            },
+            }],
         );
 
         let state = AppState {
@@ -470,7 +474,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "GET:/api".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "GET".to_string(),
                 path: "/api".to_string(),
                 status: 200,
@@ -486,7 +490,7 @@ mod tests {
                     strict: false,
                 }),
                 body: None,
-            },
+            }],
         );
 
         let state = AppState {
@@ -524,7 +528,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "POST:/login".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "POST".to_string(),
                 path: "/login".to_string(),
                 status: 200,
@@ -537,7 +541,7 @@ mod tests {
                     partial: None,
                     strict: false,
                 })),
-            },
+            }],
         );
 
         let state = AppState {
@@ -566,7 +570,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "POST:/users".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "POST".to_string(),
                 path: "/users".to_string(),
                 status: 201,
@@ -579,7 +583,7 @@ mod tests {
                     partial: Some(json!({"name": "Alice"})),
                     strict: false,
                 })),
-            },
+            }],
         );
 
         let state = AppState {
@@ -612,7 +616,7 @@ mod tests {
         let mut mocks = HashMap::new();
         mocks.insert(
             "POST:/api/search".to_string(),
-            MockConfig {
+            vec![MockConfig {
                 method: "POST".to_string(),
                 path: "/api/search".to_string(),
                 status: 200,
@@ -638,7 +642,7 @@ mod tests {
                     partial: Some(json!({"query": "Alice"})),
                     strict: false,
                 })),
-            },
+            }],
         );
 
         let state = AppState {
@@ -662,5 +666,77 @@ mod tests {
         let body = Body::from(r#"{"query":"Alice"}"#);
         let response = handle_request(Method::POST, uri, headers, State(state), body).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Multiple Mocks per METHOD:PATH Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_multiple_mocks_same_path_body_differentiation() {
+        // Reproduce the bug: two POST /login mocks differ only by body matcher.
+        // Both must be retained and the highest-scoring one must win.
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/login".to_string(),
+            vec![
+                MockConfig {
+                    method: "POST".to_string(),
+                    path: "/login".to_string(),
+                    status: 200,
+                    response: json!({"role": "admin"}),
+                    consume_body: true,
+                    query_params: None,
+                    headers: None,
+                    body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                        exact: None,
+                        partial: Some(json!({"role": "admin"})),
+                        strict: false,
+                    })),
+                },
+                MockConfig {
+                    method: "POST".to_string(),
+                    path: "/login".to_string(),
+                    status: 200,
+                    response: json!({"role": "user"}),
+                    consume_body: true,
+                    query_params: None,
+                    headers: None,
+                    body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                        exact: None,
+                        partial: Some(json!({"role": "user"})),
+                        strict: false,
+                    })),
+                },
+            ],
+        );
+
+        let state = AppState {
+            mocks: Arc::new(mocks),
+        };
+
+        // Request with admin role should return admin mock
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/login".parse().unwrap();
+        let body = Body::from(r#"{"role":"admin"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state.clone()), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, resp_body) = response.into_parts();
+        let bytes = resp_body.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["role"], "admin");
+
+        // Request with user role should return user mock
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/login".parse().unwrap();
+        let body = Body::from(r#"{"role":"user"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, resp_body) = response.into_parts();
+        let bytes = resp_body.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["role"], "user");
     }
 }
