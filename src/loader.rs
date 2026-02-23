@@ -38,38 +38,45 @@ pub fn load_mocks(path: &str) -> MockStore {
             entry.push(mock);
         }
     } else if path_obj.is_dir() {
-        // Load all JSON files from directory
-        match fs::read_dir(path_obj) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if entry_path.is_file()
-                        && (entry_path.extension().and_then(|s| s.to_str()) == Some("json"))
-                    {
-                        if let Ok(mock) = load_single_mock(&entry_path) {
-                            let key = create_mock_key(&mock.method, &mock.path);
-                            debug!("Loaded mock: {} -> {}", key, entry_path.display());
-                            let entry = mocks.entry(key).or_default();
-                            if !entry.is_empty() {
-                                warn!(
-                                    "Multiple mocks registered for {} {}: {} total",
-                                    mock.method,
-                                    mock.path,
-                                    entry.len() + 1
-                                );
-                            }
-                            entry.push(mock);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to read directory {}: {}", path, e);
-            }
-        }
+        // Load all JSON files from directory tree (recursive)
+        collect_json_files(path_obj, &mut mocks);
     }
 
     Arc::new(mocks)
+}
+
+/// Recursively collects and loads all JSON mock files from a directory tree.
+fn collect_json_files(dir: &Path, mocks: &mut HashMap<String, Vec<MockConfig>>) {
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    collect_json_files(&entry_path, mocks);
+                } else if entry_path.is_file()
+                    && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
+                {
+                    if let Ok(mock) = load_single_mock(&entry_path) {
+                        let key = create_mock_key(&mock.method, &mock.path);
+                        debug!("Loaded mock: {} -> {}", key, entry_path.display());
+                        let entry = mocks.entry(key).or_default();
+                        if !entry.is_empty() {
+                            warn!(
+                                "Multiple mocks registered for {} {}: {} total",
+                                mock.method,
+                                mock.path,
+                                entry.len() + 1
+                            );
+                        }
+                        entry.push(mock);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to read directory {}: {}", dir.display(), e);
+        }
+    }
 }
 
 /// Loads a single mock configuration from a JSON file.
@@ -101,7 +108,7 @@ fn load_single_mock(path: &Path) -> Result<MockConfig, String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -196,6 +203,52 @@ mod tests {
 
         let store = load_mocks(temp_dir.path().to_str().unwrap());
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_load_mocks_from_subdirectory() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        // Create a mock in the top-level directory
+        let mock1 = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+        let mut file1 = File::create(dir_path.join("top.json")).unwrap();
+        file1.write_all(mock1.as_bytes()).unwrap();
+
+        // Create a subdirectory with a mock
+        let sub_dir = dir_path.join("advanced");
+        fs::create_dir(&sub_dir).unwrap();
+        let mock2 = r#"{
+            "method": "POST",
+            "path": "/login",
+            "status": 200,
+            "response": {"token": "abc"}
+        }"#;
+        let mut file2 = File::create(sub_dir.join("login.json")).unwrap();
+        file2.write_all(mock2.as_bytes()).unwrap();
+
+        // Create a nested subdirectory
+        let nested_dir = sub_dir.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+        let mock3 = r#"{
+            "method": "DELETE",
+            "path": "/items/1",
+            "status": 204,
+            "response": {}
+        }"#;
+        let mut file3 = File::create(nested_dir.join("delete.json")).unwrap();
+        file3.write_all(mock3.as_bytes()).unwrap();
+
+        let store = load_mocks(dir_path.to_str().unwrap());
+        assert_eq!(store.len(), 3);
+        assert!(store.contains_key("GET:/users"));
+        assert!(store.contains_key("POST:/login"));
+        assert!(store.contains_key("DELETE:/items/1"));
     }
 
     #[test]
