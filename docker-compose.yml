@@ -1,6 +1,6 @@
 services:
   mimic:
-    image: mimic:latest
+    image: ragilhadi/mimic:latest
     container_name: mimic
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
