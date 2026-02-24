@@ -167,7 +167,9 @@ async fn record_request(
         path: context.path,
         query_params: context.query_params,
         headers: redacted_headers,
-        body: context.body.and_then(|b| String::from_utf8(b.to_vec()).ok()),
+        body: context
+            .body
+            .and_then(|b| String::from_utf8(b.to_vec()).ok()),
         matched_mock,
         response_status,
     };

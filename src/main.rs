@@ -7,7 +7,9 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use handler::{admin_dashboard, clear_requests, handle_request, health_check, list_requests, AppState};
+use handler::{
+    admin_dashboard, clear_requests, handle_request, health_check, list_requests, AppState,
+};
 use loader::load_mocks;
 use std::env;
 use tower_http::trace::TraceLayer;
