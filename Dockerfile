@@ -7,6 +7,7 @@ WORKDIR /build
 # Copy all source files
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
+COPY static ./static
 
 # Build the application
 RUN cargo build --release

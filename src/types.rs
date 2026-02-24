@@ -193,6 +193,28 @@ impl MockConfig {
 
 pub type MockStore = Arc<HashMap<String, Vec<MockConfig>>>;
 
+// ============================================================================
+// Request History Types
+// ============================================================================
+
+/// A recorded incoming request and its outcome
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestRecord {
+    pub id: u64,
+    pub timestamp: String,
+    pub method: String,
+    pub path: String,
+    pub query_params: HashMap<String, String>,
+    pub headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_mock: Option<String>,
+    pub response_status: u16,
+}
+
+pub type RequestLog = Arc<tokio::sync::RwLock<Vec<RequestRecord>>>;
+
 /// Create a lookup key from method and path (without query string)
 pub fn create_mock_key(method: &str, path: &str) -> String {
     // Strip query string if present for the key

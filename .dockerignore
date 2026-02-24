@@ -1,0 +1,5 @@
+target/
+coverage/
+issues/
+.git/
+*.md
