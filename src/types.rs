@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 // ============================================================================
 // Query Parameter Matching Types
@@ -191,7 +192,7 @@ impl MockConfig {
     }
 }
 
-pub type MockStore = Arc<HashMap<String, Vec<MockConfig>>>;
+pub type MockStore = Arc<RwLock<HashMap<String, Vec<MockConfig>>>>;
 
 // ============================================================================
 // Request History Types
@@ -367,8 +368,8 @@ mod tests {
         assert_eq!(cloned.status, config.status);
     }
 
-    #[test]
-    fn test_mock_store_operations() {
+    #[tokio::test]
+    async fn test_mock_store_operations() {
         let mut map = HashMap::new();
         map.insert(
             "GET:/test".to_string(),
@@ -384,11 +385,12 @@ mod tests {
             }],
         );
 
-        let store: MockStore = Arc::new(map);
-        assert_eq!(store.len(), 1);
-        assert_eq!(store["GET:/test"].len(), 1);
-        assert!(store.contains_key("GET:/test"));
-        assert!(!store.contains_key("POST:/test"));
+        let store: MockStore = Arc::new(RwLock::new(map));
+        let mocks = store.read().await;
+        assert_eq!(mocks.len(), 1);
+        assert_eq!(mocks["GET:/test"].len(), 1);
+        assert!(mocks.contains_key("GET:/test"));
+        assert!(!mocks.contains_key("POST:/test"));
     }
 
     #[test]

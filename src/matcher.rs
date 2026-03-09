@@ -7,7 +7,7 @@
 
 use crate::types::{
     BodyMatcher, FormBodyMatcher, HeaderMatcher, HeaderPattern, HeaderValue, JsonBodyMatcher,
-    MockConfig, MockStore, QueryParamMatcher, QueryParamPattern, QueryParamValue, TextBodyMatcher,
+    MockConfig, QueryParamMatcher, QueryParamPattern, QueryParamValue, TextBodyMatcher,
 };
 use bytes::Bytes;
 use regex::Regex;
@@ -516,7 +516,10 @@ pub struct MatchResult {
 }
 
 /// Find the best matching mock for a request
-pub fn find_matching_mock(context: &RequestContext, mocks: &MockStore) -> Option<MockConfig> {
+pub fn find_matching_mock(
+    context: &RequestContext,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+) -> Option<MockConfig> {
     let base_key = crate::types::create_mock_key(&context.method, &context.path);
 
     debug!(
