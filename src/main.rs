@@ -55,10 +55,13 @@ async fn main() {
     };
 
     // Spawn background task for hot-reloading mock files
+    const RELOAD_INTERVAL_SECS: u64 = 2;
     let reload_mocks = mocks;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-        // Skip the first immediate tick
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
+        // tokio::time::interval fires immediately on creation; skip the first
+        // tick to avoid redundantly reloading mocks that were just loaded at startup.
         interval.tick().await;
         loop {
             interval.tick().await;

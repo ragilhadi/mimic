@@ -101,7 +101,7 @@ pub async fn handle_request(
             let status = StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK);
             let matched_key = format!("{}:{}", method_str, path);
 
-            // Drop the read lock before recording the request
+            // Release read lock before recording to avoid holding it during async I/O
             drop(mocks);
 
             // Record the request
@@ -113,7 +113,7 @@ pub async fn handle_request(
         None => {
             info!("No mock found for: {} {}", method_str, path);
 
-            // Drop the read lock before recording the request
+            // Release read lock before recording to avoid holding it during async I/O
             drop(mocks);
 
             // Record the request (clone query_params for use in error response)
