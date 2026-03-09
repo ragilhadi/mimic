@@ -27,7 +27,7 @@ pub fn load_mocks_map(path: &str) -> LoadResult {
         warn!("Mock path does not exist: {}", path);
         return LoadResult {
             mocks: HashMap::new(),
-            errors: 0,
+            errors: 1,
         };
     }
 
@@ -193,6 +193,7 @@ mod tests {
     fn test_load_mocks_nonexistent_directory() {
         let result = load_mocks_map("/nonexistent/path");
         assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
@@ -200,6 +201,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let result = load_mocks_map(temp_dir.path().to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 0);
     }
 
     #[test]
@@ -214,6 +216,7 @@ mod tests {
 
         let result = load_mocks_map(dir_path.to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 0);
     }
 
     #[test]
@@ -303,6 +306,7 @@ mod tests {
 
         let result = load_mocks_map(file_path.to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
