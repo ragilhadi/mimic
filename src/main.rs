@@ -13,7 +13,7 @@ use handler::{
 use loader::{load_mocks, load_mocks_map};
 use std::env;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Application entry point.
@@ -65,16 +65,35 @@ async fn main() {
         interval.tick().await;
         loop {
             interval.tick().await;
-            let new_mocks = load_mocks_map(MOCKS_DIR);
+            let mocks_dir = MOCKS_DIR;
+            // Run blocking file I/O off the async runtime to avoid stalling request handling
+            let result = tokio::task::spawn_blocking(move || load_mocks_map(mocks_dir))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Hot reload task panicked: {}", e);
+                    loader::LoadResult {
+                        mocks: std::collections::HashMap::new(),
+                        errors: 1,
+                    }
+                });
+            if result.errors > 0 {
+                warn!(
+                    "🔄 Hot reload: {} error(s) loading mocks, keeping previous mock set",
+                    result.errors
+                );
+                continue;
+            }
             let mut store = reload_mocks.write().await;
             let old_len = store.len();
-            *store = new_mocks;
+            *store = result.mocks;
             let new_len = store.len();
             if old_len != new_len {
                 info!(
                     "🔄 Hot reload: mocks updated ({} -> {} endpoint(s))",
                     old_len, new_len
                 );
+            } else {
+                debug!("🔄 Hot reload: mocks reloaded ({} endpoint(s), no changes)", new_len);
             }
         }
     });
