@@ -544,7 +544,7 @@ pub fn find_matching_mock(
     }
 
     // Sort by score (highest first) and return best match
-    candidates.sort_by(|a, b| b.score.cmp(&a.score));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.score));
 
     if let Some(best) = candidates.into_iter().next() {
         debug!("Found matching mock with score {}", best.score);

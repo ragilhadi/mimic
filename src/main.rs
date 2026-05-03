@@ -93,7 +93,10 @@ async fn main() {
                     old_len, new_len
                 );
             } else {
-                debug!("🔄 Hot reload: mocks reloaded ({} endpoint(s), no changes)", new_len);
+                debug!(
+                    "🔄 Hot reload: mocks reloaded ({} endpoint(s), no changes)",
+                    new_len
+                );
             }
         }
     });
