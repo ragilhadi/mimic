@@ -10,10 +10,10 @@ use axum::{
 use handler::{
     admin_dashboard, clear_requests, handle_request, health_check, list_requests, AppState,
 };
-use loader::load_mocks;
+use loader::{load_mocks, load_mocks_map};
 use std::env;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Application entry point.
@@ -42,14 +42,64 @@ async fn main() {
 
     // Load mock configurations
     let mocks = load_mocks(MOCKS_DIR);
-    info!("Loaded {} mock(s)", mocks.len());
+    {
+        let m = mocks.read().await;
+        info!("Loaded {} mock(s)", m.len());
+    }
 
     // Create application state
     let state = AppState {
-        mocks,
+        mocks: mocks.clone(),
         request_log: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
+
+    // Spawn background task for hot-reloading mock files
+    const RELOAD_INTERVAL_SECS: u64 = 2;
+    let reload_mocks = mocks;
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
+        // tokio::time::interval fires immediately on creation; skip the first
+        // tick to avoid redundantly reloading mocks that were just loaded at startup.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let mocks_dir = MOCKS_DIR;
+            // Run blocking file I/O off the async runtime to avoid stalling request handling
+            let result = tokio::task::spawn_blocking(move || load_mocks_map(mocks_dir))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Hot reload task panicked: {}", e);
+                    loader::LoadResult {
+                        mocks: std::collections::HashMap::new(),
+                        errors: 1,
+                    }
+                });
+            if result.errors > 0 {
+                warn!(
+                    "🔄 Hot reload: {} error(s) loading mocks, keeping previous mock set",
+                    result.errors
+                );
+                continue;
+            }
+            let mut store = reload_mocks.write().await;
+            let old_len = store.len();
+            *store = result.mocks;
+            let new_len = store.len();
+            if old_len != new_len {
+                info!(
+                    "🔄 Hot reload: mocks updated ({} -> {} endpoint(s))",
+                    old_len, new_len
+                );
+            } else {
+                debug!(
+                    "🔄 Hot reload: mocks reloaded ({} endpoint(s), no changes)",
+                    new_len
+                );
+            }
+        }
+    });
 
     // Build router
     let app = create_router(state);
@@ -64,6 +114,7 @@ async fn main() {
 
     info!("🚀 Server listening on http://{}", addr);
     info!("📋 Health check available at http://{}/health", addr);
+    info!("🔄 Hot reload enabled (checking every 2s)");
 
     // Start server
     axum::serve(listener, app).await.unwrap_or_else(|e| {
@@ -114,7 +165,7 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
-            mocks: Arc::new(HashMap::new()),
+            mocks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }

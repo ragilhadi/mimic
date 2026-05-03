@@ -49,12 +49,11 @@ pub async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Check if any mock needs body matching
-    let needs_body_matching = state
-        .mocks
-        .values()
-        .flatten()
-        .any(|mock| mock.body.is_some());
+    // Check if any mock needs body matching (acquire read lock)
+    let needs_body_matching = {
+        let mocks = state.mocks.read().await;
+        mocks.values().flatten().any(|mock| mock.body.is_some())
+    };
 
     // Consume body if needed for matching or if consume_body is set
     let body_bytes: Option<Bytes> =
@@ -93,13 +92,17 @@ pub async fn handle_request(
         content_type,
     };
 
-    // Find matching mock using the new matcher
-    match find_matching_mock(&context, &state.mocks) {
+    // Find matching mock using the matcher (acquire read lock)
+    let mocks = state.mocks.read().await;
+    match find_matching_mock(&context, &mocks) {
         Some(mock) => {
             info!("Mock matched: {} {} -> {}", method_str, path, mock.status);
 
             let status = StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK);
             let matched_key = format!("{}:{}", method_str, path);
+
+            // Release read lock before recording to avoid holding it during async I/O
+            drop(mocks);
 
             // Record the request
             record_request(&state, context, Some(matched_key), mock.status).await;
@@ -109,6 +112,9 @@ pub async fn handle_request(
         }
         None => {
             info!("No mock found for: {} {}", method_str, path);
+
+            // Release read lock before recording to avoid holding it during async I/O
+            drop(mocks);
 
             // Record the request (clone query_params for use in error response)
             let query_params_clone = context.query_params.clone();
@@ -131,9 +137,10 @@ pub async fn handle_request(
 }
 
 pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mocks = state.mocks.read().await;
     Json(json!({
         "status": "healthy",
-        "mocks_loaded": state.mocks.len(),
+        "mocks_loaded": mocks.len(),
         "service": "mimic"
     }))
 }
@@ -288,7 +295,7 @@ mod tests {
         );
 
         AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         }
@@ -296,7 +303,7 @@ mod tests {
 
     fn create_empty_state() -> AppState {
         AppState {
-            mocks: Arc::new(HashMap::new()),
+            mocks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         }
@@ -459,7 +466,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -503,7 +510,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -557,7 +564,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -609,7 +616,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -662,7 +669,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -706,7 +713,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -767,7 +774,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };
@@ -835,7 +842,7 @@ mod tests {
         );
 
         let state = AppState {
-            mocks: Arc::new(mocks),
+            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
         };

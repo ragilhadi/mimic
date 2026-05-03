@@ -3,7 +3,65 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
+
+/// Result of loading mock configurations, including any errors encountered.
+pub struct LoadResult {
+    pub mocks: HashMap<String, Vec<MockConfig>>,
+    pub errors: usize,
+}
+
+/// Loads mock configurations from a directory or file into a raw HashMap.
+///
+/// Args:
+///     path (str): Path to directory containing JSON mock files or a single JSON file.
+///
+/// Returns:
+///     LoadResult containing mock configurations keyed by "METHOD:PATH" and the
+///     number of files that failed to load.
+pub fn load_mocks_map(path: &str) -> LoadResult {
+    let path_obj = Path::new(path);
+
+    if !path_obj.exists() {
+        warn!("Mock path does not exist: {}", path);
+        return LoadResult {
+            mocks: HashMap::new(),
+            errors: 1,
+        };
+    }
+
+    let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+    let mut errors: usize = 0;
+
+    if path_obj.is_file() {
+        // Load single file
+        match load_single_mock(path_obj) {
+            Ok(mock) => {
+                let key = create_mock_key(&mock.method, &mock.path);
+                let entry = mocks.entry(key).or_default();
+                if !entry.is_empty() {
+                    warn!(
+                        "Multiple mocks registered for {} {}: {} total",
+                        mock.method,
+                        mock.path,
+                        entry.len() + 1
+                    );
+                }
+                entry.push(mock);
+            }
+            Err(e) => {
+                warn!("Failed to load mock file {}: {}", path, e);
+                errors += 1;
+            }
+        }
+    } else if path_obj.is_dir() {
+        // Load all JSON files from directory tree (recursive)
+        collect_json_files(path_obj, &mut mocks, &mut errors);
+    }
+
+    LoadResult { mocks, errors }
+}
 
 /// Loads mock configurations from a directory or file.
 ///
@@ -13,69 +71,52 @@ use tracing::{debug, error, warn};
 /// Returns:
 ///     MockStore: Thread-safe HashMap of mock configurations keyed by "METHOD:PATH".
 pub fn load_mocks(path: &str) -> MockStore {
-    let path_obj = Path::new(path);
-
-    if !path_obj.exists() {
-        warn!("Mock path does not exist: {}", path);
-        return Arc::new(HashMap::new());
-    }
-
-    let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
-
-    if path_obj.is_file() {
-        // Load single file
-        if let Ok(mock) = load_single_mock(path_obj) {
-            let key = create_mock_key(&mock.method, &mock.path);
-            let entry = mocks.entry(key).or_default();
-            if !entry.is_empty() {
-                warn!(
-                    "Multiple mocks registered for {} {}: {} total",
-                    mock.method,
-                    mock.path,
-                    entry.len() + 1
-                );
-            }
-            entry.push(mock);
-        }
-    } else if path_obj.is_dir() {
-        // Load all JSON files from directory tree (recursive)
-        collect_json_files(path_obj, &mut mocks);
-    }
-
-    Arc::new(mocks)
+    let result = load_mocks_map(path);
+    Arc::new(RwLock::new(result.mocks))
 }
 
 /// Recursively collects and loads all JSON mock files from a directory tree.
-fn collect_json_files(dir: &Path, mocks: &mut HashMap<String, Vec<MockConfig>>) {
+fn collect_json_files(
+    dir: &Path,
+    mocks: &mut HashMap<String, Vec<MockConfig>>,
+    errors: &mut usize,
+) {
     match fs::read_dir(dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
                 if entry_path.is_dir() {
-                    collect_json_files(&entry_path, mocks);
+                    collect_json_files(&entry_path, mocks, errors);
                 } else if entry_path.is_file()
                     && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
                 {
-                    if let Ok(mock) = load_single_mock(&entry_path) {
-                        let key = create_mock_key(&mock.method, &mock.path);
-                        debug!("Loaded mock: {} -> {}", key, entry_path.display());
-                        let entry = mocks.entry(key).or_default();
-                        if !entry.is_empty() {
-                            warn!(
-                                "Multiple mocks registered for {} {}: {} total (file: {})",
-                                mock.method,
-                                mock.path,
-                                entry.len() + 1,
-                                entry_path.display()
-                            );
+                    match load_single_mock(&entry_path) {
+                        Ok(mock) => {
+                            let key = create_mock_key(&mock.method, &mock.path);
+                            debug!("Loaded mock: {} -> {}", key, entry_path.display());
+                            let entry = mocks.entry(key).or_default();
+                            if !entry.is_empty() {
+                                warn!(
+                                    "Multiple mocks registered for {} {}: {} total (file: {})",
+                                    mock.method,
+                                    mock.path,
+                                    entry.len() + 1,
+                                    entry_path.display()
+                                );
+                            }
+                            entry.push(mock);
                         }
-                        entry.push(mock);
+                        Err(e) => {
+                            warn!("Failed to load mock file {}: {}", entry_path.display(), e);
+                            *errors += 1;
+                        }
                     }
                 }
             }
         }
         Err(e) => {
             error!("Failed to read directory {}: {}", dir.display(), e);
+            *errors += 1;
         }
     }
 }
@@ -142,23 +183,25 @@ mod tests {
         let mut file2 = File::create(&file2_path).unwrap();
         file2.write_all(mock2.as_bytes()).unwrap();
 
-        let store = load_mocks(dir_path.to_str().unwrap());
-        assert_eq!(store.len(), 2);
-        assert!(store.contains_key("GET:/users"));
-        assert!(store.contains_key("POST:/login"));
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.mocks.len(), 2);
+        assert!(result.mocks.contains_key("GET:/users"));
+        assert!(result.mocks.contains_key("POST:/login"));
     }
 
     #[test]
     fn test_load_mocks_nonexistent_directory() {
-        let store = load_mocks("/nonexistent/path");
-        assert_eq!(store.len(), 0);
+        let result = load_mocks_map("/nonexistent/path");
+        assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
     fn test_load_mocks_empty_path() {
         let temp_dir = TempDir::new().unwrap();
-        let store = load_mocks(temp_dir.path().to_str().unwrap());
-        assert_eq!(store.len(), 0);
+        let result = load_mocks_map(temp_dir.path().to_str().unwrap());
+        assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 0);
     }
 
     #[test]
@@ -171,8 +214,9 @@ mod tests {
         let mut file = File::create(&txt_file).unwrap();
         file.write_all(b"This is not JSON").unwrap();
 
-        let store = load_mocks(dir_path.to_str().unwrap());
-        assert_eq!(store.len(), 0);
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 0);
     }
 
     #[test]
@@ -183,8 +227,9 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(b"{invalid json}").unwrap();
 
-        let store = load_mocks(temp_dir.path().to_str().unwrap());
-        assert_eq!(store.len(), 0);
+        let result = load_mocks_map(temp_dir.path().to_str().unwrap());
+        assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
@@ -202,8 +247,9 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(mock.as_bytes()).unwrap();
 
-        let store = load_mocks(temp_dir.path().to_str().unwrap());
-        assert_eq!(store.len(), 0);
+        let result = load_mocks_map(temp_dir.path().to_str().unwrap());
+        assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
@@ -245,11 +291,11 @@ mod tests {
         let mut file3 = File::create(nested_dir.join("delete.json")).unwrap();
         file3.write_all(mock3.as_bytes()).unwrap();
 
-        let store = load_mocks(dir_path.to_str().unwrap());
-        assert_eq!(store.len(), 3);
-        assert!(store.contains_key("GET:/users"));
-        assert!(store.contains_key("POST:/login"));
-        assert!(store.contains_key("DELETE:/items/1"));
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.mocks.len(), 3);
+        assert!(result.mocks.contains_key("GET:/users"));
+        assert!(result.mocks.contains_key("POST:/login"));
+        assert!(result.mocks.contains_key("DELETE:/items/1"));
     }
 
     #[test]
@@ -258,8 +304,9 @@ mod tests {
         let file_path = temp_dir.path().join("not_a_dir.txt");
         File::create(&file_path).unwrap();
 
-        let store = load_mocks(file_path.to_str().unwrap());
-        assert_eq!(store.len(), 0);
+        let result = load_mocks_map(file_path.to_str().unwrap());
+        assert_eq!(result.mocks.len(), 0);
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
@@ -307,8 +354,8 @@ mod tests {
             file.write_all(mock.as_bytes()).unwrap();
         }
 
-        let store = load_mocks(dir_path.to_str().unwrap());
-        assert_eq!(store.len(), 5);
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.mocks.len(), 5);
     }
 
     #[test]
@@ -356,9 +403,115 @@ mod tests {
         let mut file2 = File::create(dir_path.join("login_user.json")).unwrap();
         file2.write_all(mock_user.as_bytes()).unwrap();
 
-        let store = load_mocks(dir_path.to_str().unwrap());
+        let result = load_mocks_map(dir_path.to_str().unwrap());
         // One unique key, but two mocks stored under it
-        assert_eq!(store.len(), 1);
-        assert_eq!(store["POST:/login"].len(), 2);
+        assert_eq!(result.mocks.len(), 1);
+        assert_eq!(result.mocks["POST:/login"].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reload_mocks_reflects_file_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        // Create initial mock file
+        let mock1 = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+        let mut file1 = File::create(dir_path.join("users.json")).unwrap();
+        file1.write_all(mock1.as_bytes()).unwrap();
+
+        // Load initial state
+        let store = load_mocks(dir_path.to_str().unwrap());
+        {
+            let mocks = store.read().await;
+            assert_eq!(mocks.len(), 1);
+            assert!(mocks.contains_key("GET:/users"));
+        }
+
+        // Add a new mock file (simulating a file change)
+        let mock2 = r#"{
+            "method": "POST",
+            "path": "/login",
+            "status": 201,
+            "response": {"token": "abc123"}
+        }"#;
+        let mut file2 = File::create(dir_path.join("login.json")).unwrap();
+        file2.write_all(mock2.as_bytes()).unwrap();
+
+        // Reload mocks into the store (simulating hot reload)
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        {
+            let mut mocks = store.write().await;
+            *mocks = result.mocks;
+        }
+
+        // Verify the new mock is now available
+        {
+            let mocks = store.read().await;
+            assert_eq!(mocks.len(), 2);
+            assert!(mocks.contains_key("GET:/users"));
+            assert!(mocks.contains_key("POST:/login"));
+        }
+
+        // Delete the first mock file (simulating a file removal)
+        fs::remove_file(dir_path.join("users.json")).unwrap();
+
+        // Reload mocks again
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        {
+            let mut mocks = store.write().await;
+            *mocks = result.mocks;
+        }
+
+        // Verify only the remaining mock is available
+        {
+            let mocks = store.read().await;
+            assert_eq!(mocks.len(), 1);
+            assert!(!mocks.contains_key("GET:/users"));
+            assert!(mocks.contains_key("POST:/login"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reload_skips_on_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        // Create a valid mock file
+        let mock1 = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+        let mut file1 = File::create(dir_path.join("users.json")).unwrap();
+        file1.write_all(mock1.as_bytes()).unwrap();
+
+        // Load initial state
+        let store = load_mocks(dir_path.to_str().unwrap());
+        {
+            let mocks = store.read().await;
+            assert_eq!(mocks.len(), 1);
+        }
+
+        // Add an invalid mock file
+        let mut file2 = File::create(dir_path.join("broken.json")).unwrap();
+        file2.write_all(b"{invalid json}").unwrap();
+
+        // Reload should report errors; caller should skip the swap
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert!(result.errors > 0);
+        // Do NOT swap — previous mock set is preserved
+        {
+            let mocks = store.read().await;
+            assert_eq!(mocks.len(), 1);
+            assert!(mocks.contains_key("GET:/users"));
+        }
     }
 }
