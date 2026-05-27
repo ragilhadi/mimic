@@ -1,6 +1,0 @@
-{
-  "method": "DELETE",
-  "path": "/users/123",
-  "status": 204,
-  "response": {}
-}
