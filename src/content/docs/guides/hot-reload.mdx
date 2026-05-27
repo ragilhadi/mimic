@@ -1,0 +1,51 @@
+---
+title: Hot Reload
+description: How Mimic picks up changes to mock files without a restart.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Mimic watches the mocks directory and reflects file changes immediately. You can edit, add, or delete a `.json` file and the next request will use the new state — no container restart, no rebuild.
+
+## What triggers a reload
+
+- **Editing a file** — saving changes to an existing mock updates that endpoint.
+- **Adding a file** — a new `.json` becomes a new route.
+- **Deleting a file** — the route disappears and subsequent requests get `404`.
+- **Renaming a file** — equivalent to deleting one and adding another.
+
+## Try it
+
+With Mimic running and `mocks/get_users.json` in place from the [Quick Start](/start-here/quick-start/):
+
+```bash
+curl http://localhost:8080/users
+```
+
+Now edit `mocks/get_users.json`, change one of the names, save, and curl again:
+
+```bash
+curl http://localhost:8080/users
+```
+
+The new name appears in the response immediately.
+
+## How it works under the hood
+
+Mimic uses the OS-level file-watching API to detect changes in the mounted mocks directory. When a change is detected, Mimic re-parses just the affected file and updates its in-memory route table. The Docker volume mount (`-v $(pwd)/mocks:/app/mocks:ro`) is what makes your local edits visible inside the container.
+
+## When hot reload might not work
+
+A few situations can break file-watching:
+
+- **Editing on the host while mocks are bind-mounted from a network volume** (rare). Some network filesystems don't propagate inotify events. Use a local volume instead.
+- **Editors that write via a swap file and rename** can sometimes cause two events in quick succession. Mimic handles this correctly, but if you see odd behavior, save the file again to force a refresh.
+- **Invalid JSON.** If your edit produces a malformed file, Mimic logs an error and keeps the previous version of that mock active until you fix it. Check the logs with `docker logs mimic`.
+
+<Aside type="tip">
+Run `docker logs -f mimic` in a side terminal while you edit mocks. You'll see each reload happen in real time, which is helpful for confirming a file was picked up.
+</Aside>
+
+## Disabling hot reload
+
+There is no flag to disable hot reload — it's always on. If you don't want it (for example in CI, where the mocks folder won't change), the watcher imposes effectively zero overhead at idle, so there's no reason to turn it off.

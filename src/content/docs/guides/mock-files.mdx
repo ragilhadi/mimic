@@ -1,0 +1,108 @@
+---
+title: Mock Files
+description: The anatomy of a Mimic mock file and how Mimic discovers them.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A **mock file** is a single JSON file that describes one HTTP endpoint. Mimic reads every `.json` file in the mounted mocks directory and turns each one into a route.
+
+## File location
+
+Inside the container, mocks live at `/app/mocks`. With the recommended Docker setup, you mount your local `./mocks` folder there:
+
+```bash
+-v $(pwd)/mocks:/app/mocks:ro
+```
+
+The `:ro` flag mounts it read-only — Mimic never writes to your mocks folder.
+
+## Anatomy of a mock file
+
+Here is a complete mock with every common field:
+
+```json
+{
+  "method": "GET",
+  "path": "/users",
+  "status": 200,
+  "consume_body": false,
+  "response": {
+    "users": [
+      { "id": 1, "name": "Alice" }
+    ]
+  }
+}
+```
+
+### Required fields
+
+| Field      | Type   | Description |
+|------------|--------|-------------|
+| `method`   | string | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, etc. |
+| `path`     | string | URL path the request must hit (e.g. `/users`, `/api/v1/orders`). |
+| `status`   | number | HTTP status code to return (`200`, `201`, `404`, `500`, …). |
+| `response` | any    | The JSON body to return. Can be an object, array, string, number, or `null`. |
+
+### Optional fields
+
+| Field          | Type    | Default | Description |
+|----------------|---------|---------|-------------|
+| `consume_body` | boolean | `false` | Whether Mimic should read the request body. Set to `true` for file uploads. See [File Uploads](/guides/file-uploads/). |
+| `query_params` | object  | —       | Match against query string parameters. See [Query Parameters](/matching/query-params/). |
+| `headers`      | object  | —       | Match against request headers. See [Headers](/matching/headers/). |
+| `body`         | object  | —       | Match against the request body. See [Request Body](/matching/body/). |
+
+## Naming and organizing files
+
+The filename has **no effect** on routing — Mimic only cares about the `method` and `path` fields inside the file. That said, descriptive names make your mocks folder readable. A common convention:
+
+```
+mocks/
+├── get_users.json
+├── get_user_by_id.json
+├── post_login.json
+├── post_logout.json
+└── delete_user.json
+```
+
+You can also use subdirectories — Mimic scans recursively:
+
+```
+mocks/
+├── auth/
+│   ├── login.json
+│   └── logout.json
+└── users/
+    ├── list.json
+    └── create.json
+```
+
+## How Mimic discovers mocks
+
+On startup, Mimic walks the mocks directory, parses every `.json` file, and builds a route table in memory. The `/health` endpoint reports how many mocks were loaded:
+
+```bash
+curl http://localhost:8080/health
+# {"status":"healthy","mocks_loaded":5,"service":"mimic"}
+```
+
+If a file fails to parse — invalid JSON, missing required field — Mimic logs an error and skips that file. The rest still load. Set `RUST_LOG=debug` to see exactly which file was rejected and why.
+
+<Aside type="caution">
+Two mocks with the same `method` and `path` will both be loaded. When a request comes in, Mimic uses its [match priority](/matching/priority/) scoring to decide which one wins. This is intentional — it lets you have multiple variants of the same endpoint differentiated by query params, headers, or body content.
+</Aside>
+
+## What happens when nothing matches
+
+If no mock matches an incoming request, Mimic returns a `404` with a structured error:
+
+```json
+{
+  "error": "mock not found",
+  "method": "GET",
+  "path": "/some/undefined/path"
+}
+```
+
+This is useful for spotting typos and missing mocks during development.

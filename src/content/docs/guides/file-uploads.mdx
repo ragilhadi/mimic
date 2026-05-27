@@ -1,0 +1,95 @@
+---
+title: File Uploads
+description: Use consume_body to mock endpoints that accept file uploads and multipart/form-data.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+By default, Mimic responds to requests without reading the request body. This is fast and works for the vast majority of mock endpoints. But when a client sends a **large request body** — most commonly a file upload — Mimic needs to drain that body to avoid breaking the connection.
+
+That's what `consume_body` is for.
+
+## The problem with large bodies
+
+When a client sends a large file via `multipart/form-data`, it streams the body to the server. If the server responds before reading the body, the client's write buffer can fill up and the connection can be terminated mid-transfer. The client then sees a "Broken Pipe" or "Connection Reset" error, even though Mimic responded with `200`.
+
+Setting `consume_body: true` tells Mimic to fully read and discard the request body before sending its response. This keeps the client happy.
+
+## When to use `consume_body: true`
+
+Use it whenever the client will send:
+
+- File uploads (images, PDFs, videos)
+- `multipart/form-data` requests
+- Large JSON or text payloads (more than a few KB)
+
+You should **not** use it for normal GET requests or small POST/PUT bodies — it's a small performance cost for no benefit.
+
+## Example: file upload endpoint
+
+`mocks/upload_image.json`:
+
+```json
+{
+  "method": "POST",
+  "path": "/upload",
+  "status": 200,
+  "consume_body": true,
+  "response": {
+    "uploaded": true,
+    "filename": "document.jpg",
+    "size": 12345,
+    "url": "https://cdn.example.com/uploads/document.jpg"
+  }
+}
+```
+
+Test it:
+
+```bash
+curl -X POST http://localhost:8080/upload \
+  -F "file=@./some-image.jpg" \
+  -F "description=A nice photo"
+```
+
+The response is whatever you put in `response` — Mimic does not inspect the uploaded file. It just reads and discards the body so the client's upload completes cleanly.
+
+## Example: OCR-style endpoint
+
+`mocks/ocr.json`:
+
+```json
+{
+  "method": "POST",
+  "path": "/ocr-image",
+  "status": 200,
+  "consume_body": true,
+  "response": {
+    "status": "SUCCESS",
+    "text": "Extracted text from image",
+    "confidence": 0.95,
+    "detected_text": [
+      { "text": "Hello World", "bbox": [10, 20, 100, 40] }
+    ]
+  }
+}
+```
+
+This pattern is useful when you're building a frontend that uploads files to a real OCR service and you want to develop without consuming API quota.
+
+<Aside type="caution">
+`consume_body: true` reads the body into memory. For very large files, this means temporarily holding the file in RAM. If you're testing multi-gigabyte uploads, consider keeping your test files reasonably sized.
+</Aside>
+
+## Performance comparison
+
+| `consume_body` | Throughput  | Memory                | Best for |
+|----------------|-------------|------------------------|----------|
+| `false` (default) | Fastest  | Minimal               | GET requests, body-less POST/PUT/DELETE |
+| `true`            | Standard | Temporary spike per request | File uploads, multipart forms, large payloads |
+
+For mixed workloads, set it per-endpoint based on whether each endpoint actually expects a meaningful body. There's no global setting.
+
+## Combining with body matching
+
+`consume_body` only controls whether the body is **read**. If you want to **match** against body content (return different responses depending on what's in the body), see [Request Body matching](/matching/body/). When you use body matching, Mimic automatically reads the body — you don't need to set `consume_body` explicitly.

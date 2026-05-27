@@ -1,0 +1,183 @@
+---
+title: Request Body Matching
+description: Match requests against JSON, plain text, or form-encoded body content.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Use the `body` field to match against the request body. Mimic supports three body formats: **JSON**, **text**, and **form** data.
+
+## Choosing a body type
+
+```json
+{
+  "body": {
+    "type": "json" | "text" | "form",
+    /* ...mode-specific fields... */
+  }
+}
+```
+
+The `type` field tells Mimic how to parse the body before comparing. Get this wrong and matching will silently fail — set `RUST_LOG=debug` if you're not sure what's happening.
+
+## JSON body matching
+
+Use for requests with `Content-Type: application/json`.
+
+### Exact match
+
+The entire body must match exactly:
+
+```json
+{
+  "body": {
+    "type": "json",
+    "exact": {
+      "username": "admin",
+      "password": "secret"
+    }
+  }
+}
+```
+
+Any extra fields in the request body cause the match to fail.
+
+### Partial match (recommended default)
+
+Only the specified fields must match — extras are fine:
+
+```json
+{
+  "body": {
+    "type": "json",
+    "partial": {
+      "username": "admin"
+    }
+  }
+}
+```
+
+This matches `{"username": "admin"}` and `{"username": "admin", "remember_me": true}` but not `{"username": "bob"}`.
+
+### Strict partial
+
+```json
+{
+  "body": {
+    "type": "json",
+    "partial": { "username": "admin" },
+    "strict": true
+  }
+}
+```
+
+`strict: true` combined with `partial` rejects requests that have extra fields. This is effectively the same as `exact` but expressed differently.
+
+### Worked example: login endpoint
+
+`mocks/login_success.json`:
+
+```json
+{
+  "method": "POST",
+  "path": "/api/login",
+  "status": 200,
+  "headers": {
+    "required": { "content-type": { "contains": "json" } }
+  },
+  "body": {
+    "type": "json",
+    "partial": {
+      "username": "admin",
+      "password": "secret123"
+    }
+  },
+  "response": {
+    "success": true,
+    "token": "eyJhbGciOiJIUzI1NiIs..."
+  }
+}
+```
+
+`mocks/login_invalid.json`:
+
+```json
+{
+  "method": "POST",
+  "path": "/api/login",
+  "status": 401,
+  "response": {
+    "error": "invalid_credentials"
+  }
+}
+```
+
+<Tabs>
+  <TabItem label="Success">
+    ```bash
+    curl -X POST http://localhost:8080/api/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"secret123"}'
+    # 200 with token
+    ```
+  </TabItem>
+  <TabItem label="Failure">
+    ```bash
+    curl -X POST http://localhost:8080/api/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"wrong"}'
+    # 401 invalid_credentials (falls through to the second mock)
+    ```
+  </TabItem>
+</Tabs>
+
+## Text body matching
+
+For non-JSON text payloads:
+
+```json
+{
+  "body": {
+    "type": "text",
+    "contains": "specific phrase"
+  }
+}
+```
+
+Text bodies support:
+
+| Mode      | Example                              | Description |
+|-----------|--------------------------------------|-------------|
+| `exact`   | `"exact": "hello world"`             | Body must equal the string exactly. |
+| `contains`| `"contains": "world"`                | Body must contain the substring. |
+| `regex`   | `"regex": "^ORDER-[0-9]+$"`          | Body must match the regex. |
+
+## Form body matching
+
+For requests with `Content-Type: application/x-www-form-urlencoded`:
+
+```json
+{
+  "body": {
+    "type": "form",
+    "fields": {
+      "username": "admin",
+      "password": "secret"
+    },
+    "strict": false
+  }
+}
+```
+
+Form matching behaves like JSON `partial` — only the listed fields must match, and `strict: true` rejects extras.
+
+## Combining body matchers with other matchers
+
+You can combine `body` with `query_params` and `headers` for precise routing. See [Match Priority](/matching/priority/) for how Mimic decides when multiple body-matching mocks could apply to the same request.
+
+## Common gotchas
+
+- **JSON whitespace doesn't matter.** Mimic parses the JSON before comparing, so `{"a":1}` and `{ "a" : 1 }` are equivalent.
+- **Numbers vs strings.** `{"id": 1}` and `{"id": "1"}` are different. JSON types are preserved.
+- **Don't forget the Content-Type.** If your `body.type` is `json` but the request doesn't send `Content-Type: application/json`, Mimic won't try to parse it as JSON. Add a header matcher to enforce the right content type.
+- **Body matching requires reading the body**, so Mimic implicitly behaves as if `consume_body: true` when you use it. You don't need to set the flag yourself.

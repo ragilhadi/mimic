@@ -1,0 +1,105 @@
+---
+title: Docker
+description: Run Mimic as a standalone Docker container.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The fastest way to run Mimic is a single `docker run` command. The image is around 90 MB compressed and supports both `linux/amd64` and `linux/arm64`.
+
+## Minimal run command
+
+```bash
+docker run -d \
+  --name mimic \
+  -p 8080:8080 \
+  -v $(pwd)/mocks:/app/mocks:ro \
+  ragilhadi/mimic:latest
+```
+
+Breakdown:
+
+- `-d` runs the container in the background.
+- `--name mimic` gives the container a stable name so you can `docker stop mimic` later.
+- `-p 8080:8080` maps host port 8080 to container port 8080.
+- `-v $(pwd)/mocks:/app/mocks:ro` mounts your local `./mocks` folder into the container as read-only.
+- `ragilhadi/mimic:latest` is the image. Pin to a specific tag in production.
+
+## Mounting on Windows
+
+If you're on Windows, `$(pwd)` won't work in cmd or PowerShell. Use the full path or PowerShell's `${PWD}`:
+
+```powershell
+docker run -d `
+  --name mimic `
+  -p 8080:8080 `
+  -v ${PWD}/mocks:/app/mocks:ro `
+  ragilhadi/mimic:latest
+```
+
+## Running on a different port
+
+```bash
+docker run -d \
+  --name mimic \
+  -p 9000:9000 \
+  -e PORT=9000 \
+  -v $(pwd)/mocks:/app/mocks:ro \
+  ragilhadi/mimic:latest
+```
+
+Both the host port mapping and Mimic's internal port need to change. See [Environment Variables](/reference/environment/).
+
+## Health checks
+
+Mimic exposes a `/health` endpoint. Use it for Docker's built-in health check:
+
+```bash
+docker run -d \
+  --name mimic \
+  -p 8080:8080 \
+  -v $(pwd)/mocks:/app/mocks:ro \
+  --health-cmd="wget --spider -q http://localhost:8080/health || exit 1" \
+  --health-interval=10s \
+  --health-timeout=3s \
+  --health-retries=3 \
+  ragilhadi/mimic:latest
+```
+
+`wget` is included in the image specifically so the health check can run inside the container without extra installs.
+
+## Managing the container
+
+```bash
+# View logs
+docker logs -f mimic
+
+# Restart
+docker restart mimic
+
+# Stop and remove
+docker stop mimic && docker rm mimic
+
+# Pull a newer version
+docker pull ragilhadi/mimic:latest
+docker stop mimic && docker rm mimic
+# (then run again with the same command)
+```
+
+## Pinning to a version
+
+<Aside type="caution">
+Use a specific version tag rather than `latest` for anything beyond local experimentation. Pinning protects you from accidental breakage and makes builds reproducible.
+</Aside>
+
+```bash
+docker pull ragilhadi/mimic:v1.0.0
+docker run -d --name mimic ragilhadi/mimic:v1.0.0
+```
+
+Browse available tags on the [Docker Hub page](https://hub.docker.com/r/ragilhadi/mimic/tags).
+
+## Where to next
+
+- For multi-service setups or anything more than a one-liner, use [Docker Compose](/deployment/docker-compose/) instead.
+- For setting log levels and ports, see [Environment Variables](/reference/environment/).

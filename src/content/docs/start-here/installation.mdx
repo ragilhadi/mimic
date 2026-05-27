@@ -1,0 +1,132 @@
+---
+title: Installation
+description: Install Mimic via Docker, Docker Compose, or build it from source.
+---
+
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
+
+Mimic ships as a Docker image. That's the recommended way to run it for almost every use case. Building from source is supported but only needed if you're contributing to Mimic itself.
+
+## Docker (recommended)
+
+<Tabs>
+  <TabItem label="docker run">
+    ```bash
+    docker run -d \
+      --name mimic \
+      -p 8080:8080 \
+      -v $(pwd)/mocks:/app/mocks:ro \
+      ragilhadi/mimic:latest
+    ```
+  </TabItem>
+  <TabItem label="docker compose">
+    Create a `docker-compose.yml`:
+
+    ```yaml
+    services:
+      mimic:
+        image: ragilhadi/mimic:latest
+        container_name: mimic
+        ports:
+          - "8080:8080"
+        volumes:
+          - ./mocks:/app/mocks:ro
+        environment:
+          - PORT=8080
+          - RUST_LOG=info
+        restart: unless-stopped
+    ```
+
+    Then run:
+
+    ```bash
+    docker compose up -d
+    ```
+  </TabItem>
+</Tabs>
+
+### Available tags
+
+```bash
+# Latest stable
+docker pull ragilhadi/mimic:latest
+
+# Pin to a specific version
+docker pull ragilhadi/mimic:v1.0.0
+```
+
+Images are published for `linux/amd64` and `linux/arm64`, so they run natively on Apple Silicon, Raspberry Pi, and most cloud VMs.
+
+<Aside type="tip">
+For production or CI, **always pin to a specific version tag** instead of `latest`. This keeps builds reproducible and protects you from accidental breakage when a new release ships.
+</Aside>
+
+## Building from source
+
+You only need this path if you're contributing to Mimic or you want a custom build.
+
+### Prerequisites
+
+- Rust 1.70 or later — install via [rustup](https://rustup.rs/)
+- `make` (optional, for convenience commands)
+
+### Build steps
+
+<Steps>
+
+1. **Clone the repository.**
+
+   ```bash
+   git clone https://github.com/ragilhadi/mimic.git
+   cd mimic
+   ```
+
+2. **Build a release binary.**
+
+   ```bash
+   cargo build --release
+   ```
+
+   The compiled binary will be at `target/release/mimic`.
+
+3. **Run it.**
+
+   ```bash
+   ./target/release/mimic
+   ```
+
+   By default Mimic reads mocks from `./mocks` and listens on port 8080.
+
+</Steps>
+
+### Development with hot rebuild
+
+For iterating on the Mimic codebase itself:
+
+```bash
+make dev      # run in debug mode with verbose logging
+make watch    # auto-rebuild and restart on file changes
+make test     # run the test suite
+```
+
+See the [Makefile commands](https://github.com/ragilhadi/mimic/blob/main/Makefile) in the repo for the full list.
+
+## Verifying your installation
+
+Whichever method you used, confirm Mimic is up:
+
+```bash
+curl http://localhost:8080/health
+```
+
+You should get:
+
+```json
+{
+  "status": "healthy",
+  "mocks_loaded": 0,
+  "service": "mimic"
+}
+```
+
+If `mocks_loaded` is 0 and you weren't expecting it to be, check that your mocks folder is mounted correctly and contains valid JSON files. See [Mock Files](/guides/mock-files/) for the file format.

@@ -1,0 +1,64 @@
+---
+title: Advanced Matching Overview
+description: Match requests on more than method and path - query parameters, headers, and body content.
+---
+
+import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
+
+By default Mimic matches a mock to a request based on **method** and **path**. That's enough for most cases, but real-world APIs often need finer control. Mimic supports matching on:
+
+- **Query parameters** — different responses based on `?type=admin` vs `?type=user`
+- **Headers** — different responses based on `Authorization` or `Content-Type`
+- **Request body** — different responses based on JSON, text, or form fields
+
+All three can be combined in a single mock, and Mimic uses a [priority scoring system](/matching/priority/) to pick the best match when multiple mocks could apply.
+
+## The big picture
+
+Each matcher lives at the top level of your mock file:
+
+```json
+{
+  "method": "POST",
+  "path": "/api/search",
+  "status": 200,
+
+  "query_params": { /* match on query string */ },
+  "headers":      { /* match on headers */ },
+  "body":         { /* match on request body */ },
+
+  "response": { /* ... */ }
+}
+```
+
+Any matcher you omit is treated as "don't care." A mock with no matchers will accept any request that hits the right method and path.
+
+## Strict mode
+
+Most matchers support a `strict` flag (default `false`):
+
+- `strict: false` — the request can have **extra** params/headers/fields beyond what you specified. Only the ones you listed are checked.
+- `strict: true` — the request must have **exactly** what you specified. Extra anything causes the match to fail.
+
+Strict mode is useful for security-style tests (you don't want a request with extra auth headers to silently pass) but loose mode is a better default for most app development.
+
+## Where to go from here
+
+<CardGrid>
+  <Card title="Query Parameters" icon="seti:json">
+    Match on URL query strings with exact values, regex, or "any value." See [Query Parameters](/matching/query-params/).
+  </Card>
+  <Card title="Headers" icon="seti:default">
+    Match on header values, prefixes, regex patterns, or forbidden headers. See [Headers](/matching/headers/).
+  </Card>
+  <Card title="Request Body" icon="document">
+    Match against JSON, plain text, or form-encoded body content. See [Request Body](/matching/body/).
+  </Card>
+  <Card title="Match Priority" icon="rocket">
+    Learn how Mimic picks a winner when multiple mocks could match the same request. See [Match Priority](/matching/priority/).
+  </Card>
+</CardGrid>
+
+<Aside type="tip">
+When debugging match behavior, set `RUST_LOG=debug` and watch the logs. Mimic logs why each mock did or did not match a request, which makes diagnosing rules much faster.
+</Aside>

@@ -1,0 +1,16 @@
+services:
+  docs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mimic-docs:latest
+    container_name: mimic-docs
+    ports:
+      - "3005:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

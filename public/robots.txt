@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://mimic.ragilhadi.com/sitemap-index.xml

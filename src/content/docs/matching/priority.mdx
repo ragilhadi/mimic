@@ -1,0 +1,132 @@
+---
+title: Match Priority
+description: How Mimic picks a winner when multiple mocks could match the same request.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+When more than one mock could handle an incoming request, Mimic uses a **scoring system** to decide which one wins. The mock with the highest score is served. This lets you layer specific overrides on top of general fallback responses without rewriting your config.
+
+## The scoring rules
+
+| Match component                | Points |
+|--------------------------------|--------|
+| Method + Path match            | 1000   |
+| Each matched query parameter   | +100   |
+| Each matched header            | +50    |
+| Request body match             | +500   |
+
+A mock has to match method and path to be considered at all — every candidate starts at 1000. From there, additional matchers add points, so **more specific mocks score higher** and beat less specific ones.
+
+## Example: specific override on top of a fallback
+
+Imagine two mocks for `GET /users`:
+
+`mocks/users_default.json` (fallback):
+
+```json
+{
+  "method": "GET",
+  "path": "/users",
+  "status": 200,
+  "response": { "users": [], "page": 1 }
+}
+```
+
+Score for any matching request: **1000**.
+
+`mocks/users_page_2.json` (specific):
+
+```json
+{
+  "method": "GET",
+  "path": "/users",
+  "status": 200,
+  "query_params": { "params": { "page": "2" } },
+  "response": { "users": [{ "id": 3 }, { "id": 4 }], "page": 2 }
+}
+```
+
+Score for a request that matches: **1000 + 100 = 1100**.
+
+Result:
+
+- `GET /users` → only the first mock matches (no `page` param), returns the default.
+- `GET /users?page=2` → both mocks match, but the page-2 mock scores higher and wins.
+- `GET /users?page=99` → only the default mock matches, returns the default.
+
+## Example: tiered authentication
+
+Layered auth responses using header matching:
+
+`mocks/account_admin.json`:
+
+```json
+{
+  "method": "GET",
+  "path": "/api/account",
+  "status": 200,
+  "headers": {
+    "required": {
+      "authorization": { "prefix": "Bearer " },
+      "x-role": "admin"
+    }
+  },
+  "response": { "role": "admin", "permissions": ["read", "write", "delete"] }
+}
+```
+
+Score: **1000 + 50 + 50 = 1100**.
+
+`mocks/account_user.json`:
+
+```json
+{
+  "method": "GET",
+  "path": "/api/account",
+  "status": 200,
+  "headers": {
+    "required": { "authorization": { "prefix": "Bearer " } }
+  },
+  "response": { "role": "user", "permissions": ["read"] }
+}
+```
+
+Score: **1000 + 50 = 1050**.
+
+`mocks/account_unauthorized.json`:
+
+```json
+{
+  "method": "GET",
+  "path": "/api/account",
+  "status": 401,
+  "response": { "error": "unauthorized" }
+}
+```
+
+Score: **1000**.
+
+For a request with both an `Authorization` header and `x-role: admin`, all three mocks match. The admin mock has the highest score (1100) and wins. Drop the `x-role` header and the user mock (1050) wins. Drop the `Authorization` entirely and only the unauthorized mock matches.
+
+## Tie-breaking
+
+If two mocks have the same score, Mimic picks one but the choice is not guaranteed to be stable across reloads. **Design your mocks so no two have identical scores for the same request.** The easiest way is to add another matcher to one of them — even matching a single header is enough to push the score apart.
+
+## Debugging match decisions
+
+Set `RUST_LOG=debug` and watch the logs. Mimic logs the candidate mocks and their scores for each request:
+
+```
+DEBUG request GET /api/account
+DEBUG candidates: 3
+DEBUG   account_admin.json -> 1100 (selected)
+DEBUG   account_user.json  -> 1050
+DEBUG   account_unauthorized.json -> 1000
+```
+
+This makes it obvious when a mock isn't winning the way you expected.
+
+<Aside type="tip">
+The scoring system is what makes Mimic feel less rigid than tools that require explicit priority numbers on every rule. You write each mock in isolation, and the specificity-wins rule produces sensible behavior for free.
+</Aside>

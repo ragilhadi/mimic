@@ -1,0 +1,87 @@
+---
+title: Quick Start
+description: Get a running Mimic server with your first mock in under two minutes.
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+This guide gets you from zero to a working mock in about two minutes. You'll need [Docker](https://docs.docker.com/get-docker/) installed.
+
+<Steps>
+
+1. **Create a folder for your mocks.**
+
+   ```bash
+   mkdir -p mocks && cd mocks
+   ```
+
+2. **Create your first mock file.**
+
+   Save the following as `mocks/get_users.json`:
+
+   ```json
+   {
+     "method": "GET",
+     "path": "/users",
+     "status": 200,
+     "response": {
+       "users": [
+         { "id": 1, "name": "Alice" },
+         { "id": 2, "name": "Bob" }
+       ]
+     }
+   }
+   ```
+
+3. **Start Mimic.**
+
+   From the directory *above* `mocks/`, run:
+
+   ```bash
+   docker run -d \
+     --name mimic \
+     -p 8080:8080 \
+     -v $(pwd)/mocks:/app/mocks:ro \
+     ragilhadi/mimic:latest
+   ```
+
+4. **Test it.**
+
+   ```bash
+   curl http://localhost:8080/users
+   ```
+
+   You should see your mock response.
+
+5. **Confirm Mimic is healthy.**
+
+   ```bash
+   curl http://localhost:8080/health
+   ```
+
+   This returns `{"status":"healthy","mocks_loaded":1,"service":"mimic"}`.
+
+</Steps>
+
+## What just happened
+
+- Docker pulled the `ragilhadi/mimic:latest` image (around 90 MB).
+- The `-v $(pwd)/mocks:/app/mocks:ro` flag mounted your local `mocks/` folder into the container as read-only.
+- Mimic scanned that folder, loaded `get_users.json`, and started listening on port 8080.
+- Your `curl` request matched the `GET /users` mock and returned the configured response.
+
+## Try editing the file
+
+Open `mocks/get_users.json`, change a name, save the file, and run `curl http://localhost:8080/users` again. You'll see the new response immediately — no restart needed. This is [hot reload](/guides/hot-reload/) at work.
+
+## Stop the server
+
+```bash
+docker stop mimic && docker rm mimic
+```
+
+## Where to go next
+
+- Add more mocks: see the [Mock Files](/guides/mock-files/) guide.
+- Use Docker Compose for a tidier workflow: see [Docker Compose deployment](/deployment/docker-compose/).
+- Match on more than just method and path: see [Advanced Matching](/matching/overview/).
