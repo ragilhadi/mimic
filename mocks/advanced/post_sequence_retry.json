@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "path": "/api/submit",
+  "status": 200,
+  "response": { "ok": true },
+  "sequence": [
+    { "status": 503, "response": { "error": "service unavailable, retry later" } },
+    { "status": 429, "response": { "error": "rate limited" }, "delay_ms": 100 },
+    { "status": 200, "response": { "ok": true }, "repeat": true }
+  ]
+}

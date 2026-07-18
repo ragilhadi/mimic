@@ -1,5 +1,7 @@
 use crate::matcher::{find_matching_mock, parse_headers, parse_query_string, RequestContext};
-use crate::types::{MockStore, RequestLog, RequestRecord};
+use crate::types::{
+    create_mock_key, MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
+};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -11,6 +13,7 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -20,6 +23,18 @@ pub struct AppState {
     pub mocks: MockStore,
     pub request_log: RequestLog,
     pub request_counter: Arc<AtomicU64>,
+    pub sequence_counters: SequenceCounters,
+}
+
+impl AppState {
+    pub fn new(mocks: MockStore) -> Self {
+        Self {
+            mocks,
+            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            sequence_counters: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
 }
 
 /// Maximum body size to consume for matching (10 MB)
@@ -94,27 +109,43 @@ pub async fn handle_request(
 
     // Find matching mock using the matcher (acquire read lock)
     let mocks = state.mocks.read().await;
-    match find_matching_mock(&context, &mocks) {
-        Some(mock) => {
-            info!("Mock matched: {} {} -> {}", method_str, path, mock.status);
+    let matched = find_matching_mock(&context, &mocks);
+    // Release read lock before any await (counter lock, recording, delay)
+    drop(mocks);
 
-            let status = StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK);
+    match matched {
+        Some((mock, index)) => {
+            // Resolve the response: sequence step if configured, top-level otherwise.
+            // An empty sequence array falls back to the top-level status/response.
+            let (status_u16, response, delay_ms) = match mock.sequence.as_deref() {
+                Some(steps) if !steps.is_empty() => {
+                    let base_key = create_mock_key(&method_str, &path);
+                    let counter_key = format!("{}#{}", base_key, index);
+                    advance_sequence(&state.sequence_counters, &counter_key, steps).await
+                }
+                _ => (mock.status, mock.response.clone(), None),
+            };
+
+            info!("Mock matched: {} {} -> {}", method_str, path, status_u16);
+
+            let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
             let matched_key = format!("{}:{}", method_str, path);
 
-            // Release read lock before recording to avoid holding it during async I/O
-            drop(mocks);
+            // Record the request with the status actually served
+            record_request(&state, context, Some(matched_key), status_u16).await;
 
-            // Record the request
-            record_request(&state, context, Some(matched_key), mock.status).await;
+            // Apply per-step delay last, with no locks held
+            if let Some(ms) = delay_ms {
+                if ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+            }
 
             // Return configured response
-            (status, Json(mock.response.clone())).into_response()
+            (status, Json(response)).into_response()
         }
         None => {
             info!("No mock found for: {} {}", method_str, path);
-
-            // Release read lock before recording to avoid holding it during async I/O
-            drop(mocks);
 
             // Record the request (clone query_params for use in error response)
             let query_params_clone = context.query_params.clone();
@@ -232,6 +263,57 @@ pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Pick the current sequence step and advance the counter.
+/// The write lock is held only for the map lookup + clone, never across an await.
+async fn advance_sequence(
+    counters: &SequenceCounters,
+    key: &str,
+    steps: &[SequenceStep],
+) -> (u16, serde_json::Value, Option<u64>) {
+    let mut map = counters.write().await;
+    let count = map.entry(key.to_string()).or_insert(0);
+    // Clamp so the last step keeps repeating once the sequence is exhausted
+    let idx = (*count).min(steps.len() - 1);
+    let step = &steps[idx];
+    if !step.repeat {
+        *count += 1;
+    }
+    (step.status, step.response.clone(), step.delay_ms)
+}
+
+#[derive(Deserialize, Default)]
+pub struct SequenceResetFilter {
+    pub path: Option<String>,
+}
+
+pub async fn reset_sequences(
+    State(state): State<AppState>,
+    Query(filter): Query<SequenceResetFilter>,
+) -> Json<serde_json::Value> {
+    let mut counters = state.sequence_counters.write().await;
+    let removed = match filter.path {
+        Some(ref p) => {
+            let before = counters.len();
+            // Counter keys look like "METHOD:/path#idx" — compare the path part only
+            counters.retain(|key, _| {
+                let after_method = key.split_once(':').map_or("", |(_, rest)| rest);
+                let path_part = after_method
+                    .rsplit_once('#')
+                    .map_or(after_method, |(path_part, _)| path_part);
+                path_part != p
+            });
+            before - counters.len()
+        }
+        None => {
+            let n = counters.len();
+            counters.clear();
+            n
+        }
+    };
+    info!("Reset {} sequence counter(s)", removed);
+    Json(json!({ "reset": removed }))
+}
+
 pub async fn admin_dashboard() -> Html<&'static str> {
     Html(include_str!("../static/dashboard.html"))
 }
@@ -246,7 +328,6 @@ mod tests {
     use axum::http::Method;
     use http_body_util::BodyExt;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     fn create_test_state() -> AppState {
@@ -263,6 +344,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                sequence: None,
             }],
         );
 
@@ -277,6 +359,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                sequence: None,
             }],
         );
 
@@ -291,22 +374,15 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                sequence: None,
             }],
         );
 
-        AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        }
+        AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)))
     }
 
     fn create_empty_state() -> AppState {
-        AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        }
+        AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())))
     }
 
     #[tokio::test]
@@ -462,14 +538,11 @@ mod tests {
                 }),
                 headers: None,
                 body: None,
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with correct query param
         let method = Method::GET;
@@ -506,14 +579,11 @@ mod tests {
                 }),
                 headers: None,
                 body: None,
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with numeric page
         let uri = "/users?page=123".parse().unwrap();
@@ -560,14 +630,11 @@ mod tests {
                     strict: false,
                 }),
                 body: None,
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with correct header
         let mut headers = HeaderMap::new();
@@ -612,14 +679,11 @@ mod tests {
                     strict: false,
                 }),
                 body: None,
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with any Bearer token
         let mut headers = HeaderMap::new();
@@ -665,14 +729,11 @@ mod tests {
                     partial: None,
                     strict: false,
                 })),
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with exact body
         let mut headers = HeaderMap::new();
@@ -709,14 +770,11 @@ mod tests {
                     partial: Some(json!({"name": "Alice"})),
                     strict: false,
                 })),
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with partial body (extra fields ignored)
         let mut headers = HeaderMap::new();
@@ -770,14 +828,11 @@ mod tests {
                     partial: Some(json!({"query": "Alice"})),
                     strict: false,
                 })),
+                sequence: None,
             }],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Should match with all criteria met
         let mut headers = HeaderMap::new();
@@ -823,6 +878,7 @@ mod tests {
                         partial: Some(json!({"role": "admin"})),
                         strict: false,
                     })),
+                    sequence: None,
                 },
                 MockConfig {
                     method: "POST".to_string(),
@@ -837,15 +893,12 @@ mod tests {
                         partial: Some(json!({"role": "user"})),
                         strict: false,
                     })),
+                    sequence: None,
                 },
             ],
         );
 
-        let state = AppState {
-            mocks: Arc::new(tokio::sync::RwLock::new(mocks)),
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            request_counter: Arc::new(AtomicU64::new(0)),
-        };
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
 
         // Request with admin role should return admin mock
         let mut headers = HeaderMap::new();
@@ -1102,5 +1155,310 @@ mod tests {
         assert_eq!(recorded_headers["authorization"], "[REDACTED]");
         assert_eq!(recorded_headers["cookie"], "[REDACTED]");
         assert_eq!(recorded_headers["content-type"], "application/json");
+    }
+
+    // =========================================================================
+    // Stateful Sequence Tests
+    // =========================================================================
+
+    fn sequence_mock(path: &str, steps: Vec<SequenceStep>) -> MockConfig {
+        MockConfig {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: json!({"fallback": true}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            sequence: Some(steps),
+        }
+    }
+
+    fn step(status: u16, body: serde_json::Value) -> SequenceStep {
+        SequenceStep {
+            status,
+            response: body,
+            delay_ms: None,
+            repeat: false,
+        }
+    }
+
+    fn sequence_state(path: &str, steps: Vec<SequenceStep>) -> AppState {
+        let mocks = HashMap::from([(format!("GET:{}", path), vec![sequence_mock(path, steps)])]);
+        AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)))
+    }
+
+    async fn call(state: &AppState, path: &str) -> (StatusCode, serde_json::Value) {
+        let response = handle_request(
+            Method::GET,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (parts.status, json)
+    }
+
+    #[tokio::test]
+    async fn test_sequence_steps_consumed_in_order() {
+        let state = sequence_state(
+            "/seq",
+            vec![
+                step(200, json!({"n": 1})),
+                step(429, json!({"n": 2})),
+                step(500, json!({"n": 3})),
+            ],
+        );
+
+        let (status, body) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["n"], 1);
+
+        let (status, body) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["n"], 2);
+
+        let (status, body) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["n"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_exhaustion_last_step_repeats() {
+        let state = sequence_state(
+            "/seq",
+            vec![step(201, json!({"n": 1})), step(500, json!({"n": 2}))],
+        );
+
+        let _ = call(&state, "/seq").await;
+        let _ = call(&state, "/seq").await;
+
+        // Sequence exhausted: last step keeps repeating even without repeat: true
+        for _ in 0..3 {
+            let (status, body) = call(&state, "/seq").await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body["n"], 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sequence_repeat_step_sticks() {
+        let mut repeat_step = step(200, json!({"ok": true}));
+        repeat_step.repeat = true;
+        let state = sequence_state(
+            "/seq",
+            vec![
+                step(503, json!({"error": "unavailable"})),
+                repeat_step,
+                step(500, json!({"never": true})),
+            ],
+        );
+
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // The repeat step pins the counter; the step after it is never served
+        for _ in 0..3 {
+            let (status, body) = call(&state, "/seq").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["ok"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_sequence_falls_back_to_top_level() {
+        let state = sequence_state("/seq", vec![]);
+
+        for _ in 0..2 {
+            let (status, body) = call(&state, "/seq").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["fallback"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sequence_delay_applied() {
+        let mut delayed = step(200, json!({"ok": true}));
+        delayed.delay_ms = Some(30);
+        let state = sequence_state("/seq", vec![delayed]);
+
+        let start = std::time::Instant::now();
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(30),
+            "expected at least 30ms delay, got {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequence_invalid_status_falls_back_to_ok() {
+        // 99 is below the valid HTTP status range; from_u16 rejects it
+        let state = sequence_state("/seq", vec![step(99, json!({"weird": true}))]);
+
+        let (status, body) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["weird"], true);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_counters_independent_per_variant() {
+        // Two sequenced mocks sharing POST:/login, split by body matcher.
+        // Each must advance its own counter (proves the #index key).
+        let make_mock = |role: &str, steps: Vec<SequenceStep>| MockConfig {
+            method: "POST".to_string(),
+            path: "/login".to_string(),
+            status: 200,
+            response: json!({"fallback": true}),
+            consume_body: true,
+            query_params: None,
+            headers: None,
+            body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                exact: None,
+                partial: Some(json!({"role": role})),
+                strict: false,
+            })),
+            sequence: Some(steps),
+        };
+        let mocks = HashMap::from([(
+            "POST:/login".to_string(),
+            vec![
+                make_mock("admin", vec![step(200, json!({"n": 1})), step(201, json!({"n": 2}))]),
+                make_mock("user", vec![step(202, json!({"n": 1})), step(203, json!({"n": 2}))]),
+            ],
+        )]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let post = |state: AppState, role: &'static str| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "application/json".parse().unwrap());
+            let body = Body::from(format!(r#"{{"role":"{}"}}"#, role));
+            let response = handle_request(
+                Method::POST,
+                "/login".parse().unwrap(),
+                headers,
+                State(state),
+                body,
+            )
+            .await;
+            response.status()
+        };
+
+        // Interleave: each variant advances independently
+        assert_eq!(post(state.clone(), "admin").await, StatusCode::OK);
+        assert_eq!(post(state.clone(), "user").await, StatusCode::ACCEPTED);
+        assert_eq!(post(state.clone(), "admin").await, StatusCode::CREATED);
+        let status = post(state.clone(), "user").await;
+        assert_eq!(status, StatusCode::NON_AUTHORITATIVE_INFORMATION);
+    }
+
+    #[tokio::test]
+    async fn test_reset_sequences_all() {
+        let state = sequence_state(
+            "/seq",
+            vec![step(201, json!({"n": 1})), step(200, json!({"n": 2}))],
+        );
+
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let filter = SequenceResetFilter::default();
+        let response = reset_sequences(State(state.clone()), Query(filter)).await;
+        assert_eq!(response.0["reset"], 1);
+
+        // Sequence starts over from step 1
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_reset_sequences_by_path() {
+        let mocks = HashMap::from([
+            (
+                "GET:/a".to_string(),
+                vec![sequence_mock(
+                    "/a",
+                    vec![step(201, json!({"n": 1})), step(200, json!({"n": 2}))],
+                )],
+            ),
+            (
+                "GET:/b".to_string(),
+                vec![sequence_mock(
+                    "/b",
+                    vec![step(201, json!({"n": 1})), step(200, json!({"n": 2}))],
+                )],
+            ),
+        ]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let _ = call(&state, "/a").await;
+        let _ = call(&state, "/b").await;
+
+        let filter = SequenceResetFilter {
+            path: Some("/a".to_string()),
+        };
+        let response = reset_sequences(State(state.clone()), Query(filter)).await;
+        assert_eq!(response.0["reset"], 1);
+
+        // /a restarts from step 1, /b continues from step 2
+        let (status, _) = call(&state, "/a").await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call(&state, "/b").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_thread_safety() {
+        let mut repeat_step = step(200, json!({"ok": true}));
+        repeat_step.repeat = true;
+        let state = sequence_state(
+            "/seq",
+            vec![
+                step(201, json!({"n": 1})),
+                step(202, json!({"n": 2})),
+                repeat_step,
+            ],
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move { call(&state, "/seq").await.0 }));
+        }
+
+        let mut counts: HashMap<u16, usize> = HashMap::new();
+        for handle in handles {
+            let status = handle.await.unwrap();
+            *counts.entry(status.as_u16()).or_insert(0) += 1;
+        }
+
+        // Each non-repeat step is consumed exactly once, regardless of interleaving
+        assert_eq!(counts.get(&201), Some(&1));
+        assert_eq!(counts.get(&202), Some(&1));
+        assert_eq!(counts.get(&200), Some(&18));
+    }
+
+    #[tokio::test]
+    async fn test_sequence_counter_survives_hot_reload() {
+        let steps = vec![step(201, json!({"n": 1})), step(200, json!({"n": 2}))];
+        let state = sequence_state("/seq", steps.clone());
+
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Simulate the hot-reload task wholesale-replacing the mock map
+        let fresh = HashMap::from([("GET:/seq".to_string(), vec![sequence_mock("/seq", steps)])]);
+        *state.mocks.write().await = fresh;
+
+        // Counter survives: next call serves step 2
+        let (status, body) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["n"], 2);
     }
 }
