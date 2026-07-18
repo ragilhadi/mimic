@@ -369,6 +369,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            sequence: None,
         };
 
         let key = create_mock_key(&mock.method, &mock.path);

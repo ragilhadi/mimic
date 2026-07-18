@@ -593,6 +593,72 @@ The mock with the **highest score** wins.
 
 ---
 
+## 🔁 Stateful Response Sequences
+
+A mock can return **different responses on successive calls** by declaring a `sequence` array. This makes it possible to test retry logic, rate limiting, flaky services, and multi-step flows without a real server.
+
+```json
+{
+  "method": "POST",
+  "path": "/api/submit",
+  "status": 200,
+  "response": { "ok": true },
+  "sequence": [
+    { "status": 503, "response": { "error": "service unavailable, retry later" } },
+    { "status": 429, "response": { "error": "rate limited" }, "delay_ms": 100 },
+    { "status": 200, "response": { "ok": true }, "repeat": true }
+  ]
+}
+```
+
+### Step Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `status` | number | ✅ | HTTP status code for this step |
+| `response` | any JSON | ✅ | Response body for this step |
+| `delay_ms` | number | ❌ | Delay (milliseconds) before returning this step's response |
+| `repeat` | boolean | ❌ | If `true`, the sequence stops advancing at this step (default `false`) |
+
+### Semantics
+
+- Steps are consumed **in order**, one per request.
+- A step with `"repeat": true` is returned for **all subsequent calls** — the sequence stops advancing there.
+- If no step has `"repeat": true`, the **last step repeats** once the sequence is exhausted.
+- An empty `sequence` array falls back to the top-level `status`/`response`.
+- Counters are **thread-safe** and tracked per mock — two mocks sharing a path (differentiated by body/query/header matchers) advance independently.
+- Counters survive hot reload of mock files; use the reset endpoint to start over.
+
+### Testing Retry Logic
+
+With the example above, a client with retry/backoff sees exactly what a recovering service would produce:
+
+```bash
+curl -X POST http://localhost:8080/api/submit   # 503 service unavailable
+curl -X POST http://localhost:8080/api/submit   # 429 rate limited (after 100ms delay)
+curl -X POST http://localhost:8080/api/submit   # 200 ok
+curl -X POST http://localhost:8080/api/submit   # 200 ok (repeats forever)
+```
+
+### Resetting Sequences
+
+Reset call counters so tests start from step 0 again:
+
+```bash
+# Reset all sequence counters
+curl -X POST http://localhost:8080/admin/sequences/reset
+
+# Reset only the counters for one path
+curl -X POST "http://localhost:8080/admin/sequences/reset?path=/api/submit"
+```
+
+**Response:**
+```json
+{ "reset": 1 }
+```
+
+---
+
 ## 🎯 Use Cases
 
 ### 1. **Frontend Development**
@@ -864,6 +930,21 @@ Returns server status and number of loaded mocks.
 }
 ```
 
+#### Admin
+
+```
+GET    /admin/dashboard         # Web dashboard for request history
+GET    /admin/requests          # List recorded requests (filters: ?path=&method=&status=)
+DELETE /admin/requests          # Clear recorded requests
+POST   /admin/sequences/reset   # Reset sequence counters (optional: ?path=/api/submit)
+```
+
+`POST /admin/sequences/reset` returns the number of counters that were reset:
+
+```json
+{ "reset": 2 }
+```
+
 #### Mock Endpoints
 
 All other endpoints are defined by your mock files. Mimic will:
@@ -941,9 +1022,10 @@ Built with:
 - [x] Request body matching
 - [x] Query parameter matching
 - [x] Header matching
-- [ ] Response delays
-- [ ] Admin UI
-- [ ] Hot reload for mock files
+- [x] Stateful response sequences (different response per call)
+- [x] Response delays (per sequence step via `delay_ms`)
+- [x] Admin UI (request history dashboard)
+- [x] Hot reload for mock files
 
 ---
 

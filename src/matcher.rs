@@ -513,13 +513,17 @@ fn match_form_body(actual: &HashMap<String, String>, matcher: &FormBodyMatcher) 
 pub struct MatchResult {
     pub mock: MockConfig,
     pub score: u32,
+    /// Position of the mock within its METHOD:PATH bucket, used to key
+    /// per-mock sequence counters when several mocks share a path
+    pub index: usize,
 }
 
-/// Find the best matching mock for a request
+/// Find the best matching mock for a request, along with its index
+/// within the METHOD:PATH bucket
 pub fn find_matching_mock(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
-) -> Option<MockConfig> {
+) -> Option<(MockConfig, usize)> {
     let base_key = crate::types::create_mock_key(&context.method, &context.path);
 
     debug!(
@@ -532,12 +536,13 @@ pub fn find_matching_mock(
 
     // Find all mocks that match method and path
     if let Some(mock_list) = mocks.get(&base_key) {
-        for mock in mock_list {
+        for (index, mock) in mock_list.iter().enumerate() {
             // Calculate match score
             if let Some(score) = calculate_match_score(context, mock) {
                 candidates.push(MatchResult {
                     mock: mock.clone(),
                     score,
+                    index,
                 });
             }
         }
@@ -548,7 +553,7 @@ pub fn find_matching_mock(
 
     if let Some(best) = candidates.into_iter().next() {
         debug!("Found matching mock with score {}", best.score);
-        Some(best.mock)
+        Some((best.mock, best.index))
     } else {
         debug!("No matching mock found");
         None
@@ -913,5 +918,46 @@ mod tests {
         let parsed = parse_body(&bytes, Some("application/json"));
 
         assert!(matches!(parsed, ParsedBody::Empty));
+    }
+
+    #[test]
+    fn test_find_matching_mock_returns_index() {
+        let make_mock = |role: &str| MockConfig {
+            method: "POST".to_string(),
+            path: "/login".to_string(),
+            status: 200,
+            response: serde_json::json!({"role": role}),
+            consume_body: true,
+            query_params: None,
+            headers: None,
+            body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                exact: None,
+                partial: Some(serde_json::json!({"role": role})),
+                strict: false,
+            })),
+            sequence: None,
+        };
+
+        let mocks = HashMap::from([(
+            "POST:/login".to_string(),
+            vec![make_mock("admin"), make_mock("user")],
+        )]);
+
+        let make_context = |role: &str| RequestContext {
+            method: "POST".to_string(),
+            path: "/login".to_string(),
+            query_params: HashMap::new(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(format!(r#"{{"role":"{}"}}"#, role))),
+            content_type: Some("application/json".to_string()),
+        };
+
+        let (mock, index) = find_matching_mock(&make_context("admin"), &mocks).unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(mock.response["role"], "admin");
+
+        let (mock, index) = find_matching_mock(&make_context("user"), &mocks).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(mock.response["role"], "user");
     }
 }

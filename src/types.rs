@@ -178,6 +178,25 @@ pub struct MockConfig {
     /// Optional body matcher
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyMatcher>,
+
+    /// Optional stateful response sequence (one step consumed per request)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<Vec<SequenceStep>>,
+}
+
+/// One step in a stateful response sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceStep {
+    pub status: u16,
+    pub response: serde_json::Value,
+
+    /// Optional delay applied before returning this step's response
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+
+    /// If true, the sequence stops advancing at this step
+    #[serde(default)]
+    pub repeat: bool,
 }
 
 fn default_consume_body() -> bool {
@@ -193,6 +212,9 @@ impl MockConfig {
 }
 
 pub type MockStore = Arc<RwLock<HashMap<String, Vec<MockConfig>>>>;
+
+/// Per-mock sequence call counters, keyed by "METHOD:/path#<index>"
+pub type SequenceCounters = Arc<RwLock<HashMap<String, usize>>>;
 
 // ============================================================================
 // Request History Types
@@ -287,6 +309,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            sequence: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -360,6 +383,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            sequence: None,
         };
 
         let cloned = config.clone();
@@ -382,6 +406,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                sequence: None,
             }],
         );
 
@@ -454,6 +479,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            sequence: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -537,6 +563,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            sequence: None,
         };
         assert!(!simple.has_advanced_matchers());
 
@@ -549,7 +576,59 @@ mod tests {
             query_params: Some(QueryParamMatcher::default()),
             headers: None,
             body: None,
+            sequence: None,
         };
         assert!(with_query.has_advanced_matchers());
+    }
+
+    #[test]
+    fn test_sequence_deserialization() {
+        let json = r#"{
+            "method": "POST",
+            "path": "/api/submit",
+            "status": 200,
+            "response": {"ok": true},
+            "sequence": [
+                { "status": 200, "response": { "ok": true } },
+                { "status": 429, "response": { "error": "rate limited" }, "delay_ms": 0 },
+                { "status": 200, "response": { "ok": true }, "repeat": true }
+            ]
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        let steps = config.sequence.unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].status, 200);
+        assert!(!steps[0].repeat);
+        assert_eq!(steps[1].status, 429);
+        assert_eq!(steps[1].delay_ms, Some(0));
+        assert_eq!(steps[1].response["error"], "rate limited");
+        assert!(steps[2].repeat);
+    }
+
+    #[test]
+    fn test_sequence_step_defaults() {
+        let json = r#"{ "status": 503, "response": {"error": "unavailable"} }"#;
+        let step: SequenceStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.status, 503);
+        assert_eq!(step.delay_ms, None);
+        assert!(!step.repeat);
+    }
+
+    #[test]
+    fn test_mock_config_without_sequence_backward_compat() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert!(config.sequence.is_none());
+
+        // Serialized output must omit the field so round-trips stay clean
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("sequence"));
     }
 }
