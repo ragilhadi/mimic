@@ -1329,8 +1329,14 @@ mod tests {
         let mocks = HashMap::from([(
             "POST:/login".to_string(),
             vec![
-                make_mock("admin", vec![step(200, json!({"n": 1})), step(201, json!({"n": 2}))]),
-                make_mock("user", vec![step(202, json!({"n": 1})), step(203, json!({"n": 2}))]),
+                make_mock(
+                    "admin",
+                    vec![step(200, json!({"n": 1})), step(201, json!({"n": 2}))],
+                ),
+                make_mock(
+                    "user",
+                    vec![step(202, json!({"n": 1})), step(203, json!({"n": 2}))],
+                ),
             ],
         )]);
         let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
