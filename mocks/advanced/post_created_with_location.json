@@ -1,0 +1,10 @@
+{
+  "method": "POST",
+  "path": "/resources",
+  "status": 201,
+  "response_headers": {
+    "Location": "/resources/99",
+    "X-Request-Id": "abc-123"
+  },
+  "response": { "id": 99 }
+}
