@@ -1,0 +1,7 @@
+{
+  "method": "GET",
+  "path": "/flaky-endpoint",
+  "status": 200,
+  "delay_ms": { "min": 100, "max": 3000 },
+  "response": { "data": "variable latency between 100ms and 3000ms" }
+}

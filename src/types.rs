@@ -1,3 +1,4 @@
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -179,9 +180,37 @@ pub struct MockConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyMatcher>,
 
+    /// Optional response delay: fixed ms or a {min, max} range
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<DelayConfig>,
+
     /// Optional stateful response sequence (one step consumed per request)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<Vec<SequenceStep>>,
+}
+
+/// Response delay configuration: a fixed duration or a random range
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DelayConfig {
+    Fixed(u64),
+    Range { min: u64, max: u64 },
+}
+
+impl DelayConfig {
+    /// Resolve the configured delay to a concrete duration in milliseconds
+    pub fn resolve(&self) -> u64 {
+        match self {
+            DelayConfig::Fixed(ms) => *ms,
+            DelayConfig::Range { min, max } => {
+                if max <= min {
+                    *min
+                } else {
+                    rand::rng().random_range(*min..=*max)
+                }
+            }
+        }
+    }
 }
 
 /// One step in a stateful response sequence
@@ -309,6 +338,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: None,
         };
 
@@ -383,6 +413,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: None,
         };
 
@@ -406,6 +437,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -479,6 +511,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: None,
         };
 
@@ -563,6 +596,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: None,
         };
         assert!(!simple.has_advanced_matchers());
@@ -576,6 +610,7 @@ mod tests {
             query_params: Some(QueryParamMatcher::default()),
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: None,
         };
         assert!(with_query.has_advanced_matchers());
@@ -613,6 +648,80 @@ mod tests {
         assert_eq!(step.status, 503);
         assert_eq!(step.delay_ms, None);
         assert!(!step.repeat);
+    }
+
+    #[test]
+    fn test_delay_config_fixed_deserialization() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/slow",
+            "status": 200,
+            "delay_ms": 500,
+            "response": {"data": "finally here"}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(config.delay_ms, Some(DelayConfig::Fixed(500))));
+    }
+
+    #[test]
+    fn test_delay_config_range_deserialization() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/flaky",
+            "status": 200,
+            "delay_ms": { "min": 100, "max": 3000 },
+            "response": {"data": "..."}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            config.delay_ms,
+            Some(DelayConfig::Range {
+                min: 100,
+                max: 3000
+            })
+        ));
+    }
+
+    #[test]
+    fn test_delay_config_resolve_fixed() {
+        assert_eq!(DelayConfig::Fixed(250).resolve(), 250);
+        assert_eq!(DelayConfig::Fixed(0).resolve(), 0);
+    }
+
+    #[test]
+    fn test_delay_config_resolve_range_within_bounds() {
+        let delay = DelayConfig::Range { min: 10, max: 20 };
+        for _ in 0..100 {
+            let ms = delay.resolve();
+            assert!((10..=20).contains(&ms), "sampled {} outside 10..=20", ms);
+        }
+    }
+
+    #[test]
+    fn test_delay_config_resolve_range_degenerate() {
+        // min == max resolves to that value
+        assert_eq!(DelayConfig::Range { min: 50, max: 50 }.resolve(), 50);
+        // Inverted range must not panic; resolves to min
+        assert_eq!(DelayConfig::Range { min: 100, max: 10 }.resolve(), 100);
+    }
+
+    #[test]
+    fn test_mock_config_without_delay_backward_compat() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert!(config.delay_ms.is_none());
+
+        // Serialized output must omit the field so round-trips stay clean
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("delay_ms"));
     }
 
     #[test]

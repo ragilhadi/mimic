@@ -369,6 +369,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: None,
         };
 

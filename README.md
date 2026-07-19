@@ -593,6 +593,44 @@ The mock with the **highest score** wins.
 
 ---
 
+## ⏱️ Response Delays (Latency Simulation)
+
+Simulate slow endpoints to test loading states, timeout handling, retries, circuit breakers, and debounce behavior. Add `delay_ms` to any mock — the response is held back for that duration before being sent.
+
+### Fixed delay
+
+```json
+{
+  "method": "GET",
+  "path": "/slow-endpoint",
+  "status": 200,
+  "delay_ms": 2000,
+  "response": { "data": "finally here" }
+}
+```
+
+### Random delay with jitter
+
+```json
+{
+  "method": "GET",
+  "path": "/flaky-endpoint",
+  "status": 200,
+  "delay_ms": { "min": 100, "max": 3000 },
+  "response": { "data": "..." }
+}
+```
+
+Each request samples a fresh uniform value between `min` and `max` (inclusive), so repeated calls see realistic variable latency.
+
+### Semantics
+
+- No `delay_ms` → zero overhead, responses are as fast as before.
+- The delay is applied **after** matching and request recording, with no locks held — a slow mock never blocks other requests, the admin API, or hot reload.
+- Works together with [sequences](#-stateful-response-sequences): a sequence step's own `delay_ms` takes precedence; steps without one inherit the mock-level delay.
+
+---
+
 ## 🔁 Stateful Response Sequences
 
 A mock can return **different responses on successive calls** by declaring a `sequence` array. This makes it possible to test retry logic, rate limiting, flaky services, and multi-step flows without a real server.
@@ -1023,7 +1061,7 @@ Built with:
 - [x] Query parameter matching
 - [x] Header matching
 - [x] Stateful response sequences (different response per call)
-- [x] Response delays (per sequence step via `delay_ms`)
+- [x] Response delays (mock-level `delay_ms`, fixed or random range, plus per sequence step)
 - [x] Admin UI (request history dashboard)
 - [x] Hot reload for mock files
 

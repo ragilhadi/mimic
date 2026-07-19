@@ -935,6 +935,7 @@ mod tests {
                 partial: Some(serde_json::json!({"role": role})),
                 strict: false,
             })),
+            delay_ms: None,
             sequence: None,
         };
 
