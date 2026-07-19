@@ -134,8 +134,12 @@ pub async fn handle_request(
             // Record the request with the status actually served
             record_request(&state, context, Some(matched_key), status_u16).await;
 
-            // Apply per-step delay last, with no locks held
-            if let Some(ms) = delay_ms {
+            // Resolve the delay: a sequence step's own delay wins, otherwise the
+            // mock-level delay_ms (fixed or sampled from a range) applies
+            let effective_delay = delay_ms.or_else(|| mock.delay_ms.as_ref().map(|d| d.resolve()));
+
+            // Apply the delay last, with no locks held
+            if let Some(ms) = effective_delay {
                 if ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
@@ -322,8 +326,8 @@ pub async fn admin_dashboard() -> Html<&'static str> {
 mod tests {
     use super::*;
     use crate::types::{
-        BodyMatcher, HeaderMatcher, HeaderPattern, HeaderValue, JsonBodyMatcher, MockConfig,
-        QueryParamMatcher, QueryParamPattern, QueryParamValue,
+        BodyMatcher, DelayConfig, HeaderMatcher, HeaderPattern, HeaderValue, JsonBodyMatcher,
+        MockConfig, QueryParamMatcher, QueryParamPattern, QueryParamValue,
     };
     use axum::http::Method;
     use http_body_util::BodyExt;
@@ -344,6 +348,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -359,6 +364,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -374,6 +380,7 @@ mod tests {
                 query_params: None,
                 headers: None,
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -538,6 +545,7 @@ mod tests {
                 }),
                 headers: None,
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -579,6 +587,7 @@ mod tests {
                 }),
                 headers: None,
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -630,6 +639,7 @@ mod tests {
                     strict: false,
                 }),
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -679,6 +689,7 @@ mod tests {
                     strict: false,
                 }),
                 body: None,
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -729,6 +740,7 @@ mod tests {
                     partial: None,
                     strict: false,
                 })),
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -770,6 +782,7 @@ mod tests {
                     partial: Some(json!({"name": "Alice"})),
                     strict: false,
                 })),
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -828,6 +841,7 @@ mod tests {
                     partial: Some(json!({"query": "Alice"})),
                     strict: false,
                 })),
+                delay_ms: None,
                 sequence: None,
             }],
         );
@@ -878,6 +892,7 @@ mod tests {
                         partial: Some(json!({"role": "admin"})),
                         strict: false,
                     })),
+                    delay_ms: None,
                     sequence: None,
                 },
                 MockConfig {
@@ -893,6 +908,7 @@ mod tests {
                         partial: Some(json!({"role": "user"})),
                         strict: false,
                     })),
+                    delay_ms: None,
                     sequence: None,
                 },
             ],
@@ -1171,6 +1187,7 @@ mod tests {
             query_params: None,
             headers: None,
             body: None,
+            delay_ms: None,
             sequence: Some(steps),
         }
     }
@@ -1324,6 +1341,7 @@ mod tests {
                 partial: Some(json!({"role": role})),
                 strict: false,
             })),
+            delay_ms: None,
             sequence: Some(steps),
         };
         let mocks = HashMap::from([(
@@ -1466,5 +1484,88 @@ mod tests {
         let (status, body) = call(&state, "/seq").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["n"], 2);
+    }
+
+    // =========================================================================
+    // Response Delay Tests
+    // =========================================================================
+
+    fn delayed_state(path: &str, delay: DelayConfig) -> AppState {
+        let mut mock = sequence_mock(path, vec![]);
+        mock.sequence = None;
+        mock.delay_ms = Some(delay);
+        let mocks = HashMap::from([(format!("GET:{}", path), vec![mock])]);
+        AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)))
+    }
+
+    #[tokio::test]
+    async fn test_mock_level_delay_applied() {
+        let state = delayed_state("/slow", DelayConfig::Fixed(30));
+
+        let start = std::time::Instant::now();
+        let (status, body) = call(&state, "/slow").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["fallback"], true);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(30),
+            "expected at least 30ms delay, got {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_range_delay_applied() {
+        let state = delayed_state("/flaky", DelayConfig::Range { min: 20, max: 40 });
+
+        let start = std::time::Instant::now();
+        let (status, _) = call(&state, "/flaky").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(20),
+            "expected at least 20ms delay, got {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_step_delay_overrides_mock_delay() {
+        let mut step_with_delay = step(200, json!({"ok": true}));
+        step_with_delay.delay_ms = Some(10);
+        let mut mock = sequence_mock("/seq", vec![step_with_delay]);
+        mock.delay_ms = Some(DelayConfig::Fixed(5000));
+        let mocks = HashMap::from([("GET:/seq".to_string(), vec![mock])]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let start = std::time::Instant::now();
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::OK);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(10),
+            "expected at least the step's 10ms delay, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(5000),
+            "mock-level 5000ms delay should have been overridden, got {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_delay_applies_to_step_without_own_delay() {
+        let mut mock = sequence_mock("/seq", vec![step(201, json!({"n": 1}))]);
+        mock.delay_ms = Some(DelayConfig::Fixed(30));
+        let mocks = HashMap::from([("GET:/seq".to_string(), vec![mock])]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let start = std::time::Instant::now();
+        let (status, _) = call(&state, "/seq").await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(30),
+            "expected the mock-level 30ms delay, got {:?}",
+            start.elapsed()
+        );
     }
 }
