@@ -936,6 +936,7 @@ mod tests {
                 strict: false,
             })),
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
 

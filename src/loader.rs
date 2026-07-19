@@ -370,6 +370,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
 
