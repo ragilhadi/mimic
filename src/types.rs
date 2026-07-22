@@ -180,6 +180,10 @@ pub struct MockConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyMatcher>,
 
+    /// Optional custom response headers (names are case-insensitive)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<HashMap<String, String>>,
+
     /// Optional response delay: fixed ms or a {min, max} range
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<DelayConfig>,
@@ -339,6 +343,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
 
@@ -414,6 +419,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
 
@@ -438,6 +444,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -512,6 +519,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
 
@@ -597,6 +605,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
         assert!(!simple.has_advanced_matchers());
@@ -611,6 +620,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: None,
         };
         assert!(with_query.has_advanced_matchers());
@@ -648,6 +658,50 @@ mod tests {
         assert_eq!(step.status, 503);
         assert_eq!(step.delay_ms, None);
         assert!(!step.repeat);
+    }
+
+    #[test]
+    fn test_response_headers_deserialization() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/data.xml",
+            "status": 200,
+            "response_headers": {
+                "Content-Type": "application/xml; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Custom-Header": "my-value"
+            },
+            "response": "<users><user id=\"1\"/></users>"
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        let headers = config.response_headers.unwrap();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(
+            headers.get("Content-Type").map(String::as_str),
+            Some("application/xml; charset=utf-8")
+        );
+        assert_eq!(
+            headers.get("X-Custom-Header").map(String::as_str),
+            Some("my-value")
+        );
+    }
+
+    #[test]
+    fn test_mock_config_without_response_headers_backward_compat() {
+        let json = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+
+        let config: MockConfig = serde_json::from_str(json).unwrap();
+        assert!(config.response_headers.is_none());
+
+        // Serialized output must omit the field so round-trips stay clean
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("response_headers"));
     }
 
     #[test]

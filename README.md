@@ -594,6 +594,65 @@ The mock with the **highest score** wins.
 
 ---
 
+## 📬 Custom Response Headers
+
+Set arbitrary response headers per mock with `response_headers` — for CORS, redirects, non-JSON content types, cache control, rate-limit simulation, or auth challenges.
+
+### CORS example
+
+```json
+{
+  "method": "GET",
+  "path": "/api/data",
+  "status": 200,
+  "response_headers": {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+  },
+  "response": { "data": [1, 2, 3] }
+}
+```
+
+### Non-JSON response (XML)
+
+```json
+{
+  "method": "GET",
+  "path": "/data.xml",
+  "status": 200,
+  "response_headers": {
+    "Content-Type": "application/xml; charset=utf-8",
+    "Cache-Control": "no-cache"
+  },
+  "response": "<users><user id=\"1\"/></users>"
+}
+```
+
+### Created resource with Location
+
+```json
+{
+  "method": "POST",
+  "path": "/resources",
+  "status": 201,
+  "response_headers": {
+    "Location": "/resources/99",
+    "X-Request-Id": "abc-123"
+  },
+  "response": { "id": 99 }
+}
+```
+
+### Semantics
+
+- Header names are **case-insensitive** (`content-type` and `Content-Type` both work).
+- `Content-Type: application/json` is added automatically **only when** your headers don't set a content type — mocks without `response_headers` behave exactly as before.
+- When a **non-JSON** content type is set and `response` is a JSON string, the raw string is sent as the body — so XML/CSV/plain-text responses aren't JSON-quoted.
+- Invalid header names or values are skipped with a warning; the response is still served.
+- Headers apply to every response of the mock, including all [sequence](#-stateful-response-sequences) steps.
+
+---
+
 ## ⏱️ Response Delays (Latency Simulation)
 
 Simulate slow endpoints to test loading states, timeout handling, retries, circuit breakers, and debounce behavior. Add `delay_ms` to any mock — the response is held back for that duration before being sent.
@@ -1119,6 +1178,7 @@ Built with:
 - [x] Header matching
 - [x] Stateful response sequences (different response per call)
 - [x] Response delays (mock-level `delay_ms`, fixed or random range, plus per sequence step)
+- [x] Custom response headers (`response_headers` — CORS, redirects, non-JSON content types)
 - [x] Admin UI (request history dashboard)
 - [x] Hot reload for mock files
 - [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`)

@@ -19,7 +19,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -164,8 +164,8 @@ pub async fn handle_request(
                 }
             }
 
-            // Return configured response
-            (status, Json(response)).into_response()
+            // Return configured response with any custom headers
+            build_response(status, &response, mock.response_headers.as_ref())
         }
         None => {
             info!("No mock found for: {} {}", method_str, path);
@@ -286,6 +286,54 @@ pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Build the mock response: status, custom headers, and body.
+///
+/// Custom header names are case-insensitive; invalid names/values are skipped
+/// with a warning. `Content-Type: application/json` is added only when the
+/// custom headers don't already set a content type. When a non-JSON content
+/// type is configured and the response value is a JSON string, the raw string
+/// is sent as the body (so XML/CSV/plain-text mocks aren't JSON-quoted).
+fn build_response(
+    status: StatusCode,
+    response: &serde_json::Value,
+    custom_headers: Option<&HashMap<String, String>>,
+) -> Response {
+    let mut header_map = HeaderMap::new();
+    if let Some(custom) = custom_headers {
+        for (name, value) in custom {
+            let parsed_name = axum::http::HeaderName::from_bytes(name.as_bytes());
+            let parsed_value = axum::http::HeaderValue::from_str(value);
+            match (parsed_name, parsed_value) {
+                (Ok(n), Ok(v)) => {
+                    header_map.insert(n, v);
+                }
+                _ => warn!("Skipping invalid response header: {}", name),
+            }
+        }
+    }
+    if !header_map.contains_key(CONTENT_TYPE) {
+        header_map.insert(
+            CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+    }
+
+    let is_json_content_type = header_map
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.to_ascii_lowercase().contains("json"));
+
+    let body = match response {
+        serde_json::Value::String(s) if !is_json_content_type => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+
+    let mut res = Response::new(Body::from(body));
+    *res.status_mut() = status;
+    *res.headers_mut() = header_map;
+    res
+}
+
 /// Pick the current sequence step and advance the counter.
 /// The write lock is held only for the map lookup + clone, never across an await.
 async fn advance_sequence(
@@ -368,6 +416,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -384,6 +433,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -400,6 +450,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -565,6 +616,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -607,6 +659,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -659,6 +712,7 @@ mod tests {
                 }),
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -709,6 +763,7 @@ mod tests {
                 }),
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -760,6 +815,7 @@ mod tests {
                     strict: false,
                 })),
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -802,6 +858,7 @@ mod tests {
                     strict: false,
                 })),
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -861,6 +918,7 @@ mod tests {
                     strict: false,
                 })),
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -1081,6 +1139,7 @@ mod tests {
                         strict: false,
                     })),
                     delay_ms: None,
+                    response_headers: None,
                     sequence: None,
                 },
                 MockConfig {
@@ -1097,6 +1156,7 @@ mod tests {
                         strict: false,
                     })),
                     delay_ms: None,
+                    response_headers: None,
                     sequence: None,
                 },
             ],
@@ -1376,6 +1436,7 @@ mod tests {
             headers: None,
             body: None,
             delay_ms: None,
+            response_headers: None,
             sequence: Some(steps),
         }
     }
@@ -1530,6 +1591,7 @@ mod tests {
                 strict: false,
             })),
             delay_ms: None,
+            response_headers: None,
             sequence: Some(steps),
         };
         let mocks = HashMap::from([(
@@ -1755,5 +1817,160 @@ mod tests {
             "expected the mock-level 30ms delay, got {:?}",
             start.elapsed()
         );
+    }
+
+    // =========================================================================
+    // Custom Response Header Tests
+    // =========================================================================
+
+    async fn call_raw(state: &AppState, path: &str) -> (StatusCode, HeaderMap, String) {
+        let response = handle_request(
+            Method::GET,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        (parts.status, parts.headers, text)
+    }
+
+    fn headers_state(
+        path: &str,
+        response: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> AppState {
+        let mut mock = sequence_mock(path, vec![]);
+        mock.sequence = None;
+        mock.response = response;
+        mock.response_headers = Some(
+            headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let mocks = HashMap::from([(format!("GET:{}", path), vec![mock])]);
+        AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)))
+    }
+
+    #[tokio::test]
+    async fn test_custom_response_headers_present() {
+        let state = headers_state(
+            "/data",
+            json!({"ok": true}),
+            &[
+                ("X-Custom-Header", "my-value"),
+                ("Cache-Control", "no-cache"),
+            ],
+        );
+
+        let (status, headers, body) = call_raw(&state, "/data").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("x-custom-header").unwrap(), "my-value");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-cache");
+        // Default Content-Type still applied when not overridden
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(body, r#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn test_content_type_override_not_doubled() {
+        let state = headers_state(
+            "/data.xml",
+            json!({"ignored": true}),
+            &[("Content-Type", "application/xml; charset=utf-8")],
+        );
+
+        let (_, headers, _) = call_raw(&state, "/data.xml").await;
+        let values: Vec<_> = headers.get_all("content-type").iter().collect();
+        assert_eq!(values.len(), 1, "content-type must not be duplicated");
+        assert_eq!(values[0], "application/xml; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn test_content_type_override_case_insensitive() {
+        // Lowercase key in the config must still suppress the JSON default
+        let state = headers_state("/text", json!("hello"), &[("content-type", "text/plain")]);
+
+        let (_, headers, _) = call_raw(&state, "/text").await;
+        let values: Vec<_> = headers.get_all("content-type").iter().collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn test_non_json_content_type_sends_raw_string_body() {
+        let state = headers_state(
+            "/data.xml",
+            json!("<users><user id=\"1\"/></users>"),
+            &[("Content-Type", "application/xml; charset=utf-8")],
+        );
+
+        let (status, _, body) = call_raw(&state, "/data.xml").await;
+        assert_eq!(status, StatusCode::OK);
+        // Raw XML, not a JSON-quoted string
+        assert_eq!(body, r#"<users><user id="1"/></users>"#);
+    }
+
+    #[tokio::test]
+    async fn test_string_response_without_custom_headers_stays_json() {
+        let mut mock = sequence_mock("/greeting", vec![]);
+        mock.sequence = None;
+        mock.response = json!("hello");
+        let mocks = HashMap::from([("GET:/greeting".to_string(), vec![mock])]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let (_, headers, body) = call_raw(&state, "/greeting").await;
+        // Backward compat: JSON-quoted string with the JSON content type
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(body, r#""hello""#);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_header_skipped_gracefully() {
+        let state = headers_state(
+            "/data",
+            json!({"ok": true}),
+            &[("bad header name", "x"), ("X-Valid", "yes")],
+        );
+
+        let (status, headers, _) = call_raw(&state, "/data").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("bad header name").is_none());
+        assert_eq!(headers.get("x-valid").unwrap(), "yes");
+    }
+
+    #[tokio::test]
+    async fn test_cors_and_location_headers() {
+        let state = headers_state(
+            "/resources",
+            json!({"id": 99}),
+            &[
+                ("Access-Control-Allow-Origin", "*"),
+                ("Location", "/resources/99"),
+            ],
+        );
+
+        let (_, headers, _) = call_raw(&state, "/resources").await;
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(headers.get("location").unwrap(), "/resources/99");
+    }
+
+    #[tokio::test]
+    async fn test_response_headers_apply_to_sequence_steps() {
+        let mut mock = sequence_mock("/seq", vec![step(429, json!({"error": "rate limited"}))]);
+        mock.response_headers = Some(HashMap::from([(
+            "Retry-After".to_string(),
+            "60".to_string(),
+        )]));
+        let mocks = HashMap::from([("GET:/seq".to_string(), vec![mock])]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let (status, headers, _) = call_raw(&state, "/seq").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get("retry-after").unwrap(), "60");
     }
 }

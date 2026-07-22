@@ -1,0 +1,11 @@
+{
+  "method": "GET",
+  "path": "/data.xml",
+  "status": 200,
+  "response_headers": {
+    "Content-Type": "application/xml; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "X-Custom-Header": "my-value"
+  },
+  "response": "<users><user id=\"1\"/></users>"
+}
