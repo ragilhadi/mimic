@@ -17,8 +17,9 @@
 - **Easy to Use** - Simple configuration, no complex setup
 - **Configurable Body Consumption** - Control request body handling per endpoint
 - **File Upload Support** - Handle multipart/form-data with `consume_body` option
-- **Advanced Matching** - Match on query params, headers, and request body
-- **Dynamic Response Templating** - Echo query params, headers, and body fields back into responses with `{{query.x}}` syntax
+- **Advanced Matching** - Match on path parameters, query params, headers, and request body
+- **Path Parameters** - `/users/:id` and `/users/{id}` syntax, one mock covers every value
+- **Dynamic Response Templating** - Echo path, query, header, and body fields back into responses with `{{path.x}}` syntax
 
 ---
 
@@ -295,7 +296,49 @@ Without `consume_body: true`, clients may encounter "Broken Pipe" errors when se
 
 ## 🎯 Advanced Matching
 
-Mimic supports advanced request matching beyond just HTTP method and path. You can match requests based on **query parameters**, **headers**, and **request body** content.
+Mimic supports advanced request matching beyond just HTTP method and path. You can match requests based on **path parameters**, **query parameters**, **headers**, and **request body** content.
+
+### Path Parameters
+
+A literal `path` only matches one exact URL, which gets impractical fast for REST-style resources — mocking `GET /users/1`, `GET /users/2`, `GET /users/3` would otherwise need a separate file per id. Use named path parameters instead, and a single mock covers every value in that segment.
+
+Both `:id` (Express-style) and `{id}` (OpenAPI-style) syntax are supported:
+
+**File**: `mocks/advanced/get_user_by_id.json`
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id",
+  "status": 200,
+  "response": {
+    "id": "{{path.id}}",
+    "name": "Mock User"
+  }
+}
+```
+
+```bash
+curl http://localhost:8080/users/42
+# { "id": "42", "name": "Mock User" }
+```
+
+Multiple parameters, and nested resources, work the same way:
+
+```json
+{
+  "method": "DELETE",
+  "path": "/orgs/{org}/repos/{repo}",
+  "status": 204,
+  "response": null
+}
+```
+
+**Semantics:**
+- Captured values are available for [response templating](#-dynamic-response-templating) as `{{path.id}}`.
+- An **exact path always wins over a pattern** when both could match — e.g. if `/users/42` and `/users/:id` are both defined, a request for `/users/42` hits the exact mock and everything else falls through to the pattern.
+- Exact-path lookups stay O(1); patterns are only checked when no exact match exists, so mocks with no path parameters see no performance change.
+- A [sequence](#-stateful-response-sequences) on a pattern mock advances a single shared counter across every value of the parameter (e.g. `/items/1` and `/items/2` progress the same sequence for `/items/:id`), not one counter per resolved id.
 
 ### Query Parameter Matching
 
@@ -767,7 +810,7 @@ Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax in
 | `{{header.x-request-id}}` | Request header value (case-insensitive) |
 | `{{body.username}}` | Top-level JSON (or form) body field |
 | `{{body.user.email}}` | Nested JSON body field (dot notation) |
-| `{{path.id}}` | Reserved for named path parameters — always empty today; see the Roadmap section below |
+| `{{path.id}}` | Named [path parameter](#path-parameters) `:id` or `{id}` |
 
 ### Example
 
@@ -1181,8 +1224,8 @@ Built with:
 - [x] Custom response headers (`response_headers` — CORS, redirects, non-JSON content types)
 - [x] Admin UI (request history dashboard)
 - [x] Hot reload for mock files
-- [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`)
-- [ ] Path parameter matching (`:id`) — will unlock `{{path.id}}` templating
+- [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`, `{{path.x}}`)
+- [x] Path parameter matching (`:id`, `{id}` syntax)
 
 ---
 

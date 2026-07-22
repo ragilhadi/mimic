@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "path": "/users/:id",
+  "status": 200,
+  "response": {
+    "id": "{{path.id}}",
+    "name": "Mock User"
+  }
+}
