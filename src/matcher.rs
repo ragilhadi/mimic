@@ -510,8 +510,90 @@ fn match_form_body(actual: &HashMap<String, String>, matcher: &FormBodyMatcher) 
 }
 
 // ============================================================================
+// Path Parameter Matching
+// ============================================================================
+
+/// A path template compiled into a regex, plus the parameter names in the
+/// order their capture groups appear. Supports `:name` (Express-style) and
+/// `{name}` (OpenAPI-style) segments.
+#[derive(Debug, Clone)]
+pub struct CompiledPathPattern {
+    pub original: String,
+    pub regex: Regex,
+    pub param_names: Vec<String>,
+}
+
+/// True if any path segment uses `:name` or `{name}` parameter syntax.
+pub fn is_pattern_path(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        (segment.starts_with(':') && segment.len() > 1)
+            || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
+    })
+}
+
+/// Compile a path template into a regex with one (unnamed, positional)
+/// capture group per parameter segment — using positional groups rather
+/// than Rust regex's named-group syntax means parameter names aren't
+/// restricted to `[A-Za-z0-9_]` (e.g. `:org-id` works).
+///
+/// Returns `None` if the path has no parameter segments, or the resulting
+/// regex fails to compile.
+pub fn compile_path_pattern(path: &str) -> Option<CompiledPathPattern> {
+    let mut param_names = Vec::new();
+    let mut regex_parts = Vec::new();
+
+    for segment in path.split('/') {
+        if let Some(name) = segment.strip_prefix(':').filter(|n| !n.is_empty()) {
+            param_names.push(name.to_string());
+            regex_parts.push("([^/]+)".to_string());
+        } else if segment.len() > 2 && segment.starts_with('{') && segment.ends_with('}') {
+            param_names.push(segment[1..segment.len() - 1].to_string());
+            regex_parts.push("([^/]+)".to_string());
+        } else {
+            regex_parts.push(regex::escape(segment));
+        }
+    }
+
+    if param_names.is_empty() {
+        return None;
+    }
+
+    let pattern = format!("^{}$", regex_parts.join("/"));
+    match Regex::new(&pattern) {
+        Ok(regex) => Some(CompiledPathPattern {
+            original: path.to_string(),
+            regex,
+            param_names,
+        }),
+        Err(e) => {
+            warn!("Invalid path parameter pattern '{}': {}", path, e);
+            None
+        }
+    }
+}
+
+/// Match a concrete request path against a compiled pattern, returning the
+/// captured parameter values keyed by name, or `None` if it doesn't match.
+pub fn match_path_pattern(
+    pattern: &CompiledPathPattern,
+    request_path: &str,
+) -> Option<HashMap<String, String>> {
+    let caps = pattern.regex.captures(request_path)?;
+    let mut params = HashMap::with_capacity(pattern.param_names.len());
+    for (i, name) in pattern.param_names.iter().enumerate() {
+        let value = caps.get(i + 1)?.as_str().to_string();
+        params.insert(name.clone(), value);
+    }
+    Some(params)
+}
+
+// ============================================================================
 // Mock Finding - Find best matching mock
 // ============================================================================
+
+/// Score deducted from a pattern (path-parameter) match relative to an exact
+/// path match, so an exact path always outranks a pattern when both match.
+const PATTERN_MATCH_PENALTY: u32 = 100;
 
 /// Result of mock matching with score for ranking
 #[derive(Debug)]
@@ -521,14 +603,24 @@ pub struct MatchResult {
     /// Position of the mock within its METHOD:PATH bucket, used to key
     /// per-mock sequence counters when several mocks share a path
     pub index: usize,
+    /// Values captured from named path parameters; empty for exact matches
+    pub path_params: HashMap<String, String>,
+    /// The "METHOD:path" key the matched mock is registered under — the
+    /// mock's declared path (which may be a pattern like `/users/:id`),
+    /// not necessarily the concrete request path
+    pub matched_key: String,
 }
 
-/// Find the best matching mock for a request, along with its index
-/// within the METHOD:PATH bucket
+/// Find the best matching mock for a request.
+///
+/// Exact "METHOD:path" lookups are O(1) and tried first; parameterized
+/// paths (`:id`, `{id}`) are only checked afterward, by scanning mocks
+/// registered under the same method, and always score lower — so an exact
+/// path match wins over a pattern match whenever both are eligible.
 pub fn find_matching_mock(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
-) -> Option<(MockConfig, usize)> {
+) -> Option<MatchResult> {
     let base_key = crate::types::create_mock_key(&context.method, &context.path);
 
     debug!(
@@ -539,15 +631,49 @@ pub fn find_matching_mock(
 
     let mut candidates: Vec<MatchResult> = Vec::new();
 
-    // Find all mocks that match method and path
+    // Exact match: O(1) lookup, no path params, full score.
     if let Some(mock_list) = mocks.get(&base_key) {
         for (index, mock) in mock_list.iter().enumerate() {
-            // Calculate match score
             if let Some(score) = calculate_match_score(context, mock) {
                 candidates.push(MatchResult {
                     mock: mock.clone(),
                     score,
                     index,
+                    path_params: HashMap::new(),
+                    matched_key: base_key.clone(),
+                });
+            }
+        }
+    }
+
+    // Pattern match: scan mocks registered under the same method whose path
+    // uses :name/{name} segments.
+    let method_prefix = format!("{}:", context.method.to_uppercase());
+    for (key, mock_list) in mocks.iter() {
+        if *key == base_key {
+            continue; // already handled as an exact match above
+        }
+        let Some(path_part) = key.strip_prefix(method_prefix.as_str()) else {
+            continue;
+        };
+        if !is_pattern_path(path_part) {
+            continue;
+        }
+        let Some(pattern) = compile_path_pattern(path_part) else {
+            continue;
+        };
+        let Some(params) = match_path_pattern(&pattern, &context.path) else {
+            continue;
+        };
+
+        for (index, mock) in mock_list.iter().enumerate() {
+            if let Some(score) = calculate_match_score(context, mock) {
+                candidates.push(MatchResult {
+                    mock: mock.clone(),
+                    score: score.saturating_sub(PATTERN_MATCH_PENALTY),
+                    index,
+                    path_params: params.clone(),
+                    matched_key: key.clone(),
                 });
             }
         }
@@ -558,7 +684,7 @@ pub fn find_matching_mock(
 
     if let Some(best) = candidates.into_iter().next() {
         debug!("Found matching mock with score {}", best.score);
-        Some((best.mock, best.index))
+        Some(best)
     } else {
         debug!("No matching mock found");
         None
@@ -960,12 +1086,223 @@ mod tests {
             content_type: Some("application/json".to_string()),
         };
 
-        let (mock, index) = find_matching_mock(&make_context("admin"), &mocks).unwrap();
-        assert_eq!(index, 0);
-        assert_eq!(mock.response["role"], "admin");
+        let result = find_matching_mock(&make_context("admin"), &mocks).unwrap();
+        assert_eq!(result.index, 0);
+        assert_eq!(result.mock.response["role"], "admin");
+        assert!(result.path_params.is_empty());
+        assert_eq!(result.matched_key, "POST:/login");
 
-        let (mock, index) = find_matching_mock(&make_context("user"), &mocks).unwrap();
-        assert_eq!(index, 1);
-        assert_eq!(mock.response["role"], "user");
+        let result = find_matching_mock(&make_context("user"), &mocks).unwrap();
+        assert_eq!(result.index, 1);
+        assert_eq!(result.mock.response["role"], "user");
+    }
+
+    // ========================================================================
+    // Path Parameter Tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_pattern_path() {
+        assert!(is_pattern_path("/users/:id"));
+        assert!(is_pattern_path("/orgs/{org}/repos/{repo}"));
+        assert!(is_pattern_path("/users/:id/posts/:postId"));
+        assert!(!is_pattern_path("/users/123"));
+        assert!(!is_pattern_path("/users"));
+        assert!(!is_pattern_path("/"));
+    }
+
+    #[test]
+    fn test_compile_path_pattern_single_param_colon_style() {
+        let pattern = compile_path_pattern("/users/:id").unwrap();
+        assert_eq!(pattern.param_names, vec!["id".to_string()]);
+        assert!(pattern.regex.is_match("/users/42"));
+        assert!(!pattern.regex.is_match("/users/42/extra"));
+        assert!(!pattern.regex.is_match("/users"));
+    }
+
+    #[test]
+    fn test_compile_path_pattern_single_param_brace_style() {
+        let pattern = compile_path_pattern("/users/{id}").unwrap();
+        assert_eq!(pattern.param_names, vec!["id".to_string()]);
+        assert!(pattern.regex.is_match("/users/42"));
+    }
+
+    #[test]
+    fn test_compile_path_pattern_multiple_params() {
+        let pattern = compile_path_pattern("/orgs/{org}/repos/{repo}").unwrap();
+        assert_eq!(
+            pattern.param_names,
+            vec!["org".to_string(), "repo".to_string()]
+        );
+        assert!(pattern.regex.is_match("/orgs/acme/repos/widgets"));
+    }
+
+    #[test]
+    fn test_compile_path_pattern_nested_mixed_literal_segments() {
+        let pattern = compile_path_pattern("/orders/:id/items/:itemId").unwrap();
+        assert_eq!(
+            pattern.param_names,
+            vec!["id".to_string(), "itemId".to_string()]
+        );
+        assert!(pattern.regex.is_match("/orders/ORD-9981/items/2"));
+        assert!(!pattern.regex.is_match("/orders/ORD-9981"));
+    }
+
+    #[test]
+    fn test_compile_path_pattern_returns_none_without_params() {
+        assert!(compile_path_pattern("/users/123").is_none());
+        assert!(compile_path_pattern("/users").is_none());
+    }
+
+    #[test]
+    fn test_compile_path_pattern_escapes_regex_metacharacters_in_literals() {
+        // A literal segment that looks like a regex special char shouldn't
+        // be interpreted as one.
+        let pattern = compile_path_pattern("/a.b/:id").unwrap();
+        assert!(pattern.regex.is_match("/a.b/1"));
+        assert!(!pattern.regex.is_match("/aXb/1"));
+    }
+
+    #[test]
+    fn test_match_path_pattern_captures_values() {
+        let pattern = compile_path_pattern("/orgs/{org}/repos/{repo}").unwrap();
+        let params = match_path_pattern(&pattern, "/orgs/acme/repos/widgets").unwrap();
+        assert_eq!(params.get("org"), Some(&"acme".to_string()));
+        assert_eq!(params.get("repo"), Some(&"widgets".to_string()));
+    }
+
+    #[test]
+    fn test_match_path_pattern_no_match_returns_none() {
+        let pattern = compile_path_pattern("/users/:id").unwrap();
+        assert!(match_path_pattern(&pattern, "/posts/1").is_none());
+        assert!(match_path_pattern(&pattern, "/users/1/extra").is_none());
+    }
+
+    fn path_param_mock(path: &str, response: serde_json::Value) -> MockConfig {
+        MockConfig {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            status: 200,
+            response,
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            sequence: None,
+        }
+    }
+
+    fn path_param_context(path: &str) -> RequestContext {
+        RequestContext {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            path_params: HashMap::new(),
+            query_params: HashMap::new(),
+            headers: HashMap::new(),
+            body: None,
+            content_type: None,
+        }
+    }
+
+    #[test]
+    fn test_find_matching_mock_single_path_param() {
+        let mocks = HashMap::from([(
+            "GET:/users/:id".to_string(),
+            vec![path_param_mock(
+                "/users/:id",
+                serde_json::json!({"name": "Mock User"}),
+            )],
+        )]);
+
+        let result = find_matching_mock(&path_param_context("/users/42"), &mocks).unwrap();
+        assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
+        assert_eq!(result.matched_key, "GET:/users/:id");
+        // Below the 1000 base score of an exact match
+        assert!(result.score < 1000);
+    }
+
+    #[test]
+    fn test_find_matching_mock_multiple_path_params() {
+        let mocks = HashMap::from([(
+            "DELETE:/orgs/{org}/repos/{repo}".to_string(),
+            vec![MockConfig {
+                method: "DELETE".to_string(),
+                ..path_param_mock("/orgs/{org}/repos/{repo}", serde_json::json!(null))
+            }],
+        )]);
+
+        let context = RequestContext {
+            method: "DELETE".to_string(),
+            path: "/orgs/acme/repos/widgets".to_string(),
+            path_params: HashMap::new(),
+            query_params: HashMap::new(),
+            headers: HashMap::new(),
+            body: None,
+            content_type: None,
+        };
+
+        let result = find_matching_mock(&context, &mocks).unwrap();
+        assert_eq!(result.path_params.get("org"), Some(&"acme".to_string()));
+        assert_eq!(result.path_params.get("repo"), Some(&"widgets".to_string()));
+    }
+
+    #[test]
+    fn test_find_matching_mock_nested_path_params() {
+        let mocks = HashMap::from([(
+            "GET:/orders/:id/items/:itemId".to_string(),
+            vec![path_param_mock(
+                "/orders/:id/items/:itemId",
+                serde_json::json!({"ok": true}),
+            )],
+        )]);
+
+        let result =
+            find_matching_mock(&path_param_context("/orders/ORD-9981/items/2"), &mocks).unwrap();
+        assert_eq!(result.path_params.get("id"), Some(&"ORD-9981".to_string()));
+        assert_eq!(result.path_params.get("itemId"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_find_matching_mock_exact_path_beats_pattern() {
+        let mocks = HashMap::from([
+            (
+                "GET:/users/:id".to_string(),
+                vec![path_param_mock(
+                    "/users/:id",
+                    serde_json::json!({"source": "pattern"}),
+                )],
+            ),
+            (
+                "GET:/users/42".to_string(),
+                vec![path_param_mock(
+                    "/users/42",
+                    serde_json::json!({"source": "exact"}),
+                )],
+            ),
+        ]);
+
+        let result = find_matching_mock(&path_param_context("/users/42"), &mocks).unwrap();
+        assert_eq!(result.mock.response["source"], "exact");
+        assert!(result.path_params.is_empty());
+
+        // A different id has no exact mock, so the pattern still matches
+        let result = find_matching_mock(&path_param_context("/users/7"), &mocks).unwrap();
+        assert_eq!(result.mock.response["source"], "pattern");
+        assert_eq!(result.path_params.get("id"), Some(&"7".to_string()));
+    }
+
+    #[test]
+    fn test_find_matching_mock_pattern_no_match_returns_none() {
+        let mocks = HashMap::from([(
+            "GET:/users/:id".to_string(),
+            vec![path_param_mock(
+                "/users/:id",
+                serde_json::json!({"name": "Mock User"}),
+            )],
+        )]);
+
+        assert!(find_matching_mock(&path_param_context("/posts/1"), &mocks).is_none());
     }
 }

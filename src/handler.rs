@@ -1,10 +1,8 @@
 use crate::matcher::{
-    find_matching_mock, parse_body, parse_headers, parse_query_string, RequestContext,
+    find_matching_mock, parse_body, parse_headers, parse_query_string, MatchResult, RequestContext,
 };
 use crate::template::{render_response, TemplateContext};
-use crate::types::{
-    create_mock_key, MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
-};
+use crate::types::{MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -101,7 +99,7 @@ pub async fn handle_request(
         };
 
     // Build request context for matching
-    let context = RequestContext {
+    let mut context = RequestContext {
         method: method_str.clone(),
         path: path.clone(),
         path_params: HashMap::new(),
@@ -118,13 +116,24 @@ pub async fn handle_request(
     drop(mocks);
 
     match matched {
-        Some((mock, index)) => {
+        Some(MatchResult {
+            mock,
+            index,
+            path_params,
+            matched_key: mock_key,
+        }) => {
+            // Named path parameters captured from the mock's pattern (e.g.
+            // `/users/:id`), if any, become available to templating below.
+            context.path_params = path_params;
+
             // Resolve the response: sequence step if configured, top-level otherwise.
             // An empty sequence array falls back to the top-level status/response.
+            // The counter is keyed by the mock's declared path (`mock_key`), not the
+            // concrete request path, so a pattern mock like `/users/:id` advances a
+            // single shared sequence regardless of which id was requested.
             let (status_u16, response, delay_ms) = match mock.sequence.as_deref() {
                 Some(steps) if !steps.is_empty() => {
-                    let base_key = create_mock_key(&method_str, &path);
-                    let counter_key = format!("{}#{}", base_key, index);
+                    let counter_key = format!("{}#{}", mock_key, index);
                     advance_sequence(&state.sequence_counters, &counter_key, steps).await
                 }
                 _ => (mock.status, mock.response.clone(), None),
@@ -1115,6 +1124,245 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["echoed"], "hello");
+    }
+
+    // =========================================================================
+    // Path Parameter Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_path_param_matches_and_templates_into_response() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/users/:id".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users/:id".to_string(),
+                status: 200,
+                response: json!({"id": "{{path.id}}", "name": "Mock User"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+        let uri = "/users/42".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["id"], "42");
+        assert_eq!(json["name"], "Mock User");
+    }
+
+    #[tokio::test]
+    async fn test_path_param_brace_syntax_multiple_params() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "DELETE:/orgs/{org}/repos/{repo}".to_string(),
+            vec![MockConfig {
+                method: "DELETE".to_string(),
+                path: "/orgs/{org}/repos/{repo}".to_string(),
+                status: 204,
+                response: json!(null),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+        let uri = "/orgs/acme/repos/widgets".parse().unwrap();
+        let response = handle_request(
+            Method::DELETE,
+            uri,
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_exact_path_wins_over_path_param_pattern() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/users/:id".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users/:id".to_string(),
+                status: 200,
+                response: json!({"source": "pattern"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+        mocks.insert(
+            "GET:/users/42".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users/42".to_string(),
+                status: 200,
+                response: json!({"source": "exact"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        // The exact mock wins for id=42
+        let uri = "/users/42".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["source"], "exact");
+
+        // Any other id falls through to the pattern mock
+        let uri = "/users/7".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["source"], "pattern");
+    }
+
+    #[tokio::test]
+    async fn test_path_param_sequence_shared_across_ids() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/items/:id".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/items/:id".to_string(),
+                status: 200,
+                response: json!({"ok": true}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: Some(vec![
+                    SequenceStep {
+                        status: 503,
+                        response: json!({"error": "unavailable"}),
+                        delay_ms: None,
+                        repeat: false,
+                    },
+                    SequenceStep {
+                        status: 200,
+                        response: json!({"ok": true}),
+                        delay_ms: None,
+                        repeat: true,
+                    },
+                ]),
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        // First request for id=1 consumes step 0 (503)
+        let uri = "/items/1".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A request for a *different* id shares the same sequence counter
+        // (keyed by the mock's declared pattern, not the concrete path), so
+        // it now sees step 1 (200), not step 0 again.
+        let uri = "/items/2".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_no_path_param_match_returns_404() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/users/:id".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users/:id".to_string(),
+                status: 200,
+                response: json!({"name": "Mock User"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+        let uri = "/posts/1".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     // =========================================================================
