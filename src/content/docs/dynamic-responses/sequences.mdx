@@ -1,0 +1,104 @@
+---
+title: Stateful Sequences
+description: Return a different response on successive calls with sequence — model retries, rate limiting, and flaky services.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A mock can return **different responses on successive calls** by declaring a `sequence` array. This is the tool for testing retry logic, rate limiting, flaky third-party services, and multi-step flows — all without standing up a real backend.
+
+## Basic shape
+
+```json
+{
+  "method": "POST",
+  "path": "/api/submit",
+  "status": 200,
+  "response": { "ok": true },
+  "sequence": [
+    { "status": 503, "response": { "error": "service unavailable, retry later" } },
+    { "status": 429, "response": { "error": "rate limited" }, "delay_ms": 100 },
+    { "status": 200, "response": { "ok": true }, "repeat": true }
+  ]
+}
+```
+
+Each request to this mock advances to the next step:
+
+```bash
+curl -X POST http://localhost:8080/api/submit   # 503 service unavailable
+curl -X POST http://localhost:8080/api/submit   # 429 rate limited (after 100ms delay)
+curl -X POST http://localhost:8080/api/submit   # 200 ok
+curl -X POST http://localhost:8080/api/submit   # 200 ok (repeats forever)
+```
+
+## Step fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `status` | number | yes | HTTP status code for this step. |
+| `response` | any JSON | yes | Response body for this step. Supports [templating](/dynamic-responses/templating/). |
+| `delay_ms` | number | no | Delay in milliseconds before returning this step's response. Overrides the mock-level `delay_ms` for this step only — see [Response Delays](/dynamic-responses/delays/). |
+| `repeat` | boolean | no | If `true`, the sequence stops advancing here — every subsequent call gets this same step. Default `false`. |
+
+## Semantics
+
+- Steps are consumed **in order**, one per request.
+- A step with `"repeat": true` is returned for **all subsequent calls** — the sequence stops advancing once it reaches that step.
+- If **no** step has `"repeat": true`, the **last step** repeats once the sequence is exhausted (you don't have to add `repeat: true` to the final step explicitly).
+- An **empty** `sequence` array falls back to the mock's top-level `status` / `response`, as if `sequence` weren't set at all.
+- `response_headers`, if set on the mock, applies to every step's response uniformly — see [Custom Response Headers](/dynamic-responses/response-headers/).
+
+## Counters are per-mock and thread-safe
+
+- Counters are tracked independently for each mock, keyed internally by the mock's declared `path` (plus any differentiating [query/header/body matchers](/matching/overview/)) — two mocks sharing the same path but split by, say, a body matcher advance **independently**.
+- Concurrent requests are handled safely; you won't get duplicate or skipped steps under load.
+- Counters **survive hot reload** of mock files, so editing an unrelated mock doesn't reset an in-progress sequence.
+- For a mock using [path parameters](/matching/path-parameters/) (e.g. `/items/:id`), the counter is shared across **every value of the parameter** — `/items/1` and `/items/2` advance the same sequence, not independent ones. If you need independent sequences per id, use separate exact-path mocks instead.
+
+## Resetting sequences
+
+Reset counters via the admin API so a test suite can start from step 0 again:
+
+```bash
+# Reset all sequence counters
+curl -X POST http://localhost:8080/admin/sequences/reset
+
+# Reset only the counter(s) for one path
+curl -X POST "http://localhost:8080/admin/sequences/reset?path=/api/submit"
+```
+
+```json
+{ "reset": 1 }
+```
+
+<Aside type="tip">
+Call the reset endpoint in your test suite's `beforeEach`/`setUp` if tests share a Mimic instance and rely on a sequence starting fresh each time.
+</Aside>
+
+## Worked example: circuit breaker testing
+
+Simulate a service that's down, then degraded, then healthy — and verify your client's retry/backoff logic handles all three:
+
+```json
+{
+  "method": "GET",
+  "path": "/api/health-check",
+  "status": 200,
+  "response": { "status": "ok" },
+  "sequence": [
+    { "status": 500, "response": { "error": "internal error" } },
+    { "status": 500, "response": { "error": "internal error" } },
+    { "status": 200, "response": { "status": "degraded" }, "delay_ms": 2000 },
+    { "status": 200, "response": { "status": "ok" }, "repeat": true }
+  ]
+}
+```
+
+The first two calls fail outright, the third succeeds but slowly (testing a timeout that should *not* fire), and every call after that is a fast, healthy response.
+
+## Common gotchas
+
+- **`repeat` stops advancement, it doesn't loop back to step 0.** There's no built-in way to cycle through the sequence repeatedly — if you need that, reset via the admin endpoint between test runs instead.
+- **An empty `sequence: []` is not the same as omitting it entirely**, but they behave identically — both use the top-level `status`/`response`. Prefer omitting the field if you're not using sequences.
+- **Sequence steps don't have their own matchers.** All the matching (`query_params`, `headers`, `body`) happens at the mock level, before Mimic decides which step to serve.

@@ -1,0 +1,84 @@
+---
+title: Response Delays
+description: Simulate slow or flaky endpoints with delay_ms — a fixed delay or a random range.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Real APIs aren't instant. Add `delay_ms` to any mock to hold the response back before sending it — useful for testing loading states, timeout handling, retries, circuit breakers, and debounce logic.
+
+## Fixed delay
+
+```json
+{
+  "method": "GET",
+  "path": "/slow-endpoint",
+  "status": 200,
+  "delay_ms": 2000,
+  "response": { "data": "finally here" }
+}
+```
+
+Every request to this mock waits 2000ms (2 seconds) before the response is sent.
+
+## Random delay (jitter)
+
+```json
+{
+  "method": "GET",
+  "path": "/flaky-endpoint",
+  "status": 200,
+  "delay_ms": { "min": 100, "max": 3000 },
+  "response": { "data": "..." }
+}
+```
+
+Each request samples a fresh, uniformly random value between `min` and `max` (inclusive). Repeated calls see realistic, varying latency instead of a constant delay — closer to how a real network and backend actually behave.
+
+<Aside type="note">
+If `max` is less than or equal to `min`, Mimic just uses `min` — it won't error, but it also won't produce a range.
+</Aside>
+
+## Semantics
+
+- **No `delay_ms` means zero overhead.** Responses are exactly as fast as before this field existed.
+- The delay is applied **after** matching and request recording, and with no internal locks held — a slow mock never blocks other requests, the admin API, or hot reload from proceeding.
+- The delay applies to the full response, not headers-then-body — the client sees nothing until the whole thing is ready.
+
+## Combining with sequences
+
+`delay_ms` works together with [stateful sequences](/dynamic-responses/sequences/):
+
+- A **sequence step's own `delay_ms`** takes precedence over the mock-level one, for that step only.
+- Steps that don't set their own `delay_ms` inherit the mock-level value.
+
+This lets you model something like "the first two calls fail fast, but the third (successful) call takes realistically longer":
+
+```json
+{
+  "method": "POST",
+  "path": "/api/submit",
+  "status": 200,
+  "response": { "ok": true },
+  "delay_ms": 1500,
+  "sequence": [
+    { "status": 503, "response": { "error": "unavailable" }, "delay_ms": 0 },
+    { "status": 429, "response": { "error": "rate limited" }, "delay_ms": 0 },
+    { "status": 200, "response": { "ok": true }, "repeat": true }
+  ]
+}
+```
+
+The first two steps override the delay down to `0`; the third step (and every call after it, since `repeat: true`) falls back to the mock-level `1500`.
+
+## Use cases
+
+- **Loading states.** Add a couple hundred milliseconds to see your spinners and skeleton screens actually render.
+- **Timeout handling.** Set a delay longer than your client's timeout to verify it fails gracefully.
+- **Debounce and race conditions.** A random range makes out-of-order responses reproducible in a way a fixed delay can't.
+- **Circuit breakers.** Combine with a [sequence](/dynamic-responses/sequences/) of `503`s and increasing delays to simulate a degrading, then recovering, service.
+
+## Common gotchas
+
+- **`delay_ms` is milliseconds, not seconds.** `2000` is 2 seconds.
+- **A very large delay plus a short client timeout will look like a hang, not an error**, until the client's own timeout fires — that's expected and often exactly what you want to test.

@@ -65,10 +65,20 @@ export default defineConfig({
           label: 'Advanced Matching',
           items: [
             { label: 'Overview', slug: 'matching/overview' },
+            { label: 'Path Parameters', slug: 'matching/path-parameters' },
             { label: 'Query Parameters', slug: 'matching/query-params' },
             { label: 'Headers', slug: 'matching/headers' },
             { label: 'Request Body', slug: 'matching/body' },
             { label: 'Match Priority', slug: 'matching/priority' },
+          ],
+        },
+        {
+          label: 'Dynamic Responses',
+          items: [
+            { label: 'Response Templating', slug: 'dynamic-responses/templating' },
+            { label: 'Custom Response Headers', slug: 'dynamic-responses/response-headers' },
+            { label: 'Response Delays', slug: 'dynamic-responses/delays' },
+            { label: 'Stateful Sequences', slug: 'dynamic-responses/sequences' },
           ],
         },
         {

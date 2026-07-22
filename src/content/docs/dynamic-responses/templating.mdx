@@ -1,0 +1,90 @@
+---
+title: Response Templating
+description: Echo query params, headers, path params, and body fields back into a mock's response with {{ }} syntax.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Mock responses don't have to be fully static JSON. Use `{{ }}` double-brace syntax inside any string value in `response` (or a [sequence](/dynamic-responses/sequences/) step's `response`) to echo back data from the incoming request — no custom code required.
+
+This dramatically cuts down on how many mock files you need. Instead of one file per id, username, or header value, one templated mock covers all of them.
+
+## Template sources
+
+| Template | Source |
+|---|---|
+| `{{path.id}}` | A named [path parameter](/matching/path-parameters/) `:id` or `{id}` |
+| `{{query.page}}` | URL query parameter `?page=2` |
+| `{{header.x-request-id}}` | Request header value (case-insensitive) |
+| `{{body.username}}` | Top-level JSON (or form) body field |
+| `{{body.user.email}}` | Nested JSON body field, using dot notation |
+
+## Example
+
+```json
+{
+  "method": "POST",
+  "path": "/users",
+  "status": 201,
+  "response": {
+    "id": 99,
+    "username": "{{body.username}}",
+    "email": "{{body.email}}",
+    "created_by": "{{header.x-actor}}",
+    "self_url": "/users/99"
+  }
+}
+```
+
+```bash
+curl -X POST http://localhost:8080/users \
+  -H "X-Actor: admin" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","email":"alice@example.com"}'
+```
+
+```json
+{
+  "id": 99,
+  "username": "alice",
+  "email": "alice@example.com",
+  "created_by": "admin",
+  "self_url": "/users/99"
+}
+```
+
+## Combined with path parameters
+
+Templating is what makes [path parameters](/matching/path-parameters/) useful for more than routing — the captured value can flow straight into the response:
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id",
+  "status": 200,
+  "response": { "id": "{{path.id}}", "name": "Mock User" }
+}
+```
+
+```bash
+curl http://localhost:8080/users/42
+# { "id": "42", "name": "Mock User" }
+```
+
+## Semantics
+
+- Templates are resolved **after** the mock (or sequence step) is chosen, so the interpolated value never affects matching itself — you can't use a template to influence which mock wins.
+- An unknown source, a missing key, or an explicit JSON `null` all resolve to an **empty string**. Malformed or unresolvable templates never panic and never leak the raw `{{ }}` text into the response.
+- Non-string body values (numbers, booleans, nested objects/arrays) render using their JSON text form — `{{body.age}}` for `{"age": 30}` produces `30` (unquoted), not `"30"`.
+- A response with no `{{ }}` expressions is returned unchanged — there's no templating overhead if you don't use it.
+- Header lookups are case-insensitive: `{{header.X-Request-Id}}` and `{{header.x-request-id}}` are equivalent.
+
+<Aside type="tip">
+Body templates work with both JSON bodies and `application/x-www-form-urlencoded` form bodies (`{{body.field}}` for a top-level form field). Nested dot notation (`{{body.a.b.c}}`) only applies to JSON bodies, since form data has no nesting.
+</Aside>
+
+## Common gotchas
+
+- **`{{path.id}}` requires the mock's `path` to actually capture that parameter.** If your path is `/users/:id` but you reference `{{path.slug}}`, it silently renders as an empty string — there's no error, so double-check the parameter name matches.
+- **Query values are always strings**, same as with [query parameter matching](/matching/query-params/). `{{query.page}}` for `?page=2` renders `"2"`, not `2`.
+- **Templates only work inside `response` string values.** You can't template into `status`, `method`, `path`, or matcher fields.

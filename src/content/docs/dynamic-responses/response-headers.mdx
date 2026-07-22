@@ -1,0 +1,100 @@
+---
+title: Custom Response Headers
+description: Set arbitrary response headers for CORS, redirects, non-JSON content types, and more with response_headers.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+By default every Mimic response is served as `Content-Type: application/json`. Use `response_headers` when you need something else — CORS headers, a `Location` header for a created resource, a non-JSON content type, cache control, rate-limit headers, or an auth challenge.
+
+## Basic shape
+
+```json
+{
+  "method": "GET",
+  "path": "/api/data",
+  "status": 200,
+  "response_headers": {
+    "X-RateLimit-Limit": "100",
+    "X-RateLimit-Remaining": "42"
+  },
+  "response": { "data": "ok" }
+}
+```
+
+`response_headers` is a flat map of header name to header value (both strings). Names are **case-insensitive**.
+
+## CORS
+
+```json
+{
+  "method": "GET",
+  "path": "/api/public",
+  "status": 200,
+  "response_headers": {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+  },
+  "response": { "data": "public" }
+}
+```
+
+## Redirects and created resources
+
+Set a `Location` header alongside a `201 Created` or `3xx` status:
+
+```json
+{
+  "method": "POST",
+  "path": "/orders",
+  "status": 201,
+  "response_headers": {
+    "Location": "/orders/99"
+  },
+  "response": { "id": 99, "status": "created" }
+}
+```
+
+Combine with [templating](/dynamic-responses/templating/) to build the `Location` value from the request itself if needed.
+
+## Non-JSON responses (XML, CSV, plain text)
+
+Set a `Content-Type` that isn't JSON, and put the raw payload as a **string** in `response`:
+
+```json
+{
+  "method": "GET",
+  "path": "/feed.xml",
+  "status": 200,
+  "response_headers": {
+    "Content-Type": "application/xml"
+  },
+  "response": "<?xml version=\"1.0\"?><feed><item>Hello</item></feed>"
+}
+```
+
+Mimic detects that the content type isn't JSON and sends the string as-is, instead of JSON-encoding it (which would otherwise wrap it in quotes and escape every `"`).
+
+## How `response_headers` interacts with `Content-Type`
+
+- If your custom headers already set a `Content-Type` (in any casing), Mimic uses it as-is.
+- If they don't, Mimic adds `Content-Type: application/json` automatically — existing mocks without `response_headers` behave exactly as before.
+- When the effective content type is JSON, `response` is always JSON-encoded (even if it's a string) — you only get the raw-string behavior above when the content type is explicitly non-JSON.
+
+## Applies to every response, including sequence steps
+
+`response_headers` is a **mock-level** setting. If the mock also has a [`sequence`](/dynamic-responses/sequences/), the same headers apply to every step's response — you can't set different headers per step.
+
+## Invalid headers are skipped, not fatal
+
+If a header name or value isn't valid for HTTP (for example, control characters), Mimic logs a warning and skips just that header — the rest of the response still goes out normally. Set `RUST_LOG=warn` or higher to see these in the logs.
+
+<Aside type="tip">
+`response_headers` and [response templating](/dynamic-responses/templating/) work well together: template a `Location` header value or an `X-Request-Id` echo without needing a stateful sequence.
+</Aside>
+
+## Common gotchas
+
+- **Header names are case-insensitive**, same as [header matching](/matching/headers/) — `content-type` and `Content-Type` behave identically.
+- **Values must be strings.** `"X-RateLimit-Limit": 100` (a JSON number) is invalid — use `"100"`.
+- **Setting `Content-Type: application/json` explicitly is a no-op** — that's already the default, so you only need this field when you want something *different*.

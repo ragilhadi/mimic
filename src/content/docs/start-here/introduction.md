@@ -10,7 +10,7 @@ It exists because most "real" backends are too slow, too unreliable, or simply d
 ## What Mimic is good at
 
 - **Frontend development against a missing backend.** Your team hasn't built the API yet, but the UI ticket is sitting on your board. Mock it with Mimic, ship the UI, swap in the real backend later.
-- **Reproducing edge cases.** Forcing a real backend to return a `503` or a specific malformed payload is hard. With Mimic it's one line of JSON.
+- **Reproducing edge cases.** Forcing a real backend to return a `503`, a slow response, or a specific malformed payload is hard. With Mimic it's one line of JSON — see [Response Delays](/dynamic-responses/delays/) and [Stateful Sequences](/dynamic-responses/sequences/).
 - **Third-party API simulation.** Stripe, GitHub, payment gateways — anything you don't want to actually call during tests.
 - **CI pipelines.** Mimic starts in under a second and uses ~1.66 MiB of memory, so it's cheap to spin up alongside your test suite.
 - **Demos and local environments.** Run a credible backend stand-in without provisioning anything.
@@ -52,4 +52,5 @@ That's a complete, working mock. Drop it in your `mocks/` folder, point Mimic at
 
 - New to Mimic? Continue to the [Quick Start](/start-here/quick-start/).
 - Already comfortable with Docker? Skip to [Installation](/start-here/installation/) for all the install options.
+- Want to see the full feature set? See [Advanced Matching](/matching/overview/) and [Dynamic Responses](/dynamic-responses/templating/).
 - Just need a syntax reference? Jump to the [Mock File Schema](/reference/mock-schema/).

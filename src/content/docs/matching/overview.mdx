@@ -7,11 +7,12 @@ import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
 
 By default Mimic matches a mock to a request based on **method** and **path**. That's enough for most cases, but real-world APIs often need finer control. Mimic supports matching on:
 
+- **Path parameters** — one mock (`/users/:id`) covers every value of a URL segment, instead of one mock per id
 - **Query parameters** — different responses based on `?type=admin` vs `?type=user`
 - **Headers** — different responses based on `Authorization` or `Content-Type`
 - **Request body** — different responses based on JSON, text, or form fields
 
-All three can be combined in a single mock, and Mimic uses a [priority scoring system](/matching/priority/) to pick the best match when multiple mocks could apply.
+All of these can be combined in a single mock, and Mimic uses a [priority scoring system](/matching/priority/) to pick the best match when multiple mocks could apply.
 
 ## The big picture
 
@@ -45,6 +46,9 @@ Strict mode is useful for security-style tests (you don't want a request with ex
 ## Where to go from here
 
 <CardGrid>
+  <Card title="Path Parameters" icon="forward-slash">
+    Match `/users/:id` or `/users/{id}` and capture the value. See [Path Parameters](/matching/path-parameters/).
+  </Card>
   <Card title="Query Parameters" icon="seti:json">
     Match on URL query strings with exact values, regex, or "any value." See [Query Parameters](/matching/query-params/).
   </Card>

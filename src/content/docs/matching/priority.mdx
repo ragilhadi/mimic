@@ -11,12 +11,15 @@ When more than one mock could handle an incoming request, Mimic uses a **scoring
 
 | Match component                | Points |
 |--------------------------------|--------|
-| Method + Path match            | 1000   |
+| Exact method + path match      | 1000   |
+| [Path parameter](/matching/path-parameters/) match (`:id`, `{id}`) | 900 |
 | Each matched query parameter   | +100   |
 | Each matched header            | +50    |
 | Request body match             | +500   |
 
-A mock has to match method and path to be considered at all — every candidate starts at 1000. From there, additional matchers add points, so **more specific mocks score higher** and beat less specific ones.
+A mock has to match method and path to be considered at all — an **exact** path starts at 1000, a **parameterized** path (`/users/:id`) starts 100 points lower, at 900. From there, additional matchers add points on top, so **more specific mocks score higher** and beat less specific ones — an exact path with no other matchers (1000) still beats a pattern path with a matched header (900 + 50 = 950).
+
+Exact-path candidates are looked up first (an O(1) hash lookup — no performance cost from having many pattern mocks around), and pattern candidates are only considered as a fallback. See [Path Parameters](/matching/path-parameters/) for the full behavior, including how this interacts with [sequences](/dynamic-responses/sequences/).
 
 ## Example: specific override on top of a fallback
 
@@ -108,6 +111,41 @@ Score: **1000 + 50 = 1050**.
 Score: **1000**.
 
 For a request with both an `Authorization` header and `x-role: admin`, all three mocks match. The admin mock has the highest score (1100) and wins. Drop the `x-role` header and the user mock (1050) wins. Drop the `Authorization` entirely and only the unauthorized mock matches.
+
+## Example: exact path overriding a pattern
+
+`mocks/get_user_by_id.json` (pattern, covers every id):
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id",
+  "status": 200,
+  "response": { "id": "{{path.id}}", "name": "Mock User" }
+}
+```
+
+Score for any matching request: **900**.
+
+`mocks/get_user_42.json` (exact, special-cased):
+
+```json
+{
+  "method": "GET",
+  "path": "/users/42",
+  "status": 200,
+  "response": { "id": 42, "name": "VIP User", "vip": true }
+}
+```
+
+Score for `GET /users/42`: **1000**.
+
+Result:
+
+- `GET /users/42` → both mocks match, but the exact mock (1000) beats the pattern mock (900).
+- `GET /users/7` → only the pattern mock matches (no exact mock for `7`), returns the generic response.
+
+This is the same idea as the pagination example above, just applied to the path itself instead of a query parameter.
 
 ## Tie-breaking
 

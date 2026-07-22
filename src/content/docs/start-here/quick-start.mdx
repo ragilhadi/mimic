@@ -84,4 +84,5 @@ docker stop mimic && docker rm mimic
 
 - Add more mocks: see the [Mock Files](/guides/mock-files/) guide.
 - Use Docker Compose for a tidier workflow: see [Docker Compose deployment](/deployment/docker-compose/).
-- Match on more than just method and path: see [Advanced Matching](/matching/overview/).
+- Match on more than just method and path: see [Advanced Matching](/matching/overview/), including [path parameters](/matching/path-parameters/) like `/users/:id`.
+- Make responses less static: echo request data back with [templating](/dynamic-responses/templating/), or simulate latency and flaky endpoints with [delays](/dynamic-responses/delays/) and [sequences](/dynamic-responses/sequences/).

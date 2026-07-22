@@ -52,6 +52,11 @@ Here is a complete mock with every common field:
 | `query_params` | object  | —       | Match against query string parameters. See [Query Parameters](/matching/query-params/). |
 | `headers`      | object  | —       | Match against request headers. See [Headers](/matching/headers/). |
 | `body`         | object  | —       | Match against the request body. See [Request Body](/matching/body/). |
+| `response_headers` | object | — | Custom response headers (CORS, `Location`, non-JSON content types, …). See [Custom Response Headers](/dynamic-responses/response-headers/). |
+| `delay_ms`     | number or object | — | Simulate latency: a fixed delay or a random range. See [Response Delays](/dynamic-responses/delays/). |
+| `sequence`     | array   | —       | Return a different response on each successive call. See [Stateful Sequences](/dynamic-responses/sequences/). |
+
+The `path` field can also use `:id` / `{id}` segments to match a whole family of URLs with one mock — see [Path Parameters](/matching/path-parameters/) — and any string inside `response` can pull data from the request via `{{ }}` templates — see [Response Templating](/dynamic-responses/templating/).
 
 ## Naming and organizing files
 

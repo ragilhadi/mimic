@@ -32,7 +32,10 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		Edit a mock file and Mimic reflects the change immediately — no restart, no rebuild.
 	</Card>
 	<Card title="Advanced matching" icon="puzzle">
-		Match on query params, headers, and request body content — not just method and path.
+		Match on path parameters, query params, headers, and request body content — not just method and path.
+	</Card>
+	<Card title="Dynamic responses" icon="star">
+		Echo request data back with `{{ }}` templating, simulate latency, return custom headers, or step through a sequence of responses.
 	</Card>
 	<Card title="Docker-first" icon="seti:docker">
 		Prebuilt images on Docker Hub for `amd64` and `arm64`. Mount a folder of mocks and you're done.
@@ -59,7 +62,10 @@ Drop a JSON file in `./mocks/` and Mimic will serve it. That's it.
 		Jump into [Quick Start](/start-here/quick-start/) and have a mock server running in a couple of minutes.
 	</Card>
 	<Card title="Need precise matching?" icon="setting">
-		The [Advanced Matching](/matching/overview/) section covers query params, headers, and body matching.
+		The [Advanced Matching](/matching/overview/) section covers path parameters, query params, headers, and body matching.
+	</Card>
+	<Card title="Want realistic responses?" icon="rocket">
+		[Response Templating](/dynamic-responses/templating/), [delays](/dynamic-responses/delays/), and [sequences](/dynamic-responses/sequences/) make mocks behave like the real thing.
 	</Card>
 	<Card title="Deploying somewhere?" icon="cloud-download">
 		See the [Docker](/deployment/docker/) and [Docker Compose](/deployment/docker-compose/) deployment guides.
