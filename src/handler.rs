@@ -121,6 +121,7 @@ pub async fn handle_request(
             index,
             path_params,
             matched_key: mock_key,
+            ..
         }) => {
             // Named path parameters captured from the mock's pattern (e.g.
             // `/users/:id`), if any, become available to templating below.
