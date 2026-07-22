@@ -969,6 +969,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -1007,6 +1008,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -1040,6 +1042,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: None,
             }],
         );
@@ -1090,6 +1093,7 @@ mod tests {
                 headers: None,
                 body: None,
                 delay_ms: None,
+                response_headers: None,
                 sequence: Some(vec![SequenceStep {
                     status: 200,
                     response: json!({"echoed": "{{body.message}}"}),
