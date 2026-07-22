@@ -518,7 +518,6 @@ fn match_form_body(actual: &HashMap<String, String>, matcher: &FormBodyMatcher) 
 /// `{name}` (OpenAPI-style) segments.
 #[derive(Debug, Clone)]
 pub struct CompiledPathPattern {
-    pub original: String,
     pub regex: Regex,
     pub param_names: Vec<String>,
 }
@@ -560,11 +559,7 @@ pub fn compile_path_pattern(path: &str) -> Option<CompiledPathPattern> {
 
     let pattern = format!("^{}$", regex_parts.join("/"));
     match Regex::new(&pattern) {
-        Ok(regex) => Some(CompiledPathPattern {
-            original: path.to_string(),
-            regex,
-            param_names,
-        }),
+        Ok(regex) => Some(CompiledPathPattern { regex, param_names }),
         Err(e) => {
             warn!("Invalid path parameter pattern '{}': {}", path, e);
             None
