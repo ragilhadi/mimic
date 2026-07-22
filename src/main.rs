@@ -1,6 +1,7 @@
 mod handler;
 mod loader;
 mod matcher;
+mod template;
 mod types;
 
 use axum::{

@@ -1,4 +1,7 @@
-use crate::matcher::{find_matching_mock, parse_headers, parse_query_string, RequestContext};
+use crate::matcher::{
+    find_matching_mock, parse_body, parse_headers, parse_query_string, RequestContext,
+};
+use crate::template::{render_response, TemplateContext};
 use crate::types::{
     create_mock_key, MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
 };
@@ -101,6 +104,7 @@ pub async fn handle_request(
     let context = RequestContext {
         method: method_str.clone(),
         path: path.clone(),
+        path_params: HashMap::new(),
         query_params,
         headers: parsed_headers.clone(),
         body: body_bytes,
@@ -127,6 +131,21 @@ pub async fn handle_request(
             };
 
             info!("Mock matched: {} {} -> {}", method_str, path, status_u16);
+
+            // Interpolate {{path.X}}, {{query.X}}, {{header.X}}, {{body.X}} in the
+            // response using data from the matched request, before it's consumed
+            // by recording below.
+            let parsed_body = context
+                .body
+                .as_ref()
+                .map(|b| parse_body(b, context.content_type.as_deref()));
+            let template_ctx = TemplateContext {
+                path_params: &context.path_params,
+                query_params: &context.query_params,
+                headers: &context.headers,
+                body: parsed_body.as_ref(),
+            };
+            let response = render_response(&response, &template_ctx);
 
             let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
             let matched_key = format!("{}:{}", method_str, path);
@@ -865,6 +884,175 @@ mod tests {
         let body = Body::from(r#"{"query":"Alice"}"#);
         let response = handle_request(Method::POST, uri, headers, State(state), body).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Response Templating Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_template_interpolates_body_query_and_header() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/users".to_string(),
+            vec![MockConfig {
+                method: "POST".to_string(),
+                path: "/users".to_string(),
+                status: 201,
+                response: json!({
+                    "id": 99,
+                    "username": "{{body.username}}",
+                    "email": "{{body.email}}",
+                    "created_by": "{{header.x-actor}}",
+                    "welcomed_on_page": "{{query.page}}"
+                }),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("x-actor", "admin".parse().unwrap());
+        let uri = "/users?page=2".parse().unwrap();
+        let body = Body::from(r#"{"username":"alice","email":"alice@example.com"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["id"], 99);
+        assert_eq!(json["username"], "alice");
+        assert_eq!(json["email"], "alice@example.com");
+        assert_eq!(json["created_by"], "admin");
+        assert_eq!(json["welcomed_on_page"], "2");
+    }
+
+    #[tokio::test]
+    async fn test_template_nested_body_field() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/orders".to_string(),
+            vec![MockConfig {
+                method: "POST".to_string(),
+                path: "/orders".to_string(),
+                status: 200,
+                response: json!({"shipping_city": "{{body.address.city}}"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/orders".parse().unwrap();
+        let body = Body::from(r#"{"address":{"city":"Jakarta"}}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["shipping_city"], "Jakarta");
+    }
+
+    #[tokio::test]
+    async fn test_template_missing_variable_renders_empty_string() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/profile".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/profile".to_string(),
+                status: 200,
+                response: json!({"nickname": "{{query.nickname}}"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let headers = HeaderMap::new();
+        let uri = "/profile".parse().unwrap();
+        let response = handle_request(Method::GET, uri, headers, State(state), Body::empty()).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["nickname"], "");
+    }
+
+    #[tokio::test]
+    async fn test_response_without_templates_is_unaffected() {
+        let state = create_test_state();
+        let uri = "/users".parse().unwrap();
+        let response = handle_request(
+            Method::GET,
+            uri,
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json, json!({"users": [{"id": 1, "name": "Alice"}]}));
+    }
+
+    #[tokio::test]
+    async fn test_template_in_sequence_step_response() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/echo".to_string(),
+            vec![MockConfig {
+                method: "POST".to_string(),
+                path: "/echo".to_string(),
+                status: 200,
+                response: json!({"ok": true}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                sequence: Some(vec![SequenceStep {
+                    status: 200,
+                    response: json!({"echoed": "{{body.message}}"}),
+                    delay_ms: None,
+                    repeat: true,
+                }]),
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let uri = "/echo".parse().unwrap();
+        let body = Body::from(r#"{"message":"hello"}"#);
+        let response = handle_request(Method::POST, uri, headers, State(state), body).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["echoed"], "hello");
     }
 
     // =========================================================================

@@ -18,6 +18,7 @@
 - **Configurable Body Consumption** - Control request body handling per endpoint
 - **File Upload Support** - Handle multipart/form-data with `consume_body` option
 - **Advanced Matching** - Match on query params, headers, and request body
+- **Dynamic Response Templating** - Echo query params, headers, and body fields back into responses with `{{query.x}}` syntax
 
 ---
 
@@ -697,6 +698,62 @@ curl -X POST "http://localhost:8080/admin/sequences/reset?path=/api/submit"
 
 ---
 
+## 🧬 Dynamic Response Templating
+
+Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax inside any string value in `response` (or a sequence step's `response`) to echo back data from the incoming request — no custom code required.
+
+| Template | Source |
+|---|---|
+| `{{query.page}}` | URL query parameter `?page=2` |
+| `{{header.x-request-id}}` | Request header value (case-insensitive) |
+| `{{body.username}}` | Top-level JSON (or form) body field |
+| `{{body.user.email}}` | Nested JSON body field (dot notation) |
+| `{{path.id}}` | Reserved for named path parameters — always empty today; see the Roadmap section below |
+
+### Example
+
+```json
+{
+  "method": "POST",
+  "path": "/users",
+  "status": 201,
+  "response": {
+    "id": 99,
+    "username": "{{body.username}}",
+    "email": "{{body.email}}",
+    "created_by": "{{header.x-actor}}",
+    "self_url": "/users/99"
+  }
+}
+```
+
+```bash
+curl -X POST http://localhost:8080/users \
+  -H "X-Actor: admin" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","email":"alice@example.com"}'
+```
+
+**Response:**
+```json
+{
+  "id": 99,
+  "username": "alice",
+  "email": "alice@example.com",
+  "created_by": "admin",
+  "self_url": "/users/99"
+}
+```
+
+### Semantics
+
+- Templates are resolved after the mock/sequence step is chosen, so the interpolated value never affects matching itself.
+- An unknown source, a missing key, or an explicit JSON `null` all resolve to an empty string — malformed templates never panic and never leak into the response.
+- Non-string body values (numbers, booleans, nested objects/arrays) render using their JSON text form, e.g. `{{body.age}}` for `{"age": 30}` produces `30`.
+- A response with no `{{ }}` expressions is returned unchanged with no templating overhead.
+
+---
+
 ## 🎯 Use Cases
 
 ### 1. **Frontend Development**
@@ -1064,6 +1121,8 @@ Built with:
 - [x] Response delays (mock-level `delay_ms`, fixed or random range, plus per sequence step)
 - [x] Admin UI (request history dashboard)
 - [x] Hot reload for mock files
+- [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`)
+- [ ] Path parameter matching (`:id`) — will unlock `{{path.id}}` templating
 
 ---
 
