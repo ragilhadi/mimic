@@ -1,0 +1,13 @@
+{
+  "method": "POST",
+  "path": "/users",
+  "status": 201,
+  "response": {
+    "id": 99,
+    "username": "{{body.username}}",
+    "email": "{{body.email}}",
+    "created_by": "{{header.x-actor}}",
+    "welcomed_on_page": "{{query.page}}",
+    "self_url": "/users/99"
+  }
+}
