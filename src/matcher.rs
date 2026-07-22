@@ -23,6 +23,10 @@ use tracing::{debug, warn};
 pub struct RequestContext {
     pub method: String,
     pub path: String,
+    /// Named path parameters (e.g. `:id`). Always empty until route-level
+    /// path parameter matching is implemented; reserved so templating
+    /// (`{{path.id}}`) has a source to read from once it lands.
+    pub path_params: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
     pub headers: HashMap<String, String>,
     pub body: Option<Bytes>,
@@ -35,6 +39,7 @@ impl RequestContext {
         Self {
             method,
             path,
+            path_params: HashMap::new(),
             query_params: HashMap::new(),
             headers: HashMap::new(),
             body: None,
@@ -948,6 +953,7 @@ mod tests {
         let make_context = |role: &str| RequestContext {
             method: "POST".to_string(),
             path: "/login".to_string(),
+            path_params: HashMap::new(),
             query_params: HashMap::new(),
             headers: HashMap::new(),
             body: Some(Bytes::from(format!(r#"{{"role":"{}"}}"#, role))),
