@@ -151,6 +151,23 @@ Mimic reads mock definitions from JSON files in the `/app/mocks` directory (or `
   - `true` - Consume request body (required for file uploads, multipart/form-data)
   - `false` - Skip body consumption (faster, default behavior)
 
+### Hot Reload
+
+Mimic rescans the mocks directory every 2 seconds and picks up changes without
+a restart. **Failures are isolated per file**: if one file has invalid JSON —
+an editor mid-save, a teammate's work-in-progress in a shared mocks directory —
+every other file in that cycle still applies. A single typo can no longer block
+unrelated mock changes from taking effect.
+
+The broken file's own route is not dropped, either. It keeps serving its
+last successfully-loaded response until the file parses again, so routes don't
+flap in and out of existence while somebody is editing. Each failure is logged
+with the file name and parse error, plus a summary of how many endpoints were
+applied and how many were carried forward.
+
+Deletions still take effect normally: on a clean cycle (no parse errors) the
+mock set is replaced outright, so removing a file removes its route.
+
 ---
 
 ## 📁 Mock Examples
@@ -1077,6 +1094,22 @@ Mimic supports configurable request body consumption per endpoint via the `consu
 - Mimic responds immediately without reading the request body
 - Optimal for endpoints that don't need the body
 - Best performance and lowest memory usage
+
+The decision is made **per endpoint**, scoped to the mocks registered for the
+request's method and path — a `body` matcher on some unrelated mock elsewhere
+in your mocks directory has no effect on this one.
+
+Mimic reads the body when any mock that could serve the request:
+
+- sets `"consume_body": true`, **or**
+- declares a `body` matcher (it can't match what it hasn't read), **or**
+- interpolates `{{body.…}}` into its `response` or a sequence step's response
+
+...or when **no mock is registered at all** for that method and path, so the
+404 response and the request log can still show what the client sent.
+
+Otherwise the body is left unread — which is exactly what `consume_body: false`
+promises.
 
 ### When to Use consume_body: true
 

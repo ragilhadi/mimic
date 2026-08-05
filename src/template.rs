@@ -36,6 +36,25 @@ pub fn render_response(value: &Value, ctx: &TemplateContext) -> Value {
     render_value(value, ctx)
 }
 
+/// True if any template inside `value` reads from the request body, i.e. uses
+/// a `{{body.…}}` expression.
+///
+/// Used before the body is read to decide whether a mock's response actually
+/// needs it — a response that never mentions `{{body.…}}` doesn't.
+pub fn references_body(value: &Value) -> bool {
+    match value {
+        Value::String(s) => {
+            s.contains("{{")
+                && template_regex()
+                    .captures_iter(s)
+                    .any(|caps| &caps[1] == "body")
+        }
+        Value::Object(map) => map.values().any(references_body),
+        Value::Array(arr) => arr.iter().any(references_body),
+        _ => false,
+    }
+}
+
 fn contains_template(value: &Value) -> bool {
     match value {
         Value::String(s) => s.contains("{{"),

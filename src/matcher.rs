@@ -643,6 +643,72 @@ fn path_specificity(path: &str) -> u32 {
         .count() as u32
 }
 
+/// Decide whether the request body must be read, knowing only the method and
+/// path — this runs *before* the body is consumed, so the eventual matched
+/// mock isn't known yet.
+///
+/// The body is read when either:
+///
+/// - some mock registered for this method+path asks for it, i.e. it declares a
+///   `body` matcher, sets `consume_body: true`, or interpolates `{{body.…}}`
+///   into its response; or
+/// - no mock is registered for this method+path at all, so the request is
+///   heading for a 404 and the body is worth capturing for the request log.
+///
+/// Otherwise the body is left unread, which is what `consume_body: false`
+/// (the default) promises.
+pub fn requires_body(method: &str, path: &str, mocks: &HashMap<String, Vec<MockConfig>>) -> bool {
+    let mut any_candidate = false;
+
+    /// A single mock's own answer to "do I need the request body?"
+    fn mock_needs_body(mock: &MockConfig) -> bool {
+        mock.consume_body
+            || mock.body.is_some()
+            || crate::template::references_body(&mock.response)
+            || mock.sequence.as_deref().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| crate::template::references_body(&step.response))
+            })
+    }
+
+    let base_key = crate::types::create_mock_key(method, path);
+    if let Some(mock_list) = mocks.get(&base_key) {
+        any_candidate = true;
+        if mock_list.iter().any(mock_needs_body) {
+            return true;
+        }
+    }
+
+    // Pattern routes can serve this path too, either as the winner or as the
+    // fallback when the exact key's matchers reject the request.
+    let method_prefix = format!("{}:", method.to_uppercase());
+    for (key, mock_list) in mocks.iter() {
+        if *key == base_key {
+            continue;
+        }
+        let Some(path_part) = key.strip_prefix(method_prefix.as_str()) else {
+            continue;
+        };
+        if !is_pattern_path(path_part) {
+            continue;
+        }
+        let Some(pattern) = compile_path_pattern(path_part) else {
+            continue;
+        };
+        if match_path_pattern(&pattern, path).is_none() {
+            continue;
+        }
+
+        any_candidate = true;
+        if mock_list.iter().any(mock_needs_body) {
+            return true;
+        }
+    }
+
+    !any_candidate
+}
+
 /// Find the best matching mock for a request.
 ///
 /// Exact "METHOD:path" lookups are O(1) and tried first. Parameterized paths

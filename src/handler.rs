@@ -1,5 +1,6 @@
 use crate::matcher::{
-    find_matching_mock, parse_body, parse_headers, parse_query_string, MatchResult, RequestContext,
+    find_matching_mock, parse_body, parse_headers, parse_query_string, requires_body, MatchResult,
+    RequestContext,
 };
 use crate::template::{render_response, TemplateContext};
 use crate::types::{
@@ -93,41 +94,44 @@ pub async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Check if any mock needs body matching (acquire read lock)
-    let needs_body_matching = {
+    // Decide whether to read the body, scoped to the mocks that could actually
+    // serve this method+path — a `body` matcher or `consume_body: true` on some
+    // *other* endpoint is none of this request's business (acquire read lock)
+    let needs_body = {
         let mocks = state.mocks.read().await;
-        mocks.values().flatten().any(|mock| mock.body.is_some())
+        requires_body(&method_str, &path, &mocks)
     };
 
-    // Consume body if needed for matching or if consume_body is set.
-    //
     // The body is wrapped in `Limited` so the stream is cut off — and the
     // request rejected with 413 — as soon as it exceeds the cap, rather than
     // being buffered in full and only then measured.
     let max_body = max_body_size();
-    let body_bytes: Option<Bytes> =
-        if needs_body_matching || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-            match Limited::new(body, max_body).collect().await {
-                Ok(collected) => {
-                    let bytes = collected.to_bytes();
-                    debug!("Consumed {} bytes from request body", bytes.len());
-                    Some(bytes)
-                }
-                Err(e) if is_length_limit(&*e) => {
-                    warn!(
-                        "Rejecting {} {}: request body exceeds the {}-byte limit",
-                        method_str, path, max_body
-                    );
-                    return payload_too_large(&method_str, &path, max_body);
-                }
-                Err(e) => {
-                    debug!("Failed to read body: {}", e);
-                    None
-                }
+    let body_bytes: Option<Bytes> = if needs_body {
+        match Limited::new(body, max_body).collect().await {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                debug!("Consumed {} bytes from request body", bytes.len());
+                Some(bytes)
             }
-        } else {
-            None
-        };
+            Err(e) if is_length_limit(&*e) => {
+                warn!(
+                    "Rejecting {} {}: request body exceeds the {}-byte limit",
+                    method_str, path, max_body
+                );
+                return payload_too_large(&method_str, &path, max_body);
+            }
+            Err(e) => {
+                debug!("Failed to read body: {}", e);
+                None
+            }
+        }
+    } else {
+        debug!(
+            "Skipping request body: no mock for {} {} needs it",
+            method_str, path
+        );
+        None
+    };
 
     // Build request context for matching
     let mut context = RequestContext {
@@ -2394,5 +2398,120 @@ mod tests {
                     self.chunk_size
                 ])))))
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-mock body consumption (#52)
+    // ------------------------------------------------------------------
+
+    fn body_mock(path: &str, consume_body: bool) -> MockConfig {
+        MockConfig {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            status: 202,
+            response: json!({"queued": true}),
+            consume_body,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            sequence: None,
+        }
+    }
+
+    async fn post_and_read_recorded_body(
+        state: &AppState,
+        path: &str,
+        payload: &'static str,
+    ) -> Option<String> {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+
+        let _ = handle_request(
+            Method::POST,
+            path.parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::from(payload),
+        )
+        .await;
+
+        let response = list_requests(State(state.clone()), Query(RequestFilter::default())).await;
+        let requests = response.0["requests"].as_array().unwrap();
+        requests
+            .last()
+            .and_then(|r| r["body"].as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn state_with(mocks: Vec<MockConfig>) -> AppState {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for m in mocks {
+            map.entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+        }
+        AppState::new(Arc::new(tokio::sync::RwLock::new(map)))
+    }
+
+    #[tokio::test]
+    async fn test_consume_body_false_skips_reading_the_body() {
+        let state = state_with(vec![body_mock("/trigger-job", false)]);
+        let recorded = post_and_read_recorded_body(&state, "/trigger-job", "some=body").await;
+        assert_eq!(
+            recorded, None,
+            "consume_body: false must leave the body unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consume_body_true_reads_the_body() {
+        let state = state_with(vec![body_mock("/upload", true)]);
+        let recorded = post_and_read_recorded_body(&state, "/upload", "file=contents").await;
+        assert_eq!(recorded.as_deref(), Some("file=contents"));
+    }
+
+    #[tokio::test]
+    async fn test_body_matcher_implies_consumption_without_consume_body() {
+        let mut mock = body_mock("/match-me", false);
+        mock.body = Some(BodyMatcher::Any);
+        let state = state_with(vec![mock]);
+
+        let recorded = post_and_read_recorded_body(&state, "/match-me", "payload").await;
+        assert_eq!(recorded.as_deref(), Some("payload"));
+    }
+
+    #[tokio::test]
+    async fn test_body_template_implies_consumption_without_consume_body() {
+        let mut mock = body_mock("/echo-body", false);
+        mock.response = json!({"echoed": "{{body.field}}"});
+        let state = state_with(vec![mock]);
+
+        let recorded = post_and_read_recorded_body(&state, "/echo-body", "field=value").await;
+        assert_eq!(recorded.as_deref(), Some("field=value"));
+    }
+
+    #[tokio::test]
+    async fn test_another_mocks_body_matcher_does_not_force_consumption() {
+        // The regression this fixes: `needs_body_matching` used to be global,
+        // so an unrelated mock's body matcher made every request buffer.
+        let mut unrelated = body_mock("/has-matcher", false);
+        unrelated.path = "/has-matcher".to_string();
+        unrelated.body = Some(BodyMatcher::Any);
+
+        let state = state_with(vec![unrelated, body_mock("/trigger-job", false)]);
+
+        let recorded = post_and_read_recorded_body(&state, "/trigger-job", "some=body").await;
+        assert_eq!(recorded, None);
+    }
+
+    #[tokio::test]
+    async fn test_unmatched_request_still_records_its_body() {
+        // No mock covers this path, so the request 404s either way — capture
+        // the body so the request log can show what was actually sent.
+        let state = state_with(vec![body_mock("/trigger-job", false)]);
+        let recorded = post_and_read_recorded_body(&state, "/nowhere", "debug=me").await;
+        assert_eq!(recorded.as_deref(), Some("debug=me"));
     }
 }
