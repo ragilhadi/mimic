@@ -340,7 +340,7 @@ Multiple parameters, and nested resources, work the same way:
 **Semantics:**
 - Captured values are available for [response templating](#-dynamic-response-templating) as `{{path.id}}`.
 - An **exact path always wins over a pattern** when both could match — e.g. if `/users/42` and `/users/:id` are both defined, a request for `/users/42` hits the exact mock and everything else falls through to the pattern.
-- Exact-path lookups stay O(1); patterns are only checked when no exact match exists, so mocks with no path parameters see no performance change.
+- Exact-path lookups stay O(1); the pattern scan only runs when the exact lookup matched nothing, so mocks with no path parameters see no performance change. Each path template is compiled to a regex once per process and reused, never recompiled per request.
 - A [sequence](#-stateful-response-sequences) on a pattern mock advances a single shared counter across every value of the parameter (e.g. `/items/1` and `/items/2` progress the same sequence for `/items/:id`), not one counter per resolved id.
 
 ### Query Parameter Matching

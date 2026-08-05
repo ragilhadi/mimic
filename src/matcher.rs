@@ -5,6 +5,7 @@
 //! - HTTP headers
 //! - Request body (JSON, text, form)
 
+use crate::regex_cache::{cached, compiled_regex, CompileCache};
 use crate::types::{
     BodyMatcher, FormBodyMatcher, HeaderMatcher, HeaderPattern, HeaderValue, JsonBodyMatcher,
     MockConfig, QueryParamMatcher, QueryParamPattern, QueryParamValue, TextBodyMatcher,
@@ -12,6 +13,7 @@ use crate::types::{
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
 // ============================================================================
@@ -121,12 +123,9 @@ fn match_query_param_value(actual: &str, expected: &QueryParamValue) -> bool {
     match expected {
         QueryParamValue::Exact(value) => actual == value,
         QueryParamValue::Pattern(pattern) => match pattern {
-            QueryParamPattern::Regex(regex_str) => match Regex::new(regex_str) {
-                Ok(re) => re.is_match(actual),
-                Err(e) => {
-                    warn!("Invalid regex pattern '{}': {}", regex_str, e);
-                    false
-                }
+            QueryParamPattern::Regex(regex_str) => match compiled_regex(regex_str) {
+                Some(re) => re.is_match(actual),
+                None => false,
             },
             QueryParamPattern::Any => true,
         },
@@ -220,12 +219,9 @@ fn match_header_value(actual: &str, expected: &HeaderValue) -> bool {
     match expected {
         HeaderValue::Exact(value) => actual == value,
         HeaderValue::Pattern(pattern) => match pattern {
-            HeaderPattern::Regex(regex_str) => match Regex::new(regex_str) {
-                Ok(re) => re.is_match(actual),
-                Err(e) => {
-                    warn!("Invalid regex pattern '{}': {}", regex_str, e);
-                    false
-                }
+            HeaderPattern::Regex(regex_str) => match compiled_regex(regex_str) {
+                Some(re) => re.is_match(actual),
+                None => false,
             },
             HeaderPattern::Any => true,
             HeaderPattern::Prefix(prefix) => actual.starts_with(prefix),
@@ -458,17 +454,14 @@ fn match_text_body(actual: &str, matcher: &TextBodyMatcher) -> bool {
 
     // Regex
     if let Some(ref pattern) = matcher.regex {
-        match Regex::new(pattern) {
-            Ok(re) => {
+        match compiled_regex(pattern) {
+            Some(re) => {
                 if !re.is_match(actual) {
                     debug!("Text does not match regex '{}'", pattern);
                     return false;
                 }
             }
-            Err(e) => {
-                warn!("Invalid regex pattern '{}': {}", pattern, e);
-                return false;
-            }
+            None => return false,
         }
     }
 
@@ -530,6 +523,26 @@ pub fn is_pattern_path(path: &str) -> bool {
     })
 }
 
+/// Compile (or reuse) the pattern for `path`.
+///
+/// Path templates come from mock files, so the same handful of strings are
+/// matched against on every request. Compiling them is memoized process-wide:
+/// a given template costs one `Regex::new` for the lifetime of the process,
+/// not one per request. Hot reload swapping the mock map doesn't invalidate
+/// anything — the cache is keyed by the template string itself.
+pub fn compile_path_pattern(path: &str) -> Option<Arc<CompiledPathPattern>> {
+    cached(&PATH_PATTERN_CACHE, path, build_path_pattern)
+}
+
+static PATH_PATTERN_CACHE: CompileCache<CompiledPathPattern> = OnceLock::new();
+
+/// True if `path` has ever been compiled in this process. Test-only probe for
+/// asserting that a request never reached the path-pattern compiler.
+#[cfg(test)]
+pub fn path_pattern_is_cached(path: &str) -> bool {
+    crate::regex_cache::is_cached(&PATH_PATTERN_CACHE, path)
+}
+
 /// Compile a path template into a regex with one (unnamed, positional)
 /// capture group per parameter segment — using positional groups rather
 /// than Rust regex's named-group syntax means parameter names aren't
@@ -537,7 +550,7 @@ pub fn is_pattern_path(path: &str) -> bool {
 ///
 /// Returns `None` if the path has no parameter segments, or the resulting
 /// regex fails to compile.
-pub fn compile_path_pattern(path: &str) -> Option<CompiledPathPattern> {
+fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
     let mut param_names = Vec::new();
     let mut regex_parts = Vec::new();
 
@@ -608,10 +621,11 @@ pub struct MatchResult {
 
 /// Find the best matching mock for a request.
 ///
-/// Exact "METHOD:path" lookups are O(1) and tried first; parameterized
-/// paths (`:id`, `{id}`) are only checked afterward, by scanning mocks
-/// registered under the same method, and always score lower — so an exact
-/// path match wins over a pattern match whenever both are eligible.
+/// Exact "METHOD:path" lookups are O(1) and tried first. Parameterized paths
+/// (`:id`, `{id}`) are only scanned when the exact lookup produced no match at
+/// all, so a mock set with no path parameters — or a request that hits one
+/// exactly — never touches the pattern loop. A pattern match also always
+/// scores below an otherwise-equal exact match.
 pub fn find_matching_mock(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
@@ -641,35 +655,39 @@ pub fn find_matching_mock(
         }
     }
 
-    // Pattern match: scan mocks registered under the same method whose path
-    // uses :name/{name} segments.
-    let method_prefix = format!("{}:", context.method.to_uppercase());
-    for (key, mock_list) in mocks.iter() {
-        if *key == base_key {
-            continue; // already handled as an exact match above
-        }
-        let Some(path_part) = key.strip_prefix(method_prefix.as_str()) else {
-            continue;
-        };
-        if !is_pattern_path(path_part) {
-            continue;
-        }
-        let Some(pattern) = compile_path_pattern(path_part) else {
-            continue;
-        };
-        let Some(params) = match_path_pattern(&pattern, &context.path) else {
-            continue;
-        };
+    // Pattern match: only reached when nothing matched the exact key. Scans
+    // mocks registered under the same method whose path uses :name/{name}
+    // segments; each template's regex is compiled once process-wide, not
+    // once per request.
+    if candidates.is_empty() {
+        let method_prefix = format!("{}:", context.method.to_uppercase());
+        for (key, mock_list) in mocks.iter() {
+            if *key == base_key {
+                continue; // already handled as an exact match above
+            }
+            let Some(path_part) = key.strip_prefix(method_prefix.as_str()) else {
+                continue;
+            };
+            if !is_pattern_path(path_part) {
+                continue;
+            }
+            let Some(pattern) = compile_path_pattern(path_part) else {
+                continue;
+            };
+            let Some(params) = match_path_pattern(&pattern, &context.path) else {
+                continue;
+            };
 
-        for (index, mock) in mock_list.iter().enumerate() {
-            if let Some(score) = calculate_match_score(context, mock) {
-                candidates.push(MatchResult {
-                    mock: mock.clone(),
-                    score: score.saturating_sub(PATTERN_MATCH_PENALTY),
-                    index,
-                    path_params: params.clone(),
-                    matched_key: key.clone(),
-                });
+            for (index, mock) in mock_list.iter().enumerate() {
+                if let Some(score) = calculate_match_score(context, mock) {
+                    candidates.push(MatchResult {
+                        mock: mock.clone(),
+                        score: score.saturating_sub(PATTERN_MATCH_PENALTY),
+                        index,
+                        path_params: params.clone(),
+                        matched_key: key.clone(),
+                    });
+                }
             }
         }
     }
@@ -1299,5 +1317,262 @@ mod tests {
         )]);
 
         assert!(find_matching_mock(&path_param_context("/posts/1"), &mocks).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Compilation caching / pattern short-circuit
+    // ------------------------------------------------------------------
+
+    fn plain_mock(method: &str, path: &str, marker: &str) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: serde_json::json!({"source": marker}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            sequence: None,
+        }
+    }
+
+    fn mock_map(mocks: Vec<MockConfig>) -> HashMap<String, Vec<MockConfig>> {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for mock in mocks {
+            map.entry(crate::types::create_mock_key(&mock.method, &mock.path))
+                .or_default()
+                .push(mock);
+        }
+        map
+    }
+
+    #[test]
+    fn test_path_pattern_compiled_once_across_many_requests() {
+        // A template unique to this test, so the shared process-wide cache
+        // can't have been populated by another test.
+        let template = "/cache-probe-once/:id";
+        assert!(!path_pattern_is_cached(template));
+
+        let mocks = mock_map(vec![plain_mock("GET", template, "pattern")]);
+
+        for i in 0..50 {
+            let mut ctx =
+                RequestContext::new("GET".to_string(), format!("/cache-probe-once/{}", i));
+            ctx.path_params = HashMap::new();
+            let result = find_matching_mock(&ctx, &mocks).expect("pattern should match");
+            assert_eq!(result.mock.response["source"], "pattern");
+        }
+
+        // Compilation is memoized by template string, so the 50 requests above
+        // share the single entry created by the first one.
+        assert!(path_pattern_is_cached(template));
+        let first = compile_path_pattern(template).unwrap();
+        let second = compile_path_pattern(template).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_exact_match_never_compiles_pattern_routes() {
+        let template = "/cache-probe-skip/:id";
+        assert!(!path_pattern_is_cached(template));
+
+        let mocks = mock_map(vec![
+            plain_mock("GET", "/cache-probe-skip/42", "exact"),
+            plain_mock("GET", template, "pattern"),
+        ]);
+
+        let ctx = RequestContext::new("GET".to_string(), "/cache-probe-skip/42".to_string());
+        let result = find_matching_mock(&ctx, &mocks).expect("exact should match");
+
+        assert_eq!(result.mock.response["source"], "exact");
+        assert!(result.path_params.is_empty());
+        // The pattern loop never ran, so its template was never compiled.
+        assert!(
+            !path_pattern_is_cached(template),
+            "exact-match request reached the path-pattern compiler"
+        );
+    }
+
+    #[test]
+    fn test_pattern_still_used_when_exact_key_exists_but_does_not_match() {
+        let template = "/cache-probe-fallthrough/:id";
+        let mut exact = plain_mock("GET", "/cache-probe-fallthrough/42", "exact");
+        exact.query_params = Some(QueryParamMatcher {
+            params: HashMap::from([(
+                "required".to_string(),
+                QueryParamValue::Exact("yes".to_string()),
+            )]),
+            strict: false,
+        });
+
+        let mocks = mock_map(vec![exact, plain_mock("GET", template, "pattern")]);
+
+        // The exact key exists but its query matcher rejects the request, so
+        // the pattern scan must still run.
+        let ctx = RequestContext::new("GET".to_string(), "/cache-probe-fallthrough/42".to_string());
+        let result = find_matching_mock(&ctx, &mocks).expect("pattern should match");
+
+        assert_eq!(result.mock.response["source"], "pattern");
+        assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn test_matcher_regex_is_compiled_once_per_pattern() {
+        let pattern = "^probe-[a-z]+$";
+        let matcher = HeaderMatcher {
+            required: HashMap::from([(
+                "x-probe".to_string(),
+                HeaderValue::Pattern(HeaderPattern::Regex(pattern.to_string())),
+            )]),
+            forbidden: Vec::new(),
+            strict: false,
+        };
+
+        let mut headers = HashMap::new();
+        headers.insert("x-probe".to_string(), "probe-value".to_string());
+
+        for _ in 0..100 {
+            assert!(match_headers(&headers, &matcher));
+        }
+
+        // Every one of those calls resolved to the same compiled handle.
+        let a = crate::regex_cache::compiled_regex(pattern).unwrap();
+        let b = crate::regex_cache::compiled_regex(pattern).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_invalid_matcher_regex_never_matches() {
+        let matcher = HeaderMatcher {
+            required: HashMap::from([(
+                "x-bad".to_string(),
+                HeaderValue::Pattern(HeaderPattern::Regex("([unclosed".to_string())),
+            )]),
+            forbidden: Vec::new(),
+            strict: false,
+        };
+
+        let mut headers = HashMap::new();
+        headers.insert("x-bad".to_string(), "anything".to_string());
+
+        assert!(!match_headers(&headers, &matcher));
+    }
+}
+
+/// Coarse micro-benchmarks backing the numbers in `ADVANCED_MATCHING.md`'s
+/// "Performance Notes". Excluded from the normal suite; reproduce with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod benches {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_regex_matcher() {
+        let pattern = "^[A-Za-z0-9]{32}$";
+        let value = "abcdefghijklmnopqrstuvwxyz012345";
+        let n = 100_000;
+
+        let start = Instant::now();
+        for _ in 0..n {
+            let re = Regex::new(pattern).unwrap();
+            assert!(re.is_match(value));
+        }
+        let uncached = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..n {
+            let re = compiled_regex(pattern).unwrap();
+            assert!(re.is_match(value));
+        }
+        let cached_time = start.elapsed();
+
+        println!(
+            "regex: uncached {:?}/op, cached {:?}/op",
+            uncached / n,
+            cached_time / n
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_path_pattern() {
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for i in 0..20 {
+            let path = format!("/bench{}/:id", i);
+            mocks.insert(
+                format!("GET:{}", path),
+                vec![MockConfig {
+                    method: "GET".to_string(),
+                    path,
+                    status: 200,
+                    response: serde_json::json!({}),
+                    consume_body: false,
+                    query_params: None,
+                    headers: None,
+                    body: None,
+                    delay_ms: None,
+                    response_headers: None,
+                    sequence: None,
+                }],
+            );
+        }
+        mocks.insert(
+            "GET:/bench-exact".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/bench-exact".to_string(),
+                status: 200,
+                response: serde_json::json!({}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let n = 50_000;
+        let ctx = RequestContext::new("GET".to_string(), "/bench-exact".to_string());
+        let start = Instant::now();
+        for _ in 0..n {
+            assert!(find_matching_mock(&ctx, &mocks).is_some());
+        }
+        println!(
+            "exact match with 20 pattern routes loaded: {:?}/op",
+            start.elapsed() / n
+        );
+
+        let ctx = RequestContext::new("GET".to_string(), "/bench19/42".to_string());
+        let start = Instant::now();
+        for _ in 0..n {
+            assert!(find_matching_mock(&ctx, &mocks).is_some());
+        }
+        println!(
+            "pattern match with 20 pattern routes loaded: {:?}/op",
+            start.elapsed() / n
+        );
+
+        // Approximates the old per-request cost: recompiling all 20 templates.
+        let templates: Vec<String> = (0..20).map(|i| format!("/bench{}/:id", i)).collect();
+        let start = Instant::now();
+        for _ in 0..n {
+            for t in &templates {
+                assert!(build_path_pattern(t).is_some());
+            }
+        }
+        println!(
+            "recompiling 20 path templates: {:?}/op",
+            start.elapsed() / n
+        );
     }
 }

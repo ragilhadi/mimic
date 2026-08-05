@@ -459,9 +459,30 @@ This shows what the server received, helping you debug mismatches.
 ## Performance Notes
 
 - Mocks without advanced matchers use fast path (simple lookup)
-- Advanced matching adds minimal overhead (~1-5ms)
 - Body matching requires consuming the request body
 - Use `strict: false` for better matching flexibility
+
+### Regex and path-template compilation
+
+Every regex Mimic derives from a mock file — `query_params` regex, `headers`
+regex, body `text.regex`, and `:id`/`{id}` path templates — is compiled **once
+per distinct pattern string** for the lifetime of the process and reused from
+then on. Hot reload does not invalidate the cache, because it is keyed by the
+pattern string itself. Invalid patterns are reported once, not once per
+request.
+
+Measured on a release build (`cargo test --release -- --ignored --nocapture`,
+see `mod benches` in `src/matcher.rs`); figures are per request:
+
+| Operation | Recompiling each request | Compiled once |
+|---|---|---|
+| One header regex matcher (`^[A-Za-z0-9]{32}$`) | ~46 µs | ~0.16 µs |
+| Exact-path request, 20 path-template routes loaded | ~6.0 ms | ~0.3 µs |
+| Path-parameter request, 20 path-template routes loaded | ~6.0 ms | ~7 µs |
+
+The exact-path row is the largest win and comes from two changes together: the
+pattern scan is skipped entirely when the exact lookup already matched, and
+templates that *are* scanned are no longer recompiled per request.
 
 ---
 

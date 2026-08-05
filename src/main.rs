@@ -1,6 +1,7 @@
 mod handler;
 mod loader;
 mod matcher;
+mod regex_cache;
 mod template;
 mod types;
 
