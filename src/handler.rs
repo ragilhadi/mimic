@@ -1,8 +1,11 @@
 use crate::matcher::{
-    find_matching_mock, parse_body, parse_headers, parse_query_string, MatchResult, RequestContext,
+    find_matching_mock, parse_body, parse_headers, parse_query_string, requires_body, MatchResult,
+    RequestContext,
 };
 use crate::template::{render_response, TemplateContext};
-use crate::types::{MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep};
+use crate::types::{
+    is_sensitive_header, MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
+};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -11,7 +14,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -38,8 +41,34 @@ impl AppState {
     }
 }
 
-/// Maximum body size to consume for matching (10 MB)
-const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+/// Default cap on the request body Mimic will buffer (10 MB).
+const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Environment variable overriding [`DEFAULT_MAX_BODY_SIZE`], in bytes.
+const MAX_BODY_SIZE_ENV: &str = "MIMIC_MAX_BODY_SIZE";
+
+/// The configured maximum request body size, in bytes.
+///
+/// Read once from `MIMIC_MAX_BODY_SIZE` on first use; an unset, unparsable,
+/// or zero value falls back to [`DEFAULT_MAX_BODY_SIZE`]. The limit is
+/// enforced *while* the body streams in (see [`handle_request`]), so a
+/// request larger than this never gets fully buffered.
+pub fn max_body_size() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var(MAX_BODY_SIZE_ENV) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                warn!(
+                    "Invalid {}='{}', falling back to {} bytes",
+                    MAX_BODY_SIZE_ENV, raw, DEFAULT_MAX_BODY_SIZE
+                );
+                DEFAULT_MAX_BODY_SIZE
+            }
+        },
+        Err(_) => DEFAULT_MAX_BODY_SIZE,
+    })
+}
 
 pub async fn handle_request(
     method: Method,
@@ -65,38 +94,44 @@ pub async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Check if any mock needs body matching (acquire read lock)
-    let needs_body_matching = {
+    // Decide whether to read the body, scoped to the mocks that could actually
+    // serve this method+path — a `body` matcher or `consume_body: true` on some
+    // *other* endpoint is none of this request's business (acquire read lock)
+    let needs_body = {
         let mocks = state.mocks.read().await;
-        mocks.values().flatten().any(|mock| mock.body.is_some())
+        requires_body(&method_str, &path, &mocks)
     };
 
-    // Consume body if needed for matching or if consume_body is set
-    let body_bytes: Option<Bytes> =
-        if needs_body_matching || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-            match body.collect().await {
-                Ok(collected) => {
-                    let bytes = collected.to_bytes();
-                    if bytes.len() > MAX_BODY_SIZE {
-                        debug!(
-                            "Body too large: {} bytes (max: {})",
-                            bytes.len(),
-                            MAX_BODY_SIZE
-                        );
-                        None
-                    } else {
-                        debug!("Consumed {} bytes from request body", bytes.len());
-                        Some(bytes)
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to read body: {}", e);
-                    None
-                }
+    // The body is wrapped in `Limited` so the stream is cut off — and the
+    // request rejected with 413 — as soon as it exceeds the cap, rather than
+    // being buffered in full and only then measured.
+    let max_body = max_body_size();
+    let body_bytes: Option<Bytes> = if needs_body {
+        match Limited::new(body, max_body).collect().await {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                debug!("Consumed {} bytes from request body", bytes.len());
+                Some(bytes)
             }
-        } else {
-            None
-        };
+            Err(e) if is_length_limit(&*e) => {
+                warn!(
+                    "Rejecting {} {}: request body exceeds the {}-byte limit",
+                    method_str, path, max_body
+                );
+                return payload_too_large(&method_str, &path, max_body);
+            }
+            Err(e) => {
+                debug!("Failed to read body: {}", e);
+                None
+            }
+        }
+    } else {
+        debug!(
+            "Skipping request body: no mock for {} {} needs it",
+            method_str, path
+        );
+        None
+    };
 
     // Build request context for matching
     let mut context = RequestContext {
@@ -200,6 +235,39 @@ pub async fn handle_request(
     }
 }
 
+/// True if `err`, or anything it wraps, is a body-length-limit error.
+///
+/// The source chain has to be walked rather than downcasting the outermost
+/// error: the limit trips deep inside the body stream and surfaces re-boxed,
+/// so a plain downcast only sees the outer layer — which is how an oversized
+/// chunked body could be mistaken for "no body" and answered 200.
+fn is_length_limit(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if e.is::<LengthLimitError>() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+/// 413 returned when a request body exceeds [`max_body_size`]. Mirrors the
+/// shape of the 404 "mock not found" body so clients can parse either the
+/// same way.
+fn payload_too_large(method: &str, path: &str, max_body: usize) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": "payload too large",
+            "method": method,
+            "path": path,
+            "max_body_size": max_body
+        })),
+    )
+        .into_response()
+}
+
 pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mocks = state.mocks.read().await;
     Json(json!({
@@ -208,9 +276,6 @@ pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Val
         "service": "mimic"
     }))
 }
-
-/// Headers whose values should be redacted in recorded requests
-const SENSITIVE_HEADERS: &[&str] = &["authorization", "cookie", "set-cookie"];
 
 /// Record a request into the request log, redacting sensitive headers
 async fn record_request(
@@ -223,7 +288,7 @@ async fn record_request(
         .headers
         .into_iter()
         .map(|(k, v)| {
-            if SENSITIVE_HEADERS.contains(&k.as_str()) {
+            if is_sensitive_header(&k) {
                 (k, "[REDACTED]".to_string())
             } else {
                 (k, v)
@@ -2225,5 +2290,228 @@ mod tests {
         let (status, headers, _) = call_raw(&state, "/seq").await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(headers.get("retry-after").unwrap(), "60");
+    }
+    #[tokio::test]
+    async fn test_oversized_body_rejected_with_413() {
+        let state = create_test_state();
+        let max = max_body_size();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let response = handle_request(
+            Method::POST,
+            "/echo".parse().unwrap(),
+            headers,
+            State(state),
+            Body::from(vec![b'x'; max + 1]),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "payload too large");
+        assert_eq!(json["max_body_size"], max);
+    }
+
+    #[tokio::test]
+    async fn test_body_at_the_limit_is_still_accepted() {
+        let state = create_test_state();
+        let max = max_body_size();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+
+        let response = handle_request(
+            Method::POST,
+            "/echo".parse().unwrap(),
+            headers,
+            State(state),
+            Body::from(vec![b'x'; max]),
+        )
+        .await;
+
+        // No mock matches /echo, but the body itself was accepted rather than
+        // rejected as oversized.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_streaming_body_is_not_fully_buffered() {
+        let state = create_test_state();
+        let max = max_body_size();
+        let chunk_size = 64 * 1024;
+
+        // A chunked body with no Content-Length that would keep producing far
+        // more than the limit. `Limited` must stop polling it once the cap is
+        // crossed, so `delivered` never approaches the full (10x limit) size.
+        let delivered = Arc::new(AtomicU64::new(0));
+        let body = Body::new(EndlessBody {
+            delivered: delivered.clone(),
+            chunk_size,
+            total: max * 10,
+        });
+
+        let response = handle_request(
+            Method::POST,
+            "/echo".parse().unwrap(),
+            HeaderMap::new(),
+            State(state),
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let read = delivered.load(Ordering::Relaxed) as usize;
+        assert!(
+            read <= max + chunk_size,
+            "read {} bytes for a {}-byte limit; the body was buffered past the cap",
+            read,
+            max
+        );
+    }
+
+    /// A Content-Length-less body that yields `chunk_size` chunks until
+    /// `total` bytes have been handed out, counting everything it emits.
+    struct EndlessBody {
+        delivered: Arc<AtomicU64>,
+        chunk_size: usize,
+        total: usize,
+    }
+
+    impl http_body::Body for EndlessBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            if self.delivered.load(Ordering::Relaxed) as usize >= self.total {
+                return std::task::Poll::Ready(None);
+            }
+            self.delivered
+                .fetch_add(self.chunk_size as u64, Ordering::Relaxed);
+            std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from(vec![
+                    b'x';
+                    self.chunk_size
+                ])))))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-mock body consumption (#52)
+    // ------------------------------------------------------------------
+
+    fn body_mock(path: &str, consume_body: bool) -> MockConfig {
+        MockConfig {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            status: 202,
+            response: json!({"queued": true}),
+            consume_body,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            sequence: None,
+        }
+    }
+
+    async fn post_and_read_recorded_body(
+        state: &AppState,
+        path: &str,
+        payload: &'static str,
+    ) -> Option<String> {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+
+        let _ = handle_request(
+            Method::POST,
+            path.parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::from(payload),
+        )
+        .await;
+
+        let response = list_requests(State(state.clone()), Query(RequestFilter::default())).await;
+        let requests = response.0["requests"].as_array().unwrap();
+        requests
+            .last()
+            .and_then(|r| r["body"].as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn state_with(mocks: Vec<MockConfig>) -> AppState {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for m in mocks {
+            map.entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+        }
+        AppState::new(Arc::new(tokio::sync::RwLock::new(map)))
+    }
+
+    #[tokio::test]
+    async fn test_consume_body_false_skips_reading_the_body() {
+        let state = state_with(vec![body_mock("/trigger-job", false)]);
+        let recorded = post_and_read_recorded_body(&state, "/trigger-job", "some=body").await;
+        assert_eq!(
+            recorded, None,
+            "consume_body: false must leave the body unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consume_body_true_reads_the_body() {
+        let state = state_with(vec![body_mock("/upload", true)]);
+        let recorded = post_and_read_recorded_body(&state, "/upload", "file=contents").await;
+        assert_eq!(recorded.as_deref(), Some("file=contents"));
+    }
+
+    #[tokio::test]
+    async fn test_body_matcher_implies_consumption_without_consume_body() {
+        let mut mock = body_mock("/match-me", false);
+        mock.body = Some(BodyMatcher::Any);
+        let state = state_with(vec![mock]);
+
+        let recorded = post_and_read_recorded_body(&state, "/match-me", "payload").await;
+        assert_eq!(recorded.as_deref(), Some("payload"));
+    }
+
+    #[tokio::test]
+    async fn test_body_template_implies_consumption_without_consume_body() {
+        let mut mock = body_mock("/echo-body", false);
+        mock.response = json!({"echoed": "{{body.field}}"});
+        let state = state_with(vec![mock]);
+
+        let recorded = post_and_read_recorded_body(&state, "/echo-body", "field=value").await;
+        assert_eq!(recorded.as_deref(), Some("field=value"));
+    }
+
+    #[tokio::test]
+    async fn test_another_mocks_body_matcher_does_not_force_consumption() {
+        // The regression this fixes: `needs_body_matching` used to be global,
+        // so an unrelated mock's body matcher made every request buffer.
+        let mut unrelated = body_mock("/has-matcher", false);
+        unrelated.path = "/has-matcher".to_string();
+        unrelated.body = Some(BodyMatcher::Any);
+
+        let state = state_with(vec![unrelated, body_mock("/trigger-job", false)]);
+
+        let recorded = post_and_read_recorded_body(&state, "/trigger-job", "some=body").await;
+        assert_eq!(recorded, None);
+    }
+
+    #[tokio::test]
+    async fn test_unmatched_request_still_records_its_body() {
+        // No mock covers this path, so the request 404s either way — capture
+        // the body so the request log can show what was actually sent.
+        let state = state_with(vec![body_mock("/trigger-job", false)]);
+        let recorded = post_and_read_recorded_body(&state, "/nowhere", "debug=me").await;
+        assert_eq!(recorded.as_deref(), Some("debug=me"));
     }
 }

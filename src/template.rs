@@ -3,10 +3,12 @@
 //! query params, headers, and the request body).
 
 use crate::matcher::ParsedBody;
+use crate::types::is_sensitive_header;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use tracing::debug;
 
 /// Data available to templates, sourced from the matched request.
 pub struct TemplateContext<'a> {
@@ -32,6 +34,25 @@ pub fn render_response(value: &Value, ctx: &TemplateContext) -> Value {
         return value.clone();
     }
     render_value(value, ctx)
+}
+
+/// True if any template inside `value` reads from the request body, i.e. uses
+/// a `{{body.…}}` expression.
+///
+/// Used before the body is read to decide whether a mock's response actually
+/// needs it — a response that never mentions `{{body.…}}` doesn't.
+pub fn references_body(value: &Value) -> bool {
+    match value {
+        Value::String(s) => {
+            s.contains("{{")
+                && template_regex()
+                    .captures_iter(s)
+                    .any(|caps| &caps[1] == "body")
+        }
+        Value::Object(map) => map.values().any(references_body),
+        Value::Array(arr) => arr.iter().any(references_body),
+        _ => false,
+    }
 }
 
 fn contains_template(value: &Value) -> bool {
@@ -72,7 +93,19 @@ fn resolve(source: &str, key: &str, ctx: &TemplateContext) -> Option<String> {
     match source {
         "path" => ctx.path_params.get(key).cloned(),
         "query" => ctx.query_params.get(key).cloned(),
-        "header" => ctx.headers.get(&key.to_lowercase()).cloned(),
+        // Credential-bearing headers are never interpolated: echoing a live
+        // bearer token or session cookie back into a response body would put
+        // it in devtools, HAR exports and CI logs. They resolve like a
+        // missing key does — to an empty string.
+        "header" => {
+            let name = key.to_lowercase();
+            if is_sensitive_header(&name) {
+                debug!("Refusing to interpolate sensitive header '{}'", name);
+                None
+            } else {
+                ctx.headers.get(&name).cloned()
+            }
+        }
         "body" => resolve_body(ctx.body, key),
         _ => None,
     }
@@ -293,5 +326,51 @@ mod tests {
 
         let value = json!({"x": "{{cookie.session}}"});
         assert_eq!(render_response(&value, &c), json!({"x": ""}));
+    }
+
+    #[test]
+    fn test_sensitive_headers_are_never_interpolated() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "Bearer sk_live_secret".to_string(),
+        );
+        headers.insert("cookie".to_string(), "session=abc123".to_string());
+        headers.insert("set-cookie".to_string(), "session=abc123".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &headers, None);
+
+        let value = json!({
+            "auth": "{{header.authorization}}",
+            "cookie": "{{header.cookie}}",
+            "set_cookie": "{{header.set-cookie}}"
+        });
+        assert_eq!(
+            render_response(&value, &c),
+            json!({"auth": "", "cookie": "", "set_cookie": ""})
+        );
+    }
+
+    #[test]
+    fn test_sensitive_header_redaction_is_case_insensitive() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer secret".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &headers, None);
+
+        let value = json!({"a": "{{header.Authorization}}", "b": "{{header.AUTHORIZATION}}"});
+        assert_eq!(render_response(&value, &c), json!({"a": "", "b": ""}));
+    }
+
+    #[test]
+    fn test_non_sensitive_headers_still_interpolate() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer secret".to_string());
+        headers.insert("x-tenant".to_string(), "acme".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &headers, None);
+
+        let value = json!({"tenant": "{{header.x-tenant}}"});
+        assert_eq!(render_response(&value, &c), json!({"tenant": "acme"}));
     }
 }

@@ -1,8 +1,27 @@
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+// ============================================================================
+// Sensitive Header Handling
+// ============================================================================
+
+/// Headers whose values must never leave the process — neither stored in the
+/// request log nor interpolated into a mock response by templating.
+///
+/// Defined here (rather than in one consumer) so `handler.rs` and
+/// `template.rs` can't drift apart on what counts as a secret.
+pub const SENSITIVE_HEADERS: &[&str] = &["authorization", "cookie", "set-cookie"];
+
+/// True if `name` names a header carrying credentials. Case-insensitive, so
+/// it works on both already-normalized and raw header names.
+pub fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADERS
+        .iter()
+        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+}
 
 // ============================================================================
 // Query Parameter Matching Types

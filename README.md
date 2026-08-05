@@ -107,6 +107,9 @@ PORT=8080
 
 # Logging level: trace, debug, info, warn, error (default: info)
 RUST_LOG=info
+
+# Maximum request body Mimic will buffer, in bytes (default: 10485760 = 10 MB)
+MIMIC_MAX_BODY_SIZE=10485760
 ```
 
 **Log Levels**:
@@ -147,6 +150,23 @@ Mimic reads mock definitions from JSON files in the `/app/mocks` directory (or `
 - `consume_body` - (Optional) Boolean to control request body consumption (default: `false`)
   - `true` - Consume request body (required for file uploads, multipart/form-data)
   - `false` - Skip body consumption (faster, default behavior)
+
+### Hot Reload
+
+Mimic rescans the mocks directory every 2 seconds and picks up changes without
+a restart. **Failures are isolated per file**: if one file has invalid JSON —
+an editor mid-save, a teammate's work-in-progress in a shared mocks directory —
+every other file in that cycle still applies. A single typo can no longer block
+unrelated mock changes from taking effect.
+
+The broken file's own route is not dropped, either. It keeps serving its
+last successfully-loaded response until the file parses again, so routes don't
+flap in and out of existence while somebody is editing. Each failure is logged
+with the file name and parse error, plus a summary of how many endpoints were
+applied and how many were carried forward.
+
+Deletions still take effect normally: on a clean cycle (no parse errors) the
+mock set is replaced outright, so removing a file removes its route.
 
 ---
 
@@ -337,7 +357,7 @@ Multiple parameters, and nested resources, work the same way:
 **Semantics:**
 - Captured values are available for [response templating](#-dynamic-response-templating) as `{{path.id}}`.
 - An **exact path always wins over a pattern** when both could match — e.g. if `/users/42` and `/users/:id` are both defined, a request for `/users/42` hits the exact mock and everything else falls through to the pattern.
-- Exact-path lookups stay O(1); patterns are only checked when no exact match exists, so mocks with no path parameters see no performance change.
+- Exact-path lookups stay O(1); the pattern scan only runs when the exact lookup matched nothing, so mocks with no path parameters see no performance change. Each path template is compiled to a regex once per process and reused, never recompiled per request.
 - A [sequence](#-stateful-response-sequences) on a pattern mock advances a single shared counter across every value of the parameter (e.g. `/items/1` and `/items/2` progress the same sequence for `/items/:id`), not one counter per resolved id.
 
 ### Query Parameter Matching
@@ -632,8 +652,19 @@ When multiple mocks could match a request, Mimic uses a scoring system:
 - **Query params**: +100 points per matched param
 - **Headers**: +50 points per matched header
 - **Body**: +500 points if body matches
+- **Path pattern penalty**: -100 points for a `:id`/`{id}` match, so an exact path always outranks a pattern
 
-The mock with the **highest score** wins.
+The mock with the **highest score** wins. Equal scores are broken
+deterministically — most literal path segments first (`/users/:id` beats
+`/{resource}/:id`), then lowest `METHOD:path` key lexicographically, then
+earliest position among mocks sharing that key. The winner never depends on
+load order, so it stays the same across restarts and hot reloads. See
+[ADVANCED_MATCHING.md](ADVANCED_MATCHING.md#match-priority) for details.
+
+**Strict header mode** (`"strict": true`) ignores headers every HTTP client
+sends by default — `accept`, `accept-encoding`, `connection`, `content-length`,
+`host`, `user-agent` — so a plain `curl` request isn't rejected for headers you
+never asked about.
 
 ---
 
@@ -811,6 +842,13 @@ Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax in
 | `{{body.username}}` | Top-level JSON (or form) body field |
 | `{{body.user.email}}` | Nested JSON body field (dot notation) |
 | `{{path.id}}` | Named [path parameter](#path-parameters) `:id` or `{id}` |
+
+> **Credential headers are never echoed.** `{{header.authorization}}`,
+> `{{header.cookie}}` and `{{header.set-cookie}}` always render as an empty
+> string — the same as a missing key — regardless of letter case. This matches
+> the redaction already applied to the `/admin/requests` log, so a mock file
+> can't reflect a live bearer token or session cookie into a response body
+> (and from there into browser devtools, HAR exports, or CI logs).
 
 ### Example
 
@@ -1057,6 +1095,22 @@ Mimic supports configurable request body consumption per endpoint via the `consu
 - Optimal for endpoints that don't need the body
 - Best performance and lowest memory usage
 
+The decision is made **per endpoint**, scoped to the mocks registered for the
+request's method and path — a `body` matcher on some unrelated mock elsewhere
+in your mocks directory has no effect on this one.
+
+Mimic reads the body when any mock that could serve the request:
+
+- sets `"consume_body": true`, **or**
+- declares a `body` matcher (it can't match what it hasn't read), **or**
+- interpolates `{{body.…}}` into its `response` or a sequence step's response
+
+...or when **no mock is registered at all** for that method and path, so the
+404 response and the request log can still show what the client sent.
+
+Otherwise the body is left unread — which is exactly what `consume_body: false`
+promises.
+
 ### When to Use consume_body: true
 
 Set `consume_body: true` for endpoints that handle:
@@ -1105,6 +1159,34 @@ curl -X POST http://localhost:8080/ocr-image \
 curl -X POST http://localhost:8080/trigger-job
 ```
 
+### Maximum Body Size
+
+Request bodies are capped at **10 MB** by default. The cap is enforced *while
+the body streams in*, so an oversized request is turned away before Mimic
+allocates memory for it — a client cannot drive the server's memory use past
+the limit no matter how much it sends.
+
+Over-limit requests get a `413 Payload Too Large`:
+
+```json
+{
+  "error": "payload too large",
+  "method": "POST",
+  "path": "/upload",
+  "max_body_size": 10485760
+}
+```
+
+Raise or lower the cap with the `MIMIC_MAX_BODY_SIZE` environment variable
+(in bytes):
+
+```bash
+MIMIC_MAX_BODY_SIZE=52428800 mimic   # 50 MB
+```
+
+An unset, unparsable, or zero value falls back to the 10 MB default. The
+active limit is printed at startup.
+
 ---
 
 ## 📖 API Reference
@@ -1150,12 +1232,34 @@ All other endpoints are defined by your mock files. Mimic will:
 2. Return the configured status code
 3. Return the configured response body
 
-**If no mock matches:**
+**If no mock matches** — `404 Not Found`. The body echoes what the server
+actually received, so you can see why nothing matched:
+
 ```json
 {
   "error": "mock not found",
   "method": "GET",
-  "path": "/undefined"
+  "path": "/undefined",
+  "query_params": {},
+  "headers_received": ["host", "user-agent", "accept"]
+}
+```
+
+`query_params` is the parsed query string and `headers_received` lists the
+header names the request arrived with (names only — values are never echoed).
+Both fields are always present. See
+[ADVANCED_MATCHING.md](ADVANCED_MATCHING.md#debugging) for using this to debug
+a mismatch.
+
+**If the request body exceeds the size limit** — `413 Payload Too Large`. See
+[Maximum Body Size](#maximum-body-size):
+
+```json
+{
+  "error": "payload too large",
+  "method": "POST",
+  "path": "/upload",
+  "max_body_size": 10485760
 }
 ```
 
