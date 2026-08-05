@@ -1,0 +1,13 @@
+{
+  "method": "GET",
+  "path": "/faker/user",
+  "status": 200,
+  "response": {
+    "id": "{{faker.uuid}}",
+    "name": "{{faker.name}}",
+    "email": "{{faker.email}}",
+    "age": "{{faker.int min=18 max=99}}",
+    "verified": "{{faker.bool}}",
+    "created_at": "{{faker.timestamp}}"
+  }
+}
