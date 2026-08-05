@@ -1232,12 +1232,34 @@ All other endpoints are defined by your mock files. Mimic will:
 2. Return the configured status code
 3. Return the configured response body
 
-**If no mock matches:**
+**If no mock matches** — `404 Not Found`. The body echoes what the server
+actually received, so you can see why nothing matched:
+
 ```json
 {
   "error": "mock not found",
   "method": "GET",
-  "path": "/undefined"
+  "path": "/undefined",
+  "query_params": {},
+  "headers_received": ["host", "user-agent", "accept"]
+}
+```
+
+`query_params` is the parsed query string and `headers_received` lists the
+header names the request arrived with (names only — values are never echoed).
+Both fields are always present. See
+[ADVANCED_MATCHING.md](ADVANCED_MATCHING.md#debugging) for using this to debug
+a mismatch.
+
+**If the request body exceeds the size limit** — `413 Payload Too Large`. See
+[Maximum Body Size](#maximum-body-size):
+
+```json
+{
+  "error": "payload too large",
+  "method": "POST",
+  "path": "/upload",
+  "max_body_size": 10485760
 }
 ```
 
