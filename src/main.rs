@@ -1,3 +1,4 @@
+mod faker;
 mod handler;
 mod loader;
 mod matcher;

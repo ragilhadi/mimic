@@ -1,6 +1,7 @@
 //! Response templating: interpolate `{{source.key}}` expressions inside a mock's
 //! `response` JSON using data pulled from the incoming request (path params,
-//! query params, headers, and the request body).
+//! query params, headers, and the request body), plus the request-independent
+//! `{{faker.*}}` generators in [`crate::faker`].
 
 use crate::matcher::ParsedBody;
 use crate::types::is_sensitive_header;
@@ -107,6 +108,9 @@ fn resolve(source: &str, key: &str, ctx: &TemplateContext) -> Option<String> {
             }
         }
         "body" => resolve_body(ctx.body, key),
+        // Request-independent generators: `{{faker.uuid}}`, `{{faker.int min=1 max=9}}`, …
+        // Each occurrence is resolved on its own, so repeated expressions vary.
+        "faker" => crate::faker::resolve(key),
         _ => None,
     }
 }
@@ -360,6 +364,102 @@ mod tests {
 
         let value = json!({"a": "{{header.Authorization}}", "b": "{{header.AUTHORIZATION}}"});
         assert_eq!(render_response(&value, &c), json!({"a": "", "b": ""}));
+    }
+
+    #[test]
+    fn test_faker_uuid_and_bool_render_plausible_values() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"id": "{{faker.uuid}}", "verified": "{{faker.bool}}"});
+        let rendered = render_response(&value, &c);
+
+        let id = rendered["id"].as_str().unwrap();
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.matches('-').count(), 4);
+        assert!(matches!(
+            rendered["verified"].as_str().unwrap(),
+            "true" | "false"
+        ));
+    }
+
+    #[test]
+    fn test_faker_int_honours_min_and_max_args() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"score": "{{faker.int min=1 max=100}}"});
+        for _ in 0..50 {
+            let rendered = render_response(&value, &c);
+            let score: i64 = rendered["score"].as_str().unwrap().parse().unwrap();
+            assert!((1..=100).contains(&score), "{} out of range", score);
+        }
+    }
+
+    #[test]
+    fn test_faker_name_email_and_timestamp() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({
+            "name": "{{faker.name}}",
+            "email": "{{faker.email}}",
+            "created_at": "{{faker.timestamp}}"
+        });
+        let rendered = render_response(&value, &c);
+
+        assert!(rendered["name"].as_str().unwrap().contains(' '));
+        assert!(rendered["email"]
+            .as_str()
+            .unwrap()
+            .ends_with("@example.com"));
+        chrono::DateTime::parse_from_rfc3339(rendered["created_at"].as_str().unwrap())
+            .expect("timestamp is RFC 3339");
+    }
+
+    #[test]
+    fn test_two_faker_occurrences_resolve_independently() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"a": "{{faker.uuid}}", "b": "{{faker.uuid}}"});
+        let rendered = render_response(&value, &c);
+        assert_ne!(rendered["a"], rendered["b"]);
+
+        // …including two occurrences inside the same string.
+        let value = json!({"pair": "{{faker.uuid}} {{faker.uuid}}"});
+        let rendered = render_response(&value, &c);
+        let pair = rendered["pair"].as_str().unwrap();
+        let (first, second) = pair.split_once(' ').unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_faker_malformed_args_fall_back_to_default_range() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"n": "{{faker.int min=abc max=}}"});
+        let rendered = render_response(&value, &c);
+        let n: i64 = rendered["n"].as_str().unwrap().parse().unwrap();
+        assert!((0..=1_000_000).contains(&n));
+    }
+
+    #[test]
+    fn test_unknown_faker_generator_becomes_empty_string() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"x": "{{faker.credit_card}}"});
+        assert_eq!(render_response(&value, &c), json!({"x": ""}));
+    }
+
+    #[test]
+    fn test_faker_templates_do_not_imply_body_consumption() {
+        // `references_body` decides whether the request body must be buffered;
+        // faker needs nothing from the request.
+        let value = json!({"id": "{{faker.uuid}}", "name": "{{faker.name}}"});
+        assert!(!references_body(&value));
     }
 
     #[test]

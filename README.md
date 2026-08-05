@@ -20,6 +20,7 @@
 - **Advanced Matching** - Match on path parameters, query params, headers, and request body
 - **Path Parameters** - `/users/:id` and `/users/{id}` syntax, one mock covers every value
 - **Dynamic Response Templating** - Echo path, query, header, and body fields back into responses with `{{path.x}}` syntax
+- **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
 
 ---
 
@@ -842,6 +843,7 @@ Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax in
 | `{{body.username}}` | Top-level JSON (or form) body field |
 | `{{body.user.email}}` | Nested JSON body field (dot notation) |
 | `{{path.id}}` | Named [path parameter](#path-parameters) `:id` or `{id}` |
+| `{{faker.uuid}}` | [Random generated data](#faker-generators) — no request input needed |
 
 > **Credential headers are never echoed.** `{{header.authorization}}`,
 > `{{header.cookie}}` and `{{header.set-cookie}}` always render as an empty
@@ -885,9 +887,62 @@ curl -X POST http://localhost:8080/users \
 }
 ```
 
+### Faker Generators
+
+The `faker` source doesn't read the request at all — it generates a fresh, plausible-looking value on every call, so one mock file can stand in for a whole fixture set.
+
+| Template | Output |
+|---|---|
+| `{{faker.uuid}}` | RFC 4122 v4 UUID, e.g. `3fa85f64-5717-4562-b3fc-2c963f66afa6` |
+| `{{faker.int}}` | Random integer in the default range `0..=1000000` |
+| `{{faker.int min=1 max=100}}` | Random integer in `[1, 100]` |
+| `{{faker.bool}}` | `true` or `false` |
+| `{{faker.name}}` | Random name, e.g. `Priya Novak` |
+| `{{faker.email}}` | Slugified random name at `example.com`, e.g. `priya.novak@example.com` |
+| `{{faker.timestamp}}` | Current UTC time in RFC 3339, e.g. `2026-07-22T16:12:54.481+00:00` |
+
+```json
+{
+  "method": "GET",
+  "path": "/faker/user",
+  "status": 200,
+  "response": {
+    "id": "{{faker.uuid}}",
+    "name": "{{faker.name}}",
+    "email": "{{faker.email}}",
+    "age": "{{faker.int min=18 max=99}}",
+    "verified": "{{faker.bool}}",
+    "created_at": "{{faker.timestamp}}"
+  }
+}
+```
+
+```bash
+curl http://localhost:8080/faker/user
+```
+
+**Response** (a different one every call):
+```json
+{
+  "id": "9c0f1b6d-2f4e-4a1e-b0a2-6c1d7f3e88a4",
+  "name": "Priya Novak",
+  "email": "priya.novak@example.com",
+  "age": "37",
+  "verified": "true",
+  "created_at": "2026-07-22T16:12:54.481+00:00"
+}
+```
+
+Notes:
+
+- Every occurrence resolves independently — two `{{faker.uuid}}` in one response produce two *different* UUIDs, and `{{faker.email}}` is not derived from a `{{faker.name}}` sitting next to it.
+- Faker values are always rendered as JSON strings, since templates are interpolated into string values.
+- Malformed arguments degrade to the generator's defaults instead of failing: `{{faker.int min=abc}}` and `{{faker.int min=100 max=1}}` both use the default `0..=1000000` range.
+- An unknown generator (e.g. `{{faker.credit_card}}`) renders as an empty string, like any other unknown template.
+
 ### Semantics
 
-- Templates are resolved after the mock/sequence step is chosen, so the interpolated value never affects matching itself.
+- Templates are resolved after the mock/sequence step is chosen, so the interpolated value never affects matching itself — `{{faker.*}}` included, so a faker expression sitting in a matcher is treated as a literal string.
 - An unknown source, a missing key, or an explicit JSON `null` all resolve to an empty string — malformed templates never panic and never leak into the response.
 - Non-string body values (numbers, booleans, nested objects/arrays) render using their JSON text form, e.g. `{{body.age}}` for `{"age": 30}` produces `30`.
 - A response with no `{{ }}` expressions is returned unchanged with no templating overhead.
@@ -1330,6 +1385,7 @@ Built with:
 - [x] Hot reload for mock files
 - [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`, `{{path.x}}`)
 - [x] Path parameter matching (`:id`, `{id}` syntax)
+- [x] Faker-style random data generators (`{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int}}`, …)
 
 ---
 

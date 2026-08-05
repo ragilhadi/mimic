@@ -1192,6 +1192,161 @@ mod tests {
         assert_eq!(json["echoed"], "hello");
     }
 
+    #[tokio::test]
+    async fn test_faker_templates_render_fresh_values_per_call() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/users/random".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users/random".to_string(),
+                status: 200,
+                response: json!({
+                    "id": "{{faker.uuid}}",
+                    "name": "{{faker.name}}",
+                    "age": "{{faker.int min=18 max=99}}",
+                    "verified": "{{faker.bool}}"
+                }),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let response = handle_request(
+                Method::GET,
+                "/users/random".parse().unwrap(),
+                HeaderMap::new(),
+                State(state.clone()),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            let age: i64 = json["age"].as_str().unwrap().parse().unwrap();
+            assert!((18..=99).contains(&age), "{} out of range", age);
+            assert!(matches!(
+                json["verified"].as_str().unwrap(),
+                "true" | "false"
+            ));
+            assert!(json["name"].as_str().unwrap().contains(' '));
+            ids.push(json["id"].as_str().unwrap().to_string());
+        }
+
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "uuid repeated across calls");
+    }
+
+    #[tokio::test]
+    async fn test_faker_template_in_sequence_step_response() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/jobs".to_string(),
+            vec![MockConfig {
+                method: "POST".to_string(),
+                path: "/jobs".to_string(),
+                status: 200,
+                response: json!({"ok": true}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: Some(vec![SequenceStep {
+                    status: 202,
+                    response: json!({"job_id": "{{faker.uuid}}"}),
+                    delay_ms: None,
+                    repeat: true,
+                }]),
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let response = handle_request(
+            Method::POST,
+            "/jobs".parse().unwrap(),
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["job_id"].as_str().unwrap().len(), 36);
+    }
+
+    #[tokio::test]
+    async fn test_faker_is_never_used_for_matching() {
+        // Templating fires only after a mock is selected, so a `{{faker.…}}`
+        // expression sitting in a matcher stays a literal string to match on.
+        let mut params = HashMap::new();
+        params.insert(
+            "token".to_string(),
+            QueryParamValue::Exact("{{faker.uuid}}".to_string()),
+        );
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/guarded".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/guarded".to_string(),
+                status: 200,
+                response: json!({"ok": true}),
+                consume_body: false,
+                query_params: Some(QueryParamMatcher {
+                    params,
+                    strict: false,
+                }),
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                sequence: None,
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        // A real UUID does not satisfy the literal matcher.
+        let response = handle_request(
+            Method::GET,
+            "/guarded?token=3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                .parse()
+                .unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The literal value does.
+        let response = handle_request(
+            Method::GET,
+            "/guarded?token=%7B%7Bfaker.uuid%7D%7D".parse().unwrap(),
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     // =========================================================================
     // Path Parameter Tests
     // =========================================================================
