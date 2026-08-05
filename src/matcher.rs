@@ -151,6 +151,22 @@ pub fn parse_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String>
     parsed
 }
 
+/// Headers that `strict: true` never counts as "extra".
+///
+/// These are sent unconditionally by mainstream HTTP clients (curl, browsers,
+/// `fetch`, Postman, most libraries), so counting them would make strict mode
+/// reject essentially all real traffic unless every mock declared them.
+/// `accept` in particular is sent by curl (`Accept: */*`) and by every browser
+/// on every request.
+pub const IGNORED_HEADERS: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "host",
+    "user-agent",
+];
+
 /// Check if request headers match the mock's requirements
 pub fn match_headers(request_headers: &HashMap<String, String>, matcher: &HeaderMatcher) -> bool {
     // Check all required headers match
@@ -186,14 +202,6 @@ pub fn match_headers(request_headers: &HashMap<String, String>, matcher: &Header
 
     // If strict mode, check for extra headers (excluding standard ones)
     if matcher.strict {
-        const IGNORED_HEADERS: &[&str] = &[
-            "host",
-            "user-agent",
-            "accept-encoding",
-            "connection",
-            "content-length",
-        ];
-
         for name in request_headers.keys() {
             if IGNORED_HEADERS.contains(&name.as_str()) {
                 continue;
@@ -617,6 +625,22 @@ pub struct MatchResult {
     /// mock's declared path (which may be a pattern like `/users/:id`),
     /// not necessarily the concrete request path
     pub matched_key: String,
+    /// Number of literal (non-parameter) segments in the mock's declared
+    /// path, used to break score ties in favor of the more specific route
+    pub specificity: u32,
+}
+
+/// Count the literal — i.e. non-`:name`, non-`{name}` — segments of a declared
+/// mock path. `/users/:id` scores 1, `/{resource}/:id` scores 0, and an exact
+/// path scores one per segment.
+fn path_specificity(path: &str) -> u32 {
+    path.split('/')
+        .filter(|segment| {
+            let is_param = (segment.starts_with(':') && segment.len() > 1)
+                || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2);
+            !is_param && !segment.is_empty()
+        })
+        .count() as u32
 }
 
 /// Find the best matching mock for a request.
@@ -650,6 +674,7 @@ pub fn find_matching_mock(
                     index,
                     path_params: HashMap::new(),
                     matched_key: base_key.clone(),
+                    specificity: path_specificity(&context.path),
                 });
             }
         }
@@ -686,14 +711,29 @@ pub fn find_matching_mock(
                         index,
                         path_params: params.clone(),
                         matched_key: key.clone(),
+                        specificity: path_specificity(path_part),
                     });
                 }
             }
         }
     }
 
-    // Sort by score (highest first) and return best match
-    candidates.sort_by_key(|b| std::cmp::Reverse(b.score));
+    // Rank candidates. Score decides first; the remaining keys exist so the
+    // winner is a pure function of the mock set, never of `HashMap` iteration
+    // order — which is reseeded on every hot reload and would otherwise let
+    // two equally-scored pattern mocks trade places every couple of seconds.
+    //
+    //   1. highest score
+    //   2. most literal path segments (`/users/:id` beats `/{any}/:id`)
+    //   3. lowest registered key, lexicographically
+    //   4. lowest position within that key's bucket
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.specificity.cmp(&a.specificity))
+            .then_with(|| a.matched_key.cmp(&b.matched_key))
+            .then_with(|| a.index.cmp(&b.index))
+    });
 
     if let Some(best) = candidates.into_iter().next() {
         debug!("Found matching mock with score {}", best.score);
@@ -1459,6 +1499,124 @@ mod tests {
         headers.insert("x-bad".to_string(), "anything".to_string());
 
         assert!(!match_headers(&headers, &matcher));
+    }
+    // ------------------------------------------------------------------
+    // Deterministic tie-breaking (#55)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_equal_score_patterns_resolve_identically_regardless_of_insertion_order() {
+        let specific = plain_mock("GET", "/users/:id", "specific");
+        let generic = plain_mock("GET", "/{resource}/:id", "generic");
+
+        // Same two mocks, opposite insertion order. HashMap iteration order is
+        // reseeded per map, so this is exactly the shape that used to flip.
+        let forward = mock_map(vec![specific.clone(), generic.clone()]);
+        let reverse = mock_map(vec![generic, specific]);
+
+        let ctx = RequestContext::new("GET".to_string(), "/users/42".to_string());
+
+        let a = find_matching_mock(&ctx, &forward).expect("should match");
+        let b = find_matching_mock(&ctx, &reverse).expect("should match");
+
+        assert_eq!(a.matched_key, b.matched_key);
+        assert_eq!(a.mock.response["source"], b.mock.response["source"]);
+        // More literal segments wins: /users/:id over /{resource}/:id.
+        assert_eq!(a.mock.response["source"], "specific");
+    }
+
+    #[test]
+    fn test_equal_specificity_tie_breaks_on_key_lexicographically() {
+        // Both have zero literal segments, so the key decides.
+        let alpha = plain_mock("GET", "/{alpha}/:sub", "alpha");
+        let beta = plain_mock("GET", "/{beta}/:sub", "beta");
+
+        let forward = mock_map(vec![alpha.clone(), beta.clone()]);
+        let reverse = mock_map(vec![beta, alpha]);
+
+        let ctx = RequestContext::new("GET".to_string(), "/anything/42".to_string());
+
+        let a = find_matching_mock(&ctx, &forward).expect("should match");
+        let b = find_matching_mock(&ctx, &reverse).expect("should match");
+
+        assert_eq!(a.matched_key, b.matched_key);
+        assert_eq!(a.mock.response["source"], "alpha");
+    }
+
+    #[test]
+    fn test_repeated_lookups_are_stable_across_freshly_built_maps() {
+        let specific = plain_mock("GET", "/orders/:id", "specific");
+        let generic = plain_mock("GET", "/{resource}/:id", "generic");
+        let ctx = RequestContext::new("GET".to_string(), "/orders/7".to_string());
+
+        // Rebuilding the map is what a hot reload does; each rebuild gets a
+        // fresh hasher seed.
+        let winner = {
+            let map = mock_map(vec![specific.clone(), generic.clone()]);
+            find_matching_mock(&ctx, &map).unwrap().matched_key
+        };
+
+        for _ in 0..25 {
+            let map = mock_map(vec![specific.clone(), generic.clone()]);
+            assert_eq!(find_matching_mock(&ctx, &map).unwrap().matched_key, winner);
+        }
+    }
+
+    #[test]
+    fn test_path_specificity_counts_literal_segments_only() {
+        assert_eq!(path_specificity("/users/42"), 2);
+        assert_eq!(path_specificity("/users/:id"), 1);
+        assert_eq!(path_specificity("/{resource}/:id"), 0);
+        assert_eq!(path_specificity("/orgs/{org}/repos/{repo}"), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Strict header mode ignores client-default headers (#56)
+    // ------------------------------------------------------------------
+
+    fn strict_bearer_matcher() -> HeaderMatcher {
+        HeaderMatcher {
+            required: HashMap::from([(
+                "authorization".to_string(),
+                HeaderValue::Pattern(HeaderPattern::Prefix("Bearer ".to_string())),
+            )]),
+            forbidden: Vec::new(),
+            strict: true,
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_allows_implicit_accept_header() {
+        // What `curl -H "Authorization: Bearer abc" ...` actually sends.
+        let headers = HashMap::from([
+            ("host".to_string(), "localhost:8080".to_string()),
+            ("user-agent".to_string(), "curl/8.5.0".to_string()),
+            ("accept".to_string(), "*/*".to_string()),
+            ("authorization".to_string(), "Bearer abc123".to_string()),
+        ]);
+
+        assert!(match_headers(&headers, &strict_bearer_matcher()));
+    }
+
+    #[test]
+    fn test_strict_mode_ignores_every_documented_default_header() {
+        let mut headers = HashMap::from([("authorization".to_string(), "Bearer abc".to_string())]);
+        for ignored in IGNORED_HEADERS {
+            headers.insert(ignored.to_string(), "value".to_string());
+        }
+
+        assert!(match_headers(&headers, &strict_bearer_matcher()));
+    }
+
+    #[test]
+    fn test_strict_mode_still_rejects_genuinely_extra_headers() {
+        let headers = HashMap::from([
+            ("accept".to_string(), "*/*".to_string()),
+            ("authorization".to_string(), "Bearer abc123".to_string()),
+            ("x-unexpected".to_string(), "surprise".to_string()),
+        ]);
+
+        assert!(!match_headers(&headers, &strict_bearer_matcher()));
     }
 }
 

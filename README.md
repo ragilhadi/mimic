@@ -635,8 +635,19 @@ When multiple mocks could match a request, Mimic uses a scoring system:
 - **Query params**: +100 points per matched param
 - **Headers**: +50 points per matched header
 - **Body**: +500 points if body matches
+- **Path pattern penalty**: -100 points for a `:id`/`{id}` match, so an exact path always outranks a pattern
 
-The mock with the **highest score** wins.
+The mock with the **highest score** wins. Equal scores are broken
+deterministically — most literal path segments first (`/users/:id` beats
+`/{resource}/:id`), then lowest `METHOD:path` key lexicographically, then
+earliest position among mocks sharing that key. The winner never depends on
+load order, so it stays the same across restarts and hot reloads. See
+[ADVANCED_MATCHING.md](ADVANCED_MATCHING.md#match-priority) for details.
+
+**Strict header mode** (`"strict": true`) ignores headers every HTTP client
+sends by default — `accept`, `accept-encoding`, `connection`, `content-length`,
+`host`, `user-agent` — so a plain `curl` request isn't rejected for headers you
+never asked about.
 
 ---
 

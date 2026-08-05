@@ -171,6 +171,35 @@ Match requests based on request body content:
 
 **Note:** Header names are case-insensitive (per HTTP spec).
 
+#### What `strict: true` ignores
+
+Strict mode rejects a request carrying any header not listed in `required` —
+except for the headers below, which mainstream HTTP clients send on their own
+whether you asked for them or not:
+
+| Ignored header | Sent by |
+|---|---|
+| `accept` | curl (`*/*`), browsers, `fetch`, Postman, most libraries |
+| `accept-encoding` | curl, browsers, most libraries |
+| `connection` | HTTP/1.1 clients |
+| `content-length` | any client sending a body |
+| `host` | every HTTP/1.1 client |
+| `user-agent` | curl, browsers, most libraries |
+
+Everything else counts as extra. So this mock matches a plain
+`curl -H "Authorization: Bearer abc" http://localhost:8080/strict`:
+
+```json
+{
+  "headers": {
+    "required": {"authorization": {"prefix": "Bearer "}},
+    "strict": true
+  }
+}
+```
+
+but the same request with an added `-H "X-Debug: 1"` does not.
+
 ---
 
 ### Body Matching
@@ -289,8 +318,20 @@ When multiple mocks could match a request, Mimic uses a scoring system:
 2. **Query params**: +100 points per matched param
 3. **Headers**: +50 points per matched header
 4. **Body**: +500 points if body matches
+5. **Path pattern penalty**: -100 points for a `:id`/`{id}` match, so an exact
+   path always outranks a pattern
 
-The mock with the highest score wins.
+The mock with the highest score wins. Ties are broken deterministically, in
+order:
+
+1. **More literal path segments.** `/users/:id` (one literal segment) beats
+   `/{resource}/:id` (none) for `GET /users/42`.
+2. **Lower registered `METHOD:path` key**, compared lexicographically.
+3. **Earlier position** among mocks sharing that key.
+
+The result is a pure function of the loaded mock set: the same request always
+resolves to the same mock across repeated calls, server restarts, and hot
+reloads.
 
 ---
 
