@@ -9,8 +9,8 @@ use axum::{
     Router,
 };
 use handler::{
-    admin_dashboard, clear_requests, handle_request, health_check, list_requests, reset_sequences,
-    AppState,
+    admin_dashboard, clear_requests, handle_request, health_check, list_requests, max_body_size,
+    reset_sequences, AppState,
 };
 use loader::{load_mocks, load_mocks_map};
 use std::env;
@@ -41,6 +41,7 @@ async fn main() {
     info!("Configuration:");
     info!("  Mocks directory: {}", MOCKS_DIR);
     info!("  Port: {}", port);
+    info!("  Max request body: {} bytes", max_body_size());
 
     // Load mock configurations
     let mocks = load_mocks(MOCKS_DIR);
@@ -133,6 +134,13 @@ fn create_router(state: AppState) -> Router {
         // Add state
         .with_state(state)
         // Add tracing middleware
+        //
+        // The request-body cap is enforced in `handle_request` rather than by
+        // a `tower_http` `RequestBodyLimitLayer` here: the layer's rejection
+        // carries a plain-text body, which would answer the same condition two
+        // different ways depending on whether the client declared a
+        // Content-Length. `Limited` in the handler caps the stream just as
+        // hard and always returns the documented JSON shape.
         .layer(TraceLayer::new_for_http())
 }
 
@@ -304,5 +312,71 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["reset"], 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Body limit through the full router (#50)
+    // ------------------------------------------------------------------
+
+    /// A Content-Length-less body that keeps producing chunks, so the limit
+    /// has to be enforced mid-stream rather than from a declared size.
+    struct ChunkedBody {
+        remaining: usize,
+    }
+
+    impl http_body::Body for ChunkedBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+            if self.remaining == 0 {
+                return std::task::Poll::Ready(None);
+            }
+            let chunk = 64 * 1024;
+            self.remaining = self.remaining.saturating_sub(chunk);
+            std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from(vec![
+                    b'x';
+                    chunk
+                ])))))
+        }
+    }
+
+    /// Both shapes must produce the same documented JSON body, not one JSON
+    /// and one plain-text rejection.
+    async fn assert_413_json(body: Body) {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("content-type", "text/plain")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "payload too large");
+        assert_eq!(json["max_body_size"], handler::max_body_size());
+    }
+
+    #[tokio::test]
+    async fn test_router_rejects_oversized_sized_body_with_413() {
+        assert_413_json(Body::from(vec![b'x'; handler::max_body_size() + 1])).await;
+    }
+
+    #[tokio::test]
+    async fn test_router_rejects_oversized_chunked_body_with_413() {
+        assert_413_json(Body::new(ChunkedBody {
+            remaining: handler::max_body_size() * 2,
+        }))
+        .await;
     }
 }

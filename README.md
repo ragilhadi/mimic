@@ -107,6 +107,9 @@ PORT=8080
 
 # Logging level: trace, debug, info, warn, error (default: info)
 RUST_LOG=info
+
+# Maximum request body Mimic will buffer, in bytes (default: 10485760 = 10 MB)
+MIMIC_MAX_BODY_SIZE=10485760
 ```
 
 **Log Levels**:
@@ -812,6 +815,13 @@ Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax in
 | `{{body.user.email}}` | Nested JSON body field (dot notation) |
 | `{{path.id}}` | Named [path parameter](#path-parameters) `:id` or `{id}` |
 
+> **Credential headers are never echoed.** `{{header.authorization}}`,
+> `{{header.cookie}}` and `{{header.set-cookie}}` always render as an empty
+> string — the same as a missing key — regardless of letter case. This matches
+> the redaction already applied to the `/admin/requests` log, so a mock file
+> can't reflect a live bearer token or session cookie into a response body
+> (and from there into browser devtools, HAR exports, or CI logs).
+
 ### Example
 
 ```json
@@ -1104,6 +1114,34 @@ curl -X POST http://localhost:8080/ocr-image \
 # Works with consume_body: false (default)
 curl -X POST http://localhost:8080/trigger-job
 ```
+
+### Maximum Body Size
+
+Request bodies are capped at **10 MB** by default. The cap is enforced *while
+the body streams in*, so an oversized request is turned away before Mimic
+allocates memory for it — a client cannot drive the server's memory use past
+the limit no matter how much it sends.
+
+Over-limit requests get a `413 Payload Too Large`:
+
+```json
+{
+  "error": "payload too large",
+  "method": "POST",
+  "path": "/upload",
+  "max_body_size": 10485760
+}
+```
+
+Raise or lower the cap with the `MIMIC_MAX_BODY_SIZE` environment variable
+(in bytes):
+
+```bash
+MIMIC_MAX_BODY_SIZE=52428800 mimic   # 50 MB
+```
+
+An unset, unparsable, or zero value falls back to the 10 MB default. The
+active limit is printed at startup.
 
 ---
 
