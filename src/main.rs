@@ -2,6 +2,7 @@ mod faker;
 mod handler;
 mod loader;
 mod matcher;
+mod openapi;
 mod regex_cache;
 mod template;
 mod types;
@@ -23,10 +24,50 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Application entry point.
 ///
+/// Dispatches the one-off `import-openapi` subcommand if it was asked for,
+/// otherwise starts the mock server. The subcommand check happens before the
+/// async runtime spins up: importing a spec is plain blocking file I/O and
+/// has no business starting a server.
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("import-openapi") {
+        std::process::exit(run_import(&args[2..]));
+    }
+
+    run_server();
+}
+
+/// Run the `import-openapi` subcommand, returning the process exit code.
+fn run_import(args: &[String]) -> i32 {
+    match openapi::run_import(args) {
+        Ok(written) => {
+            for path in &written {
+                println!("{}", path.display());
+            }
+            println!("✅ Generated {} mock file(s)", written.len());
+            0
+        }
+        Err(openapi::ImportError::Usage(message)) => {
+            // An empty message means `--help`, which isn't an error.
+            if message.is_empty() {
+                print!("{}", openapi::USAGE);
+                return 0;
+            }
+            eprintln!("error: {}", message);
+            eprint!("\n{}", openapi::USAGE);
+            2
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
 /// Initializes logging, loads mock configurations, sets up the HTTP server,
 /// and starts listening for incoming requests.
 #[tokio::main]
-async fn main() {
+async fn run_server() {
     // Initialize tracing/logging
     init_logging();
 

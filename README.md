@@ -21,6 +21,7 @@
 - **Path Parameters** - `/users/:id` and `/users/{id}` syntax, one mock covers every value
 - **Dynamic Response Templating** - Echo path, query, header, and body fields back into responses with `{{path.x}}` syntax
 - **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
+- **OpenAPI Import** - Generate a whole mocks directory from an OpenAPI 3.x spec with `mimic import-openapi ./spec.yaml`
 
 ---
 
@@ -946,6 +947,131 @@ Notes:
 - An unknown source, a missing key, or an explicit JSON `null` all resolve to an empty string — malformed templates never panic and never leak into the response.
 - Non-string body values (numbers, booleans, nested objects/arrays) render using their JSON text form, e.g. `{{body.age}}` for `{"age": 30}` produces `30`.
 - A response with no `{{ }}` expressions is returned unchanged with no templating overhead.
+
+---
+
+## 📥 OpenAPI / Swagger Import
+
+Already have an OpenAPI 3.x spec? Generate a whole `mocks/` directory from it in one command instead of hand-writing every file:
+
+```bash
+mimic import-openapi ./spec.yaml --out ./mocks/generated
+```
+
+JSON and YAML specs are both accepted. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status. The output is plain `MockConfig` JSON, so it hot-reloads like any other mock and can be hand-edited afterwards.
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--out <dir>` | `./mocks/generated` | Output directory |
+| `--status <code>` | `200` | Status treated as each operation's *primary* response; its file is the live one |
+| `--force` | off | Write into a non-empty output directory, overwriting files of the same name |
+| `--brace-params` | off | Emit path parameters as `{id}` instead of `:id` |
+| `-h`, `--help` | — | Show usage |
+
+### Example
+
+Given this spec:
+
+```yaml
+openapi: 3.0.3
+info: { title: Petstore, version: 1.0.0 }
+paths:
+  /users/{id}:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: { "id": 1, "name": "Alice" }
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        code: { type: integer }
+        message: { type: string }
+```
+
+`mimic import-openapi spec.yaml --out ./mocks/generated` writes:
+
+**`mocks/generated/get_users_id.json`** (the primary 200 response — no status suffix)
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id",
+  "status": 200,
+  "response": { "id": 1, "name": "Alice" },
+  "consume_body": false
+}
+```
+
+**`mocks/generated/get_users_id_404.json.disabled`** (an alternative response — inert until renamed)
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id",
+  "status": 404,
+  "response": { "code": 0, "message": "string" },
+  "consume_body": false
+}
+```
+
+Start the server and `GET /users/42` returns the 200 body immediately — path parameters are translated to Mimic's `:id` syntax, so generated mocks work with the matcher unedited.
+
+To serve the 404 instead, swap which file is live:
+
+```bash
+mv mocks/generated/get_users_id.json mocks/generated/get_users_id_200.json.disabled
+mv mocks/generated/get_users_id_404.json.disabled mocks/generated/get_users_id_404.json
+```
+
+Hot reload picks the change up within a couple of seconds — no restart needed.
+
+### Where the response body comes from
+
+For each response, the importer takes the first of these that the spec provides:
+
+1. `content.<media type>.example`
+2. The first entry in `content.<media type>.examples` (its `value`)
+3. A stub built from `content.<media type>.schema`
+4. `{}` — for body-less responses like `204`
+
+JSON media types are preferred when a response offers several.
+
+### Schema stubs
+
+When there's no example, the schema is walked recursively and each field gets a type-appropriate placeholder:
+
+| Schema | Stub |
+|--------|------|
+| `type: string` | `"string"` (or a format-appropriate value: `date`, `date-time`, `uuid`, `email`, `uri`) |
+| `type: integer` / `number` | `0` / `0.0` |
+| `type: boolean` | `false` |
+| `type: object` | `{}` with every property stubbed recursively |
+| `type: array` | one stubbed element from `items`, or `[]` if `items` is absent |
+| `enum` / `default` / `example` | the spec's own value, which always wins over a stub |
+
+`allOf` subschemas are merged; `oneOf` / `anyOf` use the first variant.
+
+### Semantics
+
+- **Multiple response codes become separate files, and only the primary one is live.** Alternatives share a path and method with the primary response and carry no matcher to tell them apart, so leaving them all enabled would make the served response depend on directory read order. They land as `.json.disabled` instead — rename to enable. They are alternative responses, not a call-order sequence, so they are also deliberately *not* folded into a single [`sequence`](#-stateful-response-sequences) mock.
+- **The primary response** is `--status` if the operation declares it, otherwise its lowest declared `2xx`, otherwise its lowest declared status. So a `POST` documenting only `201` gets a live `201`, and an operation documenting only errors still gets a live mock rather than an all-disabled route.
+- **OpenAPI's `default` key** maps to `--status` for its filename, but never outranks a declared success response — it usually documents an *error* shape, and serving that by default would be misleading. It becomes the live mock only when it's all an operation has.
+- **`$ref` is resolved** for schemas, responses, path items, and named examples. Circular references collapse to `{}` at the point of recursion rather than looping forever; external (`./other.yaml#/...`) and unresolvable refs degrade to `{}` with a warning.
+- **Existing files are protected.** A non-empty `--out` directory is refused unless you pass `--force`, so a re-import can't silently clobber mocks you edited by hand. With `--force`, every overwritten file is named in a warning.
+- **Response keys** may be quoted (`'200'`) or bare (`200`), `default`, or wildcards (`4XX` → `400`).
+- **Only OpenAPI 3.x is supported.** Swagger 2.0 specs are rejected with a clear message — convert first.
+- A malformed spec produces an error and a non-zero exit code, never a panic.
 
 ---
 
