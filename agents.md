@@ -37,7 +37,14 @@
 - **Outputs:** HTTP response (status, JSON body, headers), logs
 - **Responsibilities:** Parse request → build context → call Matcher → return response/404
 
-### 5. **Logger Agent** (`src/main.rs`)
+### 5. **Importer Agent** (`src/openapi.rs`)
+- **Purpose:** Generate mock files from an OpenAPI 3.x spec
+- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--force] [--brace-params]`
+- **Outputs:** One `MockConfig` JSON file per operation + response status
+- **Responsibilities:** Parse JSON/YAML, resolve `$ref`, pick examples or build schema stubs, translate `{id}` path templates, refuse to clobber a non-empty output directory without `--force`
+- **Note:** Runs instead of the server (checked in `main` before the async runtime starts) and exits when done
+
+### 6. **Logger Agent** (`src/main.rs`)
 - **Purpose:** Observability and debugging
 - **Inputs:** `RUST_LOG` env var, application events
 - **Outputs:** Structured logs to stdout
