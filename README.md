@@ -958,14 +958,14 @@ Already have an OpenAPI 3.x spec? Generate a whole `mocks/` directory from it in
 mimic import-openapi ./spec.yaml --out ./mocks/generated
 ```
 
-JSON and YAML specs are both accepted. The importer writes one ordinary mock file per **operation + response status** — the output is plain `MockConfig` JSON, so it hot-reloads like any other mock and can be hand-edited afterwards.
+JSON and YAML specs are both accepted. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status. The output is plain `MockConfig` JSON, so it hot-reloads like any other mock and can be hand-edited afterwards.
 
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--out <dir>` | `./mocks/generated` | Output directory |
-| `--status <code>` | `200` | Status treated as each operation's *primary* response; its file gets no status suffix |
+| `--status <code>` | `200` | Status treated as each operation's *primary* response; its file is the live one |
 | `--force` | off | Write into a non-empty output directory, overwriting files of the same name |
 | `--brace-params` | off | Emit path parameters as `{id}` instead of `:id` |
 | `-h`, `--help` | — | Show usage |
@@ -1013,7 +1013,7 @@ components:
 }
 ```
 
-**`mocks/generated/get_users_id_404.json`** (an alternative response — suffixed)
+**`mocks/generated/get_users_id_404.json.disabled`** (an alternative response — inert until renamed)
 
 ```json
 {
@@ -1026,6 +1026,15 @@ components:
 ```
 
 Start the server and `GET /users/42` returns the 200 body immediately — path parameters are translated to Mimic's `:id` syntax, so generated mocks work with the matcher unedited.
+
+To serve the 404 instead, swap which file is live:
+
+```bash
+mv mocks/generated/get_users_id.json mocks/generated/get_users_id_200.json.disabled
+mv mocks/generated/get_users_id_404.json.disabled mocks/generated/get_users_id_404.json
+```
+
+Hot reload picks the change up within a couple of seconds — no restart needed.
 
 ### Where the response body comes from
 
@@ -1055,7 +1064,9 @@ When there's no example, the schema is walked recursively and each field gets a 
 
 ### Semantics
 
-- **Multiple response codes become separate files.** They are alternative responses, not a call-order sequence, so they are deliberately *not* folded into a single [`sequence`](#-stateful-response-sequences) mock — enable the ones you want by keeping or deleting files.
+- **Multiple response codes become separate files, and only the primary one is live.** Alternatives share a path and method with the primary response and carry no matcher to tell them apart, so leaving them all enabled would make the served response depend on directory read order. They land as `.json.disabled` instead — rename to enable. They are alternative responses, not a call-order sequence, so they are also deliberately *not* folded into a single [`sequence`](#-stateful-response-sequences) mock.
+- **The primary response** is `--status` if the operation declares it, otherwise its lowest declared `2xx`, otherwise its lowest declared status. So a `POST` documenting only `201` gets a live `201`, and an operation documenting only errors still gets a live mock rather than an all-disabled route.
+- **OpenAPI's `default` key** maps to `--status` for its filename, but never outranks a declared success response — it usually documents an *error* shape, and serving that by default would be misleading. It becomes the live mock only when it's all an operation has.
 - **`$ref` is resolved** for schemas, responses, path items, and named examples. Circular references collapse to `{}` at the point of recursion rather than looping forever; external (`./other.yaml#/...`) and unresolvable refs degrade to `{}` with a warning.
 - **Existing files are protected.** A non-empty `--out` directory is refused unless you pass `--force`, so a re-import can't silently clobber mocks you edited by hand. With `--force`, every overwritten file is named in a warning.
 - **Response keys** may be quoted (`'200'`) or bare (`200`), `default`, or wildcards (`4XX` → `400`).

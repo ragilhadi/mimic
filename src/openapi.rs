@@ -44,15 +44,29 @@ const HTTP_METHODS: [&str; 8] = [
 /// deep enough to blow the stack.
 const MAX_STUB_DEPTH: usize = 32;
 
+/// Appended to every non-primary status file.
+///
+/// A spec's alternative responses (`404`, `500`, …) share a path and method
+/// with the primary one and carry no matcher to tell them apart, so leaving
+/// them all live would make the served response depend on directory read
+/// order. The loader only reads `.json`, so this suffix parks them next to
+/// the mock they belong to, inert until renamed — which is what "enable
+/// selectively" has to mean in a directory of files.
+const DISABLED_SUFFIX: &str = ".json.disabled";
+
 pub const USAGE: &str = "\
 Usage: mimic import-openapi <spec.yaml|spec.json> [options]
 
 Generate Mimic mock files from an OpenAPI 3.x spec.
 
+One live mock file is written per operation, from its primary response.
+Other documented statuses are written alongside as
+<name>_<status>.json.disabled — rename to drop the suffix to enable one.
+
 Options:
   --out <dir>      Output directory (default: ./mocks/generated)
   --status <code>  Status treated as each operation's primary response;
-                   its file gets no status suffix (default: 200)
+                   its file is the live one (default: 200)
   --force          Write into a non-empty output directory, overwriting
                    files of the same name
   --brace-params   Emit path parameters as {id} instead of :id
@@ -447,11 +461,12 @@ impl OpenApiSpec {
 /// response status — in a deterministic order.
 ///
 /// The response matching `default_status` is treated as the operation's
-/// primary one and gets an unsuffixed filename (`get_users_id.json`); every
-/// other status is suffixed (`get_users_id_404.json`) so the extra responses
-/// sit alongside, ready to be enabled selectively. They are alternative
-/// responses, not a call-order sequence, so they are deliberately *not*
-/// folded into a single `sequence` mock.
+/// primary one and is the only live mock for that operation
+/// (`get_users_id.json`). Every other status is written alongside it,
+/// status-suffixed and inert (`get_users_id_404.json.disabled`), ready to be
+/// enabled by dropping the suffix. They are alternative responses, not a
+/// call-order sequence, so they are deliberately *not* folded into a single
+/// `sequence` mock either.
 pub fn generate_mocks(
     spec: &OpenApiSpec,
     default_status: u16,
@@ -485,7 +500,7 @@ pub fn generate_mocks(
                 continue;
             };
 
-            let responses: Vec<(u16, Value)> = match operation
+            let responses: Vec<GeneratedResponse> = match operation
                 .get("responses")
                 .and_then(Value::as_object)
                 .filter(|responses| !responses.is_empty())
@@ -502,19 +517,31 @@ pub fn generate_mocks(
                             ));
                             return None;
                         };
-                        Some((status, spec.response_body(response)))
+                        Some(GeneratedResponse {
+                            status,
+                            is_catch_all: key.eq_ignore_ascii_case("default"),
+                            body: spec.response_body(response),
+                        })
                     })
                     .collect(),
                 // An operation with no documented responses still deserves a
                 // route, so the spec's shape is reachable immediately.
-                None => vec![(default_status, empty_object())],
+                None => vec![GeneratedResponse {
+                    status: default_status,
+                    is_catch_all: false,
+                    body: empty_object(),
+                }],
             };
 
-            for (status, response) in responses {
+            let primary = choose_primary(&responses, default_status);
+
+            for (index, GeneratedResponse { status, body, .. }) in responses.into_iter().enumerate()
+            {
                 let name = unique_name(
-                    &base_filename(method, template, status, default_status),
+                    &base_filename(method, template, status, index == primary),
                     &mut used_names,
                 );
+                let response = body;
                 generated.push((
                     name,
                     MockConfig {
@@ -674,13 +701,69 @@ fn translate_path(template: &str, style: PathStyle) -> String {
         .join("/")
 }
 
-/// `GET /users/{id}` + 404 -> `get_users_id_404.json`.
-fn base_filename(method: &str, template: &str, status: u16, default_status: u16) -> String {
+/// `GET /users/{id}` primary -> `get_users_id.json`;
+/// `GET /users/{id}` + 404 -> `get_users_id_404.json.disabled`.
+fn base_filename(method: &str, template: &str, status: u16, is_primary: bool) -> String {
     let slug = path_slug(template);
-    if status == default_status {
+    if is_primary {
         format!("{}_{}.json", method, slug)
     } else {
-        format!("{}_{}_{}.json", method, slug, status)
+        format!("{}_{}_{}{}", method, slug, status, DISABLED_SUFFIX)
+    }
+}
+
+/// One response the importer will emit a file for.
+struct GeneratedResponse {
+    status: u16,
+    /// True for OpenAPI's `default` catch-all key, which usually documents an
+    /// *error* shape. It maps to `default_status` for its filename but must
+    /// not outrank an explicitly declared success response.
+    is_catch_all: bool,
+    body: Value,
+}
+
+/// Pick which of an operation's responses becomes the single live mock.
+///
+/// The `--status` code wins if the operation declares it; otherwise the
+/// lowest declared 2xx, then the lowest declared status. The `default`
+/// catch-all is only chosen when it is all the operation has — a spec that
+/// documents `201` alongside a `default` error means the 201, and serving the
+/// error shape by default would be actively misleading.
+fn choose_primary(responses: &[GeneratedResponse], default_status: u16) -> usize {
+    let declared = |response: &&GeneratedResponse| !response.is_catch_all;
+
+    let exact = responses
+        .iter()
+        .position(|response| declared(&response) && response.status == default_status);
+    if let Some(index) = exact {
+        return index;
+    }
+
+    let lowest = |filter: fn(u16) -> bool| {
+        responses
+            .iter()
+            .enumerate()
+            .filter(|(_, response)| declared(response) && filter(response.status))
+            .min_by_key(|(_, response)| response.status)
+            .map(|(index, _)| index)
+    };
+
+    lowest(|status| (200..300).contains(&status))
+        .or_else(|| lowest(|_| true))
+        .unwrap_or(0)
+}
+
+/// Split a generated filename into its stem and extension, treating
+/// `.json.disabled` as a single extension.
+fn split_extension(filename: &str) -> (&str, &str) {
+    // `get_a_404.json.disabled` -> ("get_a_404", ".json.disabled")
+    if let Some(stem) = filename.strip_suffix(DISABLED_SUFFIX) {
+        let stem = stem.strip_suffix(".json").unwrap_or(stem);
+        return (stem, &filename[stem.len()..]);
+    }
+    match filename.strip_suffix(".json") {
+        Some(stem) => (stem, ".json"),
+        None => (filename, ""),
     }
 }
 
@@ -710,9 +793,9 @@ fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
     if used.insert(base.to_string()) {
         return base.to_string();
     }
-    let stem = base.strip_suffix(".json").unwrap_or(base);
+    let (stem, extension) = split_extension(base);
     for suffix in 2.. {
-        let candidate = format!("{}_{}.json", stem, suffix);
+        let candidate = format!("{}_{}{}", stem, suffix, extension);
         if used.insert(candidate.clone()) {
             return candidate;
         }
@@ -972,7 +1055,7 @@ components:
     fn test_named_examples_map_is_used() {
         let mocks = generate(&fixture());
         assert_eq!(
-            find(&mocks, "get_users_id_404.json").response,
+            find(&mocks, "get_users_id_404.json.disabled").response,
             json!({"error": "not found"})
         );
     }
@@ -980,7 +1063,7 @@ components:
     #[test]
     fn test_path_parameters_become_colon_syntax_by_default() {
         let mocks = generate(&fixture());
-        assert_eq!(find(&mocks, "delete_users_id_204.json").path, "/users/:id");
+        assert_eq!(find(&mocks, "delete_users_id.json").path, "/users/:id");
     }
 
     #[test]
@@ -994,28 +1077,95 @@ components:
         let mocks = generate(&fixture());
         let names: Vec<&str> = mocks.iter().map(|(name, _)| name.as_str()).collect();
 
-        // 200 is the primary status, so it is unsuffixed; the rest are not.
+        // The primary response is live; the alternatives are suffixed and inert.
         assert!(names.contains(&"get_users_id.json"));
-        assert!(names.contains(&"get_users_id_404.json"));
-        assert!(names.contains(&"post_users_201.json"));
-        assert!(names.contains(&"post_users_400.json"));
+        assert!(names.contains(&"get_users_id_404.json.disabled"));
+        // POST /users declares no 200, so its lowest 2xx (201) is primary.
+        assert!(names.contains(&"post_users.json"));
+        assert!(names.contains(&"post_users_400.json.disabled"));
 
-        assert_eq!(find(&mocks, "post_users_400.json").status, 400);
+        assert_eq!(find(&mocks, "post_users.json").status, 201);
+        assert_eq!(find(&mocks, "post_users_400.json.disabled").status, 400);
     }
 
     #[test]
-    fn test_status_option_changes_which_file_is_unsuffixed() {
+    fn test_status_option_picks_the_primary_when_the_operation_declares_it() {
         let mocks = generate_mocks(&fixture(), 201, PathStyle::Colon);
-        let names: Vec<&str> = mocks.iter().map(|(name, _)| name.as_str()).collect();
 
-        assert!(names.contains(&"post_users.json"), "{:?}", names);
-        assert!(names.contains(&"get_users_id_200.json"), "{:?}", names);
+        // POST /users declares 201, so --status 201 makes it the live file.
+        assert_eq!(find(&mocks, "post_users.json").status, 201);
+        // GET /users/{id} has no 201; it falls back to its lowest 2xx (200)
+        // rather than leaving the route with nothing live.
+        assert_eq!(find(&mocks, "get_users_id.json").status, 200);
+    }
+
+    /// OpenAPI's `default` key usually documents an *error* shape. It must not
+    /// beat a declared success response to the live slot just because it maps
+    /// onto `--status`.
+    #[test]
+    fn test_catch_all_default_does_not_outrank_a_declared_success() {
+        let spec = OpenApiSpec::parse(
+            r#"
+openapi: 3.0.0
+paths:
+  /pets:
+    post:
+      responses:
+        '201':
+          content:
+            application/json:
+              example: {"id": 1}
+        default:
+          content:
+            application/json:
+              example: {"error": "boom"}
+"#,
+        )
+        .unwrap();
+
+        let mocks = generate(&spec);
+
+        let primary = find(&mocks, "post_pets.json");
+        assert_eq!(primary.status, 201);
+        assert_eq!(primary.response, json!({"id": 1}));
+        assert_eq!(
+            find(&mocks, "post_pets_200.json.disabled").response,
+            json!({"error": "boom"})
+        );
+    }
+
+    /// ...but when `default` is all there is, it is the live one.
+    #[test]
+    fn test_lone_catch_all_default_becomes_the_primary() {
+        let spec = OpenApiSpec::parse(
+            "openapi: 3.0.0\npaths:\n  /a:\n    get:\n      responses:\n        default:\n          content:\n            application/json:\n              example: {\"ok\": true}\n",
+        )
+        .unwrap();
+
+        let mocks = generate(&spec);
+        assert_eq!(mocks.len(), 1);
+        assert_eq!(mocks[0].0, "get_a.json");
+        assert_eq!(mocks[0].1.response, json!({"ok": true}));
+    }
+
+    /// An operation documenting only errors still gets a live mock — the
+    /// lowest declared status — rather than an all-disabled route.
+    #[test]
+    fn test_operation_with_no_success_response_still_has_a_live_mock() {
+        let spec = OpenApiSpec::parse(
+            "openapi: 3.0.0\npaths:\n  /a:\n    get:\n      responses:\n        '500': {}\n        '404': {}\n",
+        )
+        .unwrap();
+
+        let mocks = generate(&spec);
+        assert_eq!(find(&mocks, "get_a.json").status, 404);
+        assert_eq!(find(&mocks, "get_a_500.json.disabled").status, 500);
     }
 
     #[test]
     fn test_response_without_content_yields_an_empty_object() {
         let mocks = generate(&fixture());
-        let mock = find(&mocks, "delete_users_id_204.json");
+        let mock = find(&mocks, "delete_users_id.json");
         assert_eq!(mock.status, 204);
         assert_eq!(mock.response, json!({}));
     }
@@ -1053,7 +1203,7 @@ components:
     fn test_missing_example_falls_back_to_ref_resolved_schema_stub() {
         let mocks = generate(&fixture());
         assert_eq!(
-            find(&mocks, "post_users_201.json").response,
+            find(&mocks, "post_users.json").response,
             json!({"id": 0, "name": "string", "active": false})
         );
     }
@@ -1508,6 +1658,62 @@ paths:
         assert_eq!(
             matched.path_params.get("id").map(String::as_str),
             Some("42")
+        );
+    }
+
+    /// The importer must not register two indistinguishable mocks for one
+    /// route. `/users/{id}` documents both a 200 and a 404; if both were
+    /// live they would tie on score and the served response would come down
+    /// to directory read order, which varies by filesystem.
+    #[test]
+    fn test_only_the_primary_status_is_live_per_route() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mocks(&generate(&fixture()), dir.path(), false).unwrap();
+
+        let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
+        for (key, mocks) in &loaded.mocks {
+            assert_eq!(
+                mocks.len(),
+                1,
+                "route {} has {} live mocks, so which one answers is read-order dependent",
+                key,
+                mocks.len()
+            );
+        }
+
+        // The alternative response is on disk, just inert until renamed.
+        assert!(dir.path().join("get_users_id_404.json.disabled").exists());
+        assert!(!dir.path().join("get_users_id_404.json").exists());
+    }
+
+    /// Dropping the `.disabled` suffix is all it takes to enable one.
+    #[test]
+    fn test_renaming_a_disabled_file_enables_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mocks(&generate(&fixture()), dir.path(), false).unwrap();
+
+        fs::remove_file(dir.path().join("get_users_id.json")).unwrap();
+        fs::rename(
+            dir.path().join("get_users_id_404.json.disabled"),
+            dir.path().join("get_users_id_404.json"),
+        )
+        .unwrap();
+
+        let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
+        let context =
+            crate::matcher::RequestContext::new("GET".to_string(), "/users/42".to_string());
+        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks).unwrap();
+
+        assert_eq!(matched.mock.status, 404);
+        assert_eq!(matched.mock.response, json!({"error": "not found"}));
+    }
+
+    #[test]
+    fn test_split_extension() {
+        assert_eq!(split_extension("get_a.json"), ("get_a", ".json"));
+        assert_eq!(
+            split_extension("get_a_404.json.disabled"),
+            ("get_a_404", ".json.disabled")
         );
     }
 
