@@ -12,8 +12,9 @@ use axum::{
     Router,
 };
 use handler::{
-    admin_dashboard, clear_requests, configured_port, handle_request, health_check, list_mocks,
-    list_requests, list_sequences, max_body_size, max_log_entries, reset_sequences, AppState,
+    admin_dashboard, clear_requests, configured_active_tags, configured_port, get_scenario,
+    handle_request, health_check, list_mocks, list_requests, list_sequences, max_body_size,
+    max_log_entries, reset_sequences, set_scenario, AppState,
 };
 use loader::{load_mocks, load_mocks_map};
 use std::collections::HashMap;
@@ -79,10 +80,21 @@ async fn run_server() {
     // Get port from environment variable
     let port = configured_port();
 
+    // Scenario selection: which tagged mock groups start out matchable
+    let active_tags = configured_active_tags();
+
     info!("Configuration:");
     info!("  Mocks directory: {}", MOCKS_DIR);
     info!("  Port: {}", port);
     info!("  Max request body: {} bytes", max_body_size());
+    match active_tags.as_ref() {
+        Some(tags) => {
+            let mut names: Vec<&str> = tags.iter().map(String::as_str).collect();
+            names.sort();
+            info!("  Active scenario tags: {}", names.join(", "));
+        }
+        None => info!("  Active scenario tags: (none — all mocks matchable)"),
+    }
     match max_log_entries() {
         0 => info!("  Request log: unbounded"),
         n => info!("  Request log: last {} request(s)", n),
@@ -96,7 +108,7 @@ async fn run_server() {
     }
 
     // Create application state
-    let state = AppState::new(mocks.clone());
+    let state = AppState::with_active_tags(mocks.clone(), active_tags);
 
     // Spawn background task for hot-reloading mock files
     const RELOAD_INTERVAL_SECS: u64 = 2;
@@ -208,6 +220,8 @@ fn create_router(state: AppState) -> Router {
         .route("/admin/mocks", get(list_mocks))
         .route("/admin/sequences", get(list_sequences))
         .route("/admin/sequences/reset", post(reset_sequences))
+        // Scenario switching: which tagged mock groups are currently matchable
+        .route("/admin/scenario", get(get_scenario).post(set_scenario))
         // Catch-all route for mock requests
         .fallback(any(handle_request))
         // Add state
@@ -307,6 +321,58 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_admin_scenario_endpoint_is_routed() {
+        let app = create_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/scenario")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["filtering"], false);
+    }
+
+    /// `curl -X POST /admin/scenario -d '{"tags": [...]}'` sends a form
+    /// content type. The endpoint reads the raw body precisely so that
+    /// documented one-liner works instead of 415-ing.
+    #[tokio::test]
+    async fn test_admin_scenario_post_accepts_a_body_without_a_json_content_type() {
+        let state = test_state();
+        let app = create_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/scenario")
+                    .body(Body::from(r#"{"tags": ["error-scenario"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["active_tags"], serde_json::json!(["error-scenario"]));
+
+        let active = state.active_tags.read().await;
+        assert_eq!(
+            active.as_ref().map(|tags| tags.len()),
+            Some(1),
+            "the POST should have taken effect on the shared state"
+        );
     }
 
     #[tokio::test]
@@ -480,6 +546,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         }
     }
 

@@ -13,7 +13,7 @@ use crate::types::{
 };
 use bytes::Bytes;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
@@ -1071,7 +1071,17 @@ fn path_specificity(path: &str) -> u32 {
 ///
 /// Otherwise the body is left unread, which is what `consume_body: false`
 /// (the default) promises.
-pub fn requires_body(method: &str, path: &str, mocks: &HashMap<String, Vec<MockConfig>>) -> bool {
+///
+/// `active_tags` is the scenario selection (see [`MockConfig::is_active`]);
+/// mocks filtered out by it are invisible here for the same reason they're
+/// invisible to [`find_matching_mock`] — a request only tag-filtered mocks
+/// could serve is heading for a 404, and its body is worth logging.
+pub fn requires_body(
+    method: &str,
+    path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
+) -> bool {
     let mut any_candidate = false;
 
     /// A single mock's own answer to "do I need the request body?"
@@ -1088,9 +1098,15 @@ pub fn requires_body(method: &str, path: &str, mocks: &HashMap<String, Vec<MockC
 
     let base_key = crate::types::create_mock_key(method, path);
     if let Some(mock_list) = mocks.get(&base_key) {
-        any_candidate = true;
-        if mock_list.iter().any(mock_needs_body) {
-            return true;
+        let mut active = mock_list
+            .iter()
+            .filter(|m| m.is_active(active_tags))
+            .peekable();
+        if active.peek().is_some() {
+            any_candidate = true;
+            if active.any(mock_needs_body) {
+                return true;
+            }
         }
     }
 
@@ -1114,8 +1130,15 @@ pub fn requires_body(method: &str, path: &str, mocks: &HashMap<String, Vec<MockC
             continue;
         }
 
+        let mut active = mock_list
+            .iter()
+            .filter(|m| m.is_active(active_tags))
+            .peekable();
+        if active.peek().is_none() {
+            continue;
+        }
         any_candidate = true;
-        if mock_list.iter().any(mock_needs_body) {
+        if active.any(mock_needs_body) {
             return true;
         }
     }
@@ -1130,9 +1153,15 @@ pub fn requires_body(method: &str, path: &str, mocks: &HashMap<String, Vec<MockC
 /// all, so a mock set with no path parameters — or a request that hits one
 /// exactly — never touches the pattern loop. A pattern match also always
 /// scores below an otherwise-equal exact match.
+///
+/// `active_tags` is the scenario selection: mocks it filters out (see
+/// [`MockConfig::is_active`]) are skipped before scoring, so they behave
+/// exactly as if they weren't loaded. `None`, and any mock without `tags`,
+/// means no filtering — the zero-config behavior.
 pub fn find_matching_mock(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
 ) -> Option<MatchResult> {
     let base_key = crate::types::create_mock_key(&context.method, &context.path);
 
@@ -1147,6 +1176,12 @@ pub fn find_matching_mock(
     // Exact match: O(1) lookup, no path params, full score.
     if let Some(mock_list) = mocks.get(&base_key) {
         for (index, mock) in mock_list.iter().enumerate() {
+            // Note the index comes from the unfiltered list: it keys sequence
+            // counters and hit counts, so it must not shift when a scenario
+            // hides a sibling mock registered under the same path.
+            if !mock.is_active(active_tags) {
+                continue;
+            }
             if let Some(breakdown) = calculate_match_score(context, mock) {
                 candidates.push(MatchResult {
                     mock: mock.clone(),
@@ -1185,6 +1220,9 @@ pub fn find_matching_mock(
             };
 
             for (index, mock) in mock_list.iter().enumerate() {
+                if !mock.is_active(active_tags) {
+                    continue;
+                }
                 if let Some(breakdown) = calculate_match_score(context, mock) {
                     candidates.push(MatchResult {
                         mock: mock.clone(),
@@ -1371,15 +1409,32 @@ const MAX_EXPLAINED_CANDIDATES: usize = 5;
 ///
 /// Meant to be called only on the 404 path: it walks the mock map and formats
 /// strings, so the matched path never pays for it.
+///
+/// Mocks hidden by the scenario selection are reported as a count rather than
+/// judged by their matchers — "3 mock(s) match this request but are filtered
+/// out by inactive tags" is the answer somebody staring at an unexpected 404
+/// actually needs. This string reaches the debug log and `/admin/requests`,
+/// never the 404 body, so scenario configuration isn't leaked to API clients.
 pub fn explain_no_match(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
 ) -> Option<String> {
     let base_key = crate::types::create_mock_key(&context.method, &context.path);
     let mut candidates: Vec<(String, RejectReason)> = Vec::new();
+    let mut tag_filtered: Vec<String> = Vec::new();
 
     let mut collect = |key: &str, mock_list: &[MockConfig]| {
         for (index, mock) in mock_list.iter().enumerate() {
+            if !mock.is_active(active_tags) {
+                // Would this mock have matched if its tags were active? Only
+                // then is it worth mentioning; a tagged mock whose matchers
+                // reject the request is just a miss like any other.
+                if matches!(evaluate_mock(context, mock), Evaluation::Matched(_)) {
+                    tag_filtered.push(describe_mock(mock, key, index));
+                }
+                continue;
+            }
             if let Evaluation::Rejected(reason) = evaluate_mock(context, mock) {
                 candidates.push((describe_mock(mock, key, index), reason));
             }
@@ -1414,7 +1469,32 @@ pub fn explain_no_match(
         }
     }
 
+    // The scenario hint, built once and reused by both branches below.
+    let tag_note = (!tag_filtered.is_empty()).then(|| {
+        let shown: Vec<String> = tag_filtered
+            .iter()
+            .take(MAX_EXPLAINED_CANDIDATES)
+            .cloned()
+            .collect();
+        let mut note = format!(
+            "{} mock(s) match `{}` but are filtered out by inactive tags: {}",
+            tag_filtered.len(),
+            base_key,
+            shown.join(", ")
+        );
+        if tag_filtered.len() > shown.len() {
+            note.push_str(&format!(" (+{} more)", tag_filtered.len() - shown.len()));
+        }
+        note
+    });
+
     if candidates.is_empty() {
+        // A scenario hiding the only mock that would have served this request
+        // is the whole explanation — say that instead of "nothing registered".
+        if let Some(note) = tag_note {
+            return Some(note);
+        }
+
         // Nothing was even registered for this method+path. The most common
         // cause by far is the right path on the wrong method, so say so when
         // that's what happened.
@@ -1445,6 +1525,9 @@ pub fn explain_no_match(
     );
     if candidates.len() > shown.len() {
         explanation.push_str(&format!(" (+{} more)", candidates.len() - shown.len()));
+    }
+    if let Some(note) = tag_note {
+        explanation.push_str(&format!("; {}", note));
     }
     Some(explanation)
 }
@@ -1805,6 +1888,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
 
         let mocks = HashMap::from([(
@@ -1822,13 +1906,13 @@ mod tests {
             content_type: Some("application/json".to_string()),
         };
 
-        let result = find_matching_mock(&make_context("admin"), &mocks).unwrap();
+        let result = find_matching_mock(&make_context("admin"), &mocks, None).unwrap();
         assert_eq!(result.index, 0);
         assert_eq!(result.mock.response["role"], "admin");
         assert!(result.path_params.is_empty());
         assert_eq!(result.matched_key, "POST:/login");
 
-        let result = find_matching_mock(&make_context("user"), &mocks).unwrap();
+        let result = find_matching_mock(&make_context("user"), &mocks, None).unwrap();
         assert_eq!(result.index, 1);
         assert_eq!(result.mock.response["role"], "user");
     }
@@ -1928,6 +2012,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1953,7 +2038,7 @@ mod tests {
             )],
         )]);
 
-        let result = find_matching_mock(&path_param_context("/users/42"), &mocks).unwrap();
+        let result = find_matching_mock(&path_param_context("/users/42"), &mocks, None).unwrap();
         assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
         assert_eq!(result.matched_key, "GET:/users/:id");
         // Below the 1000 base score of an exact match
@@ -1980,7 +2065,7 @@ mod tests {
             content_type: None,
         };
 
-        let result = find_matching_mock(&context, &mocks).unwrap();
+        let result = find_matching_mock(&context, &mocks, None).unwrap();
         assert_eq!(result.path_params.get("org"), Some(&"acme".to_string()));
         assert_eq!(result.path_params.get("repo"), Some(&"widgets".to_string()));
     }
@@ -1995,8 +2080,12 @@ mod tests {
             )],
         )]);
 
-        let result =
-            find_matching_mock(&path_param_context("/orders/ORD-9981/items/2"), &mocks).unwrap();
+        let result = find_matching_mock(
+            &path_param_context("/orders/ORD-9981/items/2"),
+            &mocks,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.path_params.get("id"), Some(&"ORD-9981".to_string()));
         assert_eq!(result.path_params.get("itemId"), Some(&"2".to_string()));
     }
@@ -2020,12 +2109,12 @@ mod tests {
             ),
         ]);
 
-        let result = find_matching_mock(&path_param_context("/users/42"), &mocks).unwrap();
+        let result = find_matching_mock(&path_param_context("/users/42"), &mocks, None).unwrap();
         assert_eq!(result.mock.response["source"], "exact");
         assert!(result.path_params.is_empty());
 
         // A different id has no exact mock, so the pattern still matches
-        let result = find_matching_mock(&path_param_context("/users/7"), &mocks).unwrap();
+        let result = find_matching_mock(&path_param_context("/users/7"), &mocks, None).unwrap();
         assert_eq!(result.mock.response["source"], "pattern");
         assert_eq!(result.path_params.get("id"), Some(&"7".to_string()));
     }
@@ -2040,7 +2129,7 @@ mod tests {
             )],
         )]);
 
-        assert!(find_matching_mock(&path_param_context("/posts/1"), &mocks).is_none());
+        assert!(find_matching_mock(&path_param_context("/posts/1"), &mocks, None).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -2061,6 +2150,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         }
     }
 
@@ -2087,7 +2177,7 @@ mod tests {
             let mut ctx =
                 RequestContext::new("GET".to_string(), format!("/cache-probe-once/{}", i));
             ctx.path_params = HashMap::new();
-            let result = find_matching_mock(&ctx, &mocks).expect("pattern should match");
+            let result = find_matching_mock(&ctx, &mocks, None).expect("pattern should match");
             assert_eq!(result.mock.response["source"], "pattern");
         }
 
@@ -2110,7 +2200,7 @@ mod tests {
         ]);
 
         let ctx = RequestContext::new("GET".to_string(), "/cache-probe-skip/42".to_string());
-        let result = find_matching_mock(&ctx, &mocks).expect("exact should match");
+        let result = find_matching_mock(&ctx, &mocks, None).expect("exact should match");
 
         assert_eq!(result.mock.response["source"], "exact");
         assert!(result.path_params.is_empty());
@@ -2138,7 +2228,7 @@ mod tests {
         // The exact key exists but its query matcher rejects the request, so
         // the pattern scan must still run.
         let ctx = RequestContext::new("GET".to_string(), "/cache-probe-fallthrough/42".to_string());
-        let result = find_matching_mock(&ctx, &mocks).expect("pattern should match");
+        let result = find_matching_mock(&ctx, &mocks, None).expect("pattern should match");
 
         assert_eq!(result.mock.response["source"], "pattern");
         assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
@@ -2201,8 +2291,8 @@ mod tests {
 
         let ctx = RequestContext::new("GET".to_string(), "/users/42".to_string());
 
-        let a = find_matching_mock(&ctx, &forward).expect("should match");
-        let b = find_matching_mock(&ctx, &reverse).expect("should match");
+        let a = find_matching_mock(&ctx, &forward, None).expect("should match");
+        let b = find_matching_mock(&ctx, &reverse, None).expect("should match");
 
         assert_eq!(a.matched_key, b.matched_key);
         assert_eq!(a.mock.response["source"], b.mock.response["source"]);
@@ -2221,8 +2311,8 @@ mod tests {
 
         let ctx = RequestContext::new("GET".to_string(), "/anything/42".to_string());
 
-        let a = find_matching_mock(&ctx, &forward).expect("should match");
-        let b = find_matching_mock(&ctx, &reverse).expect("should match");
+        let a = find_matching_mock(&ctx, &forward, None).expect("should match");
+        let b = find_matching_mock(&ctx, &reverse, None).expect("should match");
 
         assert_eq!(a.matched_key, b.matched_key);
         assert_eq!(a.mock.response["source"], "alpha");
@@ -2238,12 +2328,15 @@ mod tests {
         // fresh hasher seed.
         let winner = {
             let map = mock_map(vec![specific.clone(), generic.clone()]);
-            find_matching_mock(&ctx, &map).unwrap().matched_key
+            find_matching_mock(&ctx, &map, None).unwrap().matched_key
         };
 
         for _ in 0..25 {
             let map = mock_map(vec![specific.clone(), generic.clone()]);
-            assert_eq!(find_matching_mock(&ctx, &map).unwrap().matched_key, winner);
+            assert_eq!(
+                find_matching_mock(&ctx, &map, None).unwrap().matched_key,
+                winner
+            );
         }
     }
 
@@ -2365,6 +2458,7 @@ mod benches {
                     response_headers: None,
                     source: None,
                     sequence: None,
+                    tags: Vec::new(),
                 }],
             );
         }
@@ -2383,6 +2477,7 @@ mod benches {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -2390,7 +2485,7 @@ mod benches {
         let ctx = RequestContext::new("GET".to_string(), "/bench-exact".to_string());
         let start = Instant::now();
         for _ in 0..n {
-            assert!(find_matching_mock(&ctx, &mocks).is_some());
+            assert!(find_matching_mock(&ctx, &mocks, None).is_some());
         }
         println!(
             "exact match with 20 pattern routes loaded: {:?}/op",
@@ -2400,7 +2495,7 @@ mod benches {
         let ctx = RequestContext::new("GET".to_string(), "/bench19/42".to_string());
         let start = Instant::now();
         for _ in 0..n {
-            assert!(find_matching_mock(&ctx, &mocks).is_some());
+            assert!(find_matching_mock(&ctx, &mocks, None).is_some());
         }
         println!(
             "pattern match with 20 pattern routes loaded: {:?}/op",
@@ -2446,6 +2541,7 @@ mod explanation_tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         }
     }
 
@@ -2477,7 +2573,7 @@ mod explanation_tests {
     #[test]
     fn explain_no_match_reports_an_unregistered_route() {
         let mocks = store(vec![plain_mock("GET", "/users")]);
-        let explanation = explain_no_match(&ctx("GET", "/orders"), &mocks).unwrap();
+        let explanation = explain_no_match(&ctx("GET", "/orders"), &mocks, None).unwrap();
         assert!(
             explanation.contains("no mock is registered for `GET:/orders`"),
             "{}",
@@ -2492,7 +2588,7 @@ mod explanation_tests {
             plain_mock("POST", "/users"),
             plain_mock("PUT", "/users"),
         ]);
-        let explanation = explain_no_match(&ctx("GET", "/users"), &mocks).unwrap();
+        let explanation = explain_no_match(&ctx("GET", "/users"), &mocks, None).unwrap();
         assert!(explanation.contains("no mock is registered for `GET:/users`"));
         assert!(explanation.contains("POST"), "{}", explanation);
         assert!(explanation.contains("PUT"), "{}", explanation);
@@ -2509,7 +2605,8 @@ mod explanation_tests {
             HeaderValue::Exact("secret".to_string()),
         ));
 
-        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![mock])).unwrap();
+        let explanation =
+            explain_no_match(&ctx("GET", "/users"), &store(vec![mock]), None).unwrap();
         assert!(explanation.contains("1 candidate mock(s) for `GET:/users`"));
         assert!(
             explanation.contains("mocks/get_users.json"),
@@ -2536,7 +2633,7 @@ mod explanation_tests {
             .headers
             .insert("x-tenant".to_string(), "globex".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("header `x-tenant` was `globex`"),
             "{}",
@@ -2559,7 +2656,7 @@ mod explanation_tests {
             .headers
             .insert("x-debug".to_string(), "1".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("forbidden header `x-debug` was present"),
             "{}",
@@ -2577,7 +2674,8 @@ mod explanation_tests {
             strict: false,
         });
 
-        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![mock])).unwrap();
+        let explanation =
+            explain_no_match(&ctx("GET", "/users"), &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("required query param `page` was absent"),
             "{}",
@@ -2603,7 +2701,7 @@ mod explanation_tests {
             .query_params
             .insert("page".to_string(), "abc".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("query param `page` was `abc`"),
             "{}",
@@ -2621,7 +2719,8 @@ mod explanation_tests {
             strict: false,
         }));
 
-        let explanation = explain_no_match(&ctx("POST", "/login"), &store(vec![mock])).unwrap();
+        let explanation =
+            explain_no_match(&ctx("POST", "/login"), &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("requires a request body and none was sent"),
             "{}",
@@ -2642,7 +2741,7 @@ mod explanation_tests {
         context.body = Some(Bytes::from(r#"{"user":{"id":1}}"#));
         context.content_type = Some("application/json".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("missing the field `user.name`"),
             "{}",
@@ -2663,7 +2762,7 @@ mod explanation_tests {
         context.body = Some(Bytes::from(r#"{"role":"guest"}"#));
         context.content_type = Some("application/json".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("field `role` has a different value"),
             "{}",
@@ -2684,7 +2783,7 @@ mod explanation_tests {
         context.body = Some(Bytes::from("just a note"));
         context.content_type = Some("text/plain".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("does not contain `urgent`"),
             "{}",
@@ -2706,7 +2805,7 @@ mod explanation_tests {
         context.body = Some(Bytes::from("plan=free"));
         context.content_type = Some("application/x-www-form-urlencoded".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("form body field `plan` has a different value"),
             "{}",
@@ -2723,7 +2822,7 @@ mod explanation_tests {
         context.body = Some(Bytes::from("nope"));
         context.content_type = Some("text/plain".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("requires an empty body"),
             "{}",
@@ -2742,7 +2841,8 @@ mod explanation_tests {
             HeaderValue::Pattern(HeaderPattern::Any),
         ));
 
-        let explanation = explain_no_match(&ctx("GET", "/users/42"), &store(vec![mock])).unwrap();
+        let explanation =
+            explain_no_match(&ctx("GET", "/users/42"), &store(vec![mock]), None).unwrap();
         assert!(
             explanation.contains("mocks/get_user.json"),
             "{}",
@@ -2770,7 +2870,8 @@ mod explanation_tests {
             HeaderValue::Pattern(HeaderPattern::Any),
         ));
 
-        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![a, b])).unwrap();
+        let explanation =
+            explain_no_match(&ctx("GET", "/users"), &store(vec![a, b]), None).unwrap();
         assert!(
             explanation.starts_with("2 candidate mock(s)"),
             "{}",
@@ -2794,7 +2895,7 @@ mod explanation_tests {
             })
             .collect();
 
-        let explanation = explain_no_match(&ctx("GET", "/users"), &store(mocks)).unwrap();
+        let explanation = explain_no_match(&ctx("GET", "/users"), &store(mocks), None).unwrap();
         assert!(
             explanation.starts_with("8 candidate mock(s)"),
             "{}",
@@ -2812,7 +2913,8 @@ mod explanation_tests {
             HeaderValue::Pattern(HeaderPattern::Any),
         ));
 
-        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![mock])).unwrap();
+        let explanation =
+            explain_no_match(&ctx("GET", "/users"), &store(vec![mock]), None).unwrap();
         assert!(explanation.contains("`GET:/users` #0"), "{}", explanation);
     }
 
@@ -2832,7 +2934,7 @@ mod explanation_tests {
                 .headers
                 .insert(name.to_string(), "Bearer leaked-value".to_string());
 
-            let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+            let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
             assert!(
                 explanation.contains(name),
                 "the header name is still useful: {}",
@@ -2865,7 +2967,7 @@ mod explanation_tests {
             .headers
             .insert("authorization".to_string(), "Bearer nope".to_string());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             !explanation.contains("super-secret-token"),
             "{}",
@@ -2898,11 +3000,11 @@ mod explanation_tests {
         });
         let mocks = store(vec![mock]);
 
-        let first = explain_no_match(&ctx("GET", "/users"), &mocks).unwrap();
+        let first = explain_no_match(&ctx("GET", "/users"), &mocks, None).unwrap();
         for _ in 0..20 {
             assert_eq!(
                 first,
-                explain_no_match(&ctx("GET", "/users"), &mocks).unwrap()
+                explain_no_match(&ctx("GET", "/users"), &mocks, None).unwrap()
             );
         }
         assert!(first.contains("x-alpha"), "{}", first);
@@ -2920,7 +3022,7 @@ mod explanation_tests {
         let mut context = ctx("GET", "/users");
         context.headers.insert("x-long".to_string(), long.clone());
 
-        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_no_match(&context, &store(vec![mock]), None).unwrap();
         assert!(
             !explanation.contains(&long),
             "the full value was echoed back"
@@ -2954,7 +3056,7 @@ mod explanation_tests {
             .headers
             .insert("x-api-key".to_string(), "abc".to_string());
 
-        let result = find_matching_mock(&context, &store(vec![mock])).unwrap();
+        let result = find_matching_mock(&context, &store(vec![mock]), None).unwrap();
         let explanation = explain_match(&result);
 
         assert_eq!(result.score, 1050);
@@ -2971,7 +3073,8 @@ mod explanation_tests {
     #[test]
     fn explain_match_notes_the_path_pattern_penalty() {
         let mock = plain_mock("GET", "/users/:id");
-        let result = find_matching_mock(&ctx("GET", "/users/42"), &store(vec![mock])).unwrap();
+        let result =
+            find_matching_mock(&ctx("GET", "/users/42"), &store(vec![mock]), None).unwrap();
         let explanation = explain_match(&result);
 
         assert_eq!(result.score, 900);
@@ -3006,7 +3109,7 @@ mod explanation_tests {
         context.body = Some(Bytes::from("{}"));
         context.content_type = Some("application/json".to_string());
 
-        let result = find_matching_mock(&context, &store(vec![mock])).unwrap();
+        let result = find_matching_mock(&context, &store(vec![mock]), None).unwrap();
         assert_eq!(result.breakdown.total(), result.score);
         assert_eq!(result.score, 1000 + 100 + 50 + 500);
     }
@@ -3067,5 +3170,235 @@ mod explanation_tests {
             calculate_match_score(&present, &mock).map(|b| b.total()),
             Some(1050)
         );
+    }
+}
+
+// ============================================================================
+// Scenario tag filtering (#62)
+// ============================================================================
+
+#[cfg(test)]
+mod scenario_tests {
+    use super::*;
+    use crate::types::{BodyMatcher, MockConfig};
+
+    fn mock(method: &str, path: &str, marker: &str, tags: &[&str]) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: serde_json::json!({"source": marker}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            source: None,
+            sequence: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    fn store(mocks: Vec<MockConfig>) -> HashMap<String, Vec<MockConfig>> {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for m in mocks {
+            let key = crate::types::create_mock_key(&m.method, &m.path);
+            map.entry(key).or_default().push(m);
+        }
+        map
+    }
+
+    fn active(tags: &[&str]) -> HashSet<String> {
+        tags.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn ctx(method: &str, path: &str) -> RequestContext {
+        RequestContext::new(method.to_string(), path.to_string())
+    }
+
+    #[test]
+    fn untagged_mocks_match_regardless_of_the_active_scenario() {
+        let mocks = store(vec![mock("GET", "/users", "plain", &[])]);
+
+        for tags in [None, Some(active(&["anything"])), Some(HashSet::new())] {
+            let result = find_matching_mock(&ctx("GET", "/users"), &mocks, tags.as_ref())
+                .expect("untagged mocks are always matchable");
+            assert_eq!(result.mock.response["source"], "plain");
+        }
+    }
+
+    #[test]
+    fn a_tagged_mock_matches_only_while_one_of_its_tags_is_active() {
+        let mocks = store(vec![mock("POST", "/checkout", "boom", &["error-scenario"])]);
+
+        // No filter at all: tags are inert, exactly as before this feature.
+        assert!(find_matching_mock(&ctx("POST", "/checkout"), &mocks, None).is_some());
+
+        let on = active(&["error-scenario"]);
+        assert!(find_matching_mock(&ctx("POST", "/checkout"), &mocks, Some(&on)).is_some());
+
+        let off = active(&["happy-path"]);
+        assert!(
+            find_matching_mock(&ctx("POST", "/checkout"), &mocks, Some(&off)).is_none(),
+            "an inactive mock must 404 as if it weren't loaded"
+        );
+    }
+
+    #[test]
+    fn switching_tags_switches_which_mock_serves_a_path() {
+        let mocks = store(vec![
+            mock("POST", "/checkout", "ok", &["happy-path"]),
+            mock("POST", "/checkout", "boom", &["error-scenario"]),
+        ]);
+
+        let happy = find_matching_mock(
+            &ctx("POST", "/checkout"),
+            &mocks,
+            Some(&active(&["happy-path"])),
+        )
+        .expect("happy-path mock is active");
+        assert_eq!(happy.mock.response["source"], "ok");
+        assert_eq!(happy.index, 0);
+
+        let error = find_matching_mock(
+            &ctx("POST", "/checkout"),
+            &mocks,
+            Some(&active(&["error-scenario"])),
+        )
+        .expect("error-scenario mock is active");
+        assert_eq!(error.mock.response["source"], "boom");
+        // The index still points at the mock's real position in its bucket, so
+        // sequence counters and hit counts stay keyed to the right mock.
+        assert_eq!(error.index, 1);
+    }
+
+    #[test]
+    fn an_inactive_mock_falls_through_to_its_untagged_sibling() {
+        let mocks = store(vec![
+            mock("GET", "/users", "default", &[]),
+            mock("GET", "/users", "chaos", &["error-scenario"]),
+        ]);
+
+        let result = find_matching_mock(
+            &ctx("GET", "/users"),
+            &mocks,
+            Some(&active(&["happy-path"])),
+        )
+        .expect("the untagged mock is still matchable");
+        assert_eq!(result.mock.response["source"], "default");
+    }
+
+    #[test]
+    fn tag_filtering_applies_to_pattern_routes_too() {
+        let mocks = store(vec![mock(
+            "GET",
+            "/users/:id",
+            "pattern",
+            &["error-scenario"],
+        )]);
+
+        assert!(find_matching_mock(&ctx("GET", "/users/42"), &mocks, None).is_some());
+        assert!(find_matching_mock(
+            &ctx("GET", "/users/42"),
+            &mocks,
+            Some(&active(&["error-scenario"]))
+        )
+        .is_some());
+        assert!(find_matching_mock(
+            &ctx("GET", "/users/42"),
+            &mocks,
+            Some(&active(&["happy-path"]))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_inactive_exact_mock_falls_through_to_an_active_pattern_route() {
+        let mocks = store(vec![
+            mock("GET", "/users/42", "exact", &["error-scenario"]),
+            mock("GET", "/users/:id", "pattern", &[]),
+        ]);
+
+        let result = find_matching_mock(
+            &ctx("GET", "/users/42"),
+            &mocks,
+            Some(&active(&["happy-path"])),
+        )
+        .expect("the pattern route should serve the request");
+        assert_eq!(result.mock.response["source"], "pattern");
+        assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn requires_body_ignores_mocks_the_scenario_hides() {
+        let mut hungry = mock("POST", "/checkout", "boom", &["error-scenario"]);
+        hungry.body = Some(BodyMatcher::Any);
+        let mocks = store(vec![mock("POST", "/checkout", "ok", &[]), hungry]);
+
+        // With the tagged mock active, its body matcher forces a body read.
+        assert!(requires_body(
+            "POST",
+            "/checkout",
+            &mocks,
+            Some(&active(&["error-scenario"]))
+        ));
+
+        // Hidden by the scenario, it has no say — the untagged mock left
+        // standing doesn't want the body, so `consume_body: false` holds.
+        assert!(!requires_body(
+            "POST",
+            "/checkout",
+            &mocks,
+            Some(&active(&["happy-path"]))
+        ));
+    }
+
+    #[test]
+    fn requires_body_reads_the_body_when_every_candidate_is_hidden() {
+        // Nothing matchable is left, so the request is heading for a 404 and
+        // its body is worth capturing for the request log.
+        let mocks = store(vec![mock("POST", "/checkout", "boom", &["error-scenario"])]);
+        assert!(requires_body(
+            "POST",
+            "/checkout",
+            &mocks,
+            Some(&active(&["happy-path"]))
+        ));
+    }
+
+    #[test]
+    fn explain_no_match_names_the_scenario_as_the_reason() {
+        let mocks = store(vec![mock("POST", "/checkout", "boom", &["error-scenario"])]);
+
+        let explanation = explain_no_match(
+            &ctx("POST", "/checkout"),
+            &mocks,
+            Some(&active(&["happy-path"])),
+        )
+        .expect("a filtered-out mock is worth explaining");
+
+        assert!(
+            explanation.contains("1 mock(s) match") && explanation.contains("inactive tags"),
+            "unhelpful explanation: {}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_ignores_hidden_mocks_that_would_not_have_matched_anyway() {
+        // Right path, wrong method: the tagged mock is hidden *and* irrelevant,
+        // so the explanation should stay the "wrong method" one.
+        let mocks = store(vec![mock("POST", "/checkout", "boom", &["error-scenario"])]);
+
+        let explanation = explain_no_match(
+            &ctx("GET", "/checkout"),
+            &mocks,
+            Some(&active(&["happy-path"])),
+        )
+        .expect("an unregistered route is always explained");
+
+        assert!(!explanation.contains("inactive tags"), "{}", explanation);
+        assert!(explanation.contains("POST"), "{}", explanation);
     }
 }

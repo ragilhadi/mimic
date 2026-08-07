@@ -557,6 +557,7 @@ pub fn generate_mocks(
                         response_headers: None,
                         source: None,
                         sequence: None,
+                        tags: Vec::new(),
                     },
                 ));
             }
@@ -1651,7 +1652,7 @@ paths:
         // A concrete request against the generated path-parameter mock.
         let context =
             crate::matcher::RequestContext::new("GET".to_string(), "/users/42".to_string());
-        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks)
+        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks, None)
             .expect("generated path-parameter mock should match /users/42");
 
         assert_eq!(matched.mock.path, "/users/:id");
@@ -1703,7 +1704,7 @@ paths:
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         let context =
             crate::matcher::RequestContext::new("GET".to_string(), "/users/42".to_string());
-        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks).unwrap();
+        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks, None).unwrap();
 
         assert_eq!(matched.mock.status, 404);
         assert_eq!(matched.mock.response, json!({"error": "not found"}));
@@ -1728,7 +1729,7 @@ paths:
         let context =
             crate::matcher::RequestContext::new("GET".to_string(), "/users/7".to_string());
 
-        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks)
+        let matched = crate::matcher::find_matching_mock(&context, &loaded.mocks, None)
             .expect("brace-style mock should match too");
         assert_eq!(matched.mock.path, "/users/{id}");
     }

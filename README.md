@@ -22,6 +22,7 @@
 - **Dynamic Response Templating** - Echo path, query, header, and body fields back into responses with `{{path.x}}` syntax
 - **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
 - **OpenAPI Import** - Generate a whole mocks directory from an OpenAPI 3.x spec with `mimic import-openapi ./spec.yaml`
+- **Scenario Tags** - Keep happy-path and error mocks side by side and switch between them with `MIMIC_ACTIVE_TAGS` or `POST /admin/scenario`
 - **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
 
 ---
@@ -120,6 +121,10 @@ MIMIC_MAX_LOG_ENTRIES=1000
 # How much of each request/response body the log stores, in bytes
 # (default: 65536 = 64 KB, 0 = store whole bodies)
 MIMIC_MAX_RECORDED_BODY=65536
+
+# Scenario tags active at startup, comma-separated (default: unset = all
+# mocks matchable). See "Tagged Mock Groups" below.
+MIMIC_ACTIVE_TAGS=happy-path,smoke-test
 ```
 
 **Log Levels**:
@@ -841,6 +846,104 @@ curl -X POST "http://localhost:8080/admin/sequences/reset?path=/api/submit"
 
 ---
 
+## 🏷️ Tagged Mock Groups (Scenarios)
+
+One `mocks/` directory can hold **both** your happy-path mocks and your error
+mocks. Tag them, and switch which set is live per CI job or per test run — no
+file editing, no second directory, no restart.
+
+```json
+{
+  "method": "POST",
+  "path": "/checkout",
+  "status": 500,
+  "tags": ["error-scenario"],
+  "response": { "error": "internal error" }
+}
+```
+
+```bash
+# mocks/checkout_ok.json   → "tags": ["happy-path"]
+# mocks/checkout_500.json  → "tags": ["error-scenario"]
+
+MIMIC_ACTIVE_TAGS=happy-path mimic     # only checkout_ok.json is matchable
+```
+
+### Rules
+
+- **A mock with no `tags` is always matchable.** Existing mock files need zero
+  changes, and a server started without `MIMIC_ACTIVE_TAGS` behaves exactly as
+  it did before this feature existed.
+- **`MIMIC_ACTIVE_TAGS` unset or empty means no filtering** — every mock,
+  tagged or not, is matchable.
+- A tagged mock is matchable **while at least one of its tags is active**.
+- Tags are matched **exactly and case-sensitively**; whitespace around a tag in
+  the comma-separated list is trimmed (`happy-path, smoke-test` is two tags).
+- An inactive mock **404s as if it were not loaded**. Requests fall through to
+  whatever else can serve the path — an untagged mock, or a `/users/:id`
+  pattern route.
+- Tag filtering **does not touch sequence counters**: they are keyed per mock,
+  so switching scenarios and back resumes a sequence where it left off rather
+  than restarting it.
+- With **no filter active**, two mocks tagged for opposite scenarios on the
+  same path are *both* matchable and one of them wins — so set
+  `MIMIC_ACTIVE_TAGS` (or `POST /admin/scenario`) whenever you keep competing
+  scenarios side by side.
+
+### Switching at runtime
+
+```bash
+# What's active right now?
+curl http://localhost:8080/admin/scenario
+```
+
+```json
+{
+  "active_tags": ["happy-path"],
+  "filtering": true,
+  "known_tags": ["error-scenario", "happy-path"],
+  "matchable_mocks": 12,
+  "total_mocks": 14
+}
+```
+
+```bash
+# Switch scenarios — takes effect on the next request, no restart
+curl -X POST http://localhost:8080/admin/scenario \
+  -d '{"tags": ["error-scenario"]}'
+
+# Turn filtering off again: every mock becomes matchable
+curl -X POST http://localhost:8080/admin/scenario -d '{"tags": []}'
+```
+
+`POST /admin/scenario` **replaces** the active set (it is not additive) and
+returns the same body `GET` does. A tag entry may itself be a comma-separated
+list, so `{"tags": ["a,b"]}` and `{"tags": ["a", "b"]}` are equivalent. A body
+that isn't valid JSON is answered `400` and leaves the current scenario alone.
+
+### Testing an error path
+
+```bash
+MIMIC_ACTIVE_TAGS=happy-path mimic &
+
+curl -X POST http://localhost:8080/checkout    # 200 {"order_id": "..."}
+
+curl -X POST http://localhost:8080/admin/scenario -d '{"tags": ["error-scenario"]}'
+
+curl -X POST http://localhost:8080/checkout    # 500 {"error": "internal error"}
+```
+
+### Observability
+
+- `/admin/mocks` reports each mock's `tags` and an `active` flag, so a mock
+  that is loaded but currently filtered out is obvious.
+- A 404 caused by an inactive mock records *"N mock(s) match `POST:/checkout`
+  but are filtered out by inactive tags"* in the request log and the debug log.
+  The 404 **response body is unchanged** — scenario configuration is never
+  leaked to API clients.
+
+---
+
 ## 🧬 Dynamic Response Templating
 
 Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax inside any string value in `response` (or a sequence step's `response`) to echo back data from the incoming request — no custom code required.
@@ -1342,7 +1445,7 @@ curl http://localhost:8080/health
   "mocks_loaded": 5,
   "mock_count": 7,
   "service": "mimic",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "uptime_seconds": 4021,
   "port": 8080,
   "max_body_size": 10485760,
@@ -1490,9 +1593,11 @@ DELETE /admin/requests          # Clear recorded requests
 GET    /admin/mocks             # List every loaded mock, with matchers and hit counts
 GET    /admin/sequences         # Current step of every in-progress sequence
 POST   /admin/sequences/reset   # Reset sequence counters (optional: ?path=/api/submit)
+GET    /admin/scenario          # Which scenario tags are currently active
+POST   /admin/scenario          # Replace the active tag set (body: {"tags": [...]})
 ```
 
-All admin endpoints are read-only apart from the two that say otherwise, and
+All admin endpoints are read-only apart from the ones that say otherwise, and
 all return JSON — the dashboard is just one client of them.
 
 ##### `GET /admin/requests`
@@ -1554,6 +1659,8 @@ existing consumers of this endpoint keep working unchanged.
       "response_headers": 1,
       "consume_body": false,
       "hits": 4,
+      "tags": [],
+      "active": true,
       "config": { "method": "GET", "path": "/users/:id", "status": 200, "response": {} }
     }
   ]
@@ -1564,7 +1671,9 @@ existing consumers of this endpoint keep working unchanged.
 from disk. `config` is the full `MockConfig`. `hits` counts requests served by
 that specific mock, so two mocks sharing a path stay distinguishable. The
 endpoint reads through the same lock hot reload writes to, so it always reflects
-the mock set currently serving.
+the mock set currently serving. `tags` and `active` describe the mock's
+[scenario](#-tagged-mock-groups-scenarios) membership — `active: false` means
+the mock is loaded but filtered out by the current scenario, and so unmatchable.
 
 ##### `GET /admin/sequences`
 
@@ -1594,6 +1703,35 @@ Returns the number of counters that were reset:
 ```json
 { "reset": 2 }
 ```
+
+##### `GET /admin/scenario`
+
+```json
+{
+  "active_tags": ["happy-path"],
+  "filtering": true,
+  "known_tags": ["error-scenario", "happy-path"],
+  "matchable_mocks": 12,
+  "total_mocks": 14
+}
+```
+
+`known_tags` is every tag declared by a loaded mock. `filtering` is `false`
+(and `active_tags` empty) when no scenario filter is configured, i.e. every
+mock is matchable.
+
+##### `POST /admin/scenario`
+
+Replaces the active tag set and returns the same body as the `GET`:
+
+```bash
+curl -X POST http://localhost:8080/admin/scenario -d '{"tags": ["error-scenario"]}'
+```
+
+The body is read as JSON regardless of `Content-Type`, so plain `curl -d` works.
+`{"tags": []}` clears the filter; a malformed body is a `400` and leaves the
+current scenario untouched. See
+[Tagged Mock Groups](#-tagged-mock-groups-scenarios).
 
 #### Mock Endpoints
 

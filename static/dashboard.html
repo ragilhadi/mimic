@@ -561,11 +561,23 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     return html;
   }
 
+  // Scenario tags, plus an explicit marker when the active scenario has
+  // filtered this mock out — "loaded but unmatchable" is otherwise invisible.
+  function tagBadges(m){
+    var tags = m.tags || [];
+    if(!tags.length) return '';
+    var html = tags.map(function(t){
+      return '<span class="badge'+(m.active===false?'':' badge-on')+'">'+escapeHtml(t)+'</span>';
+    }).join('');
+    if(m.active === false) html += '<span class="badge" title="filtered out by the active scenario">inactive</span>';
+    return ' ' + html;
+  }
+
   function renderMocks(){
     var needle = qs('mock-search').value.trim().toLowerCase();
     var list = mocksCache.filter(function(m){
       if(!needle) return true;
-      return (m.path+' '+m.method+' '+(m.source||'')).toLowerCase().indexOf(needle) !== -1;
+      return (m.path+' '+m.method+' '+(m.source||'')+' '+(m.tags||[]).join(' ')).toLowerCase().indexOf(needle) !== -1;
     });
     qs('stat-mocks').textContent = mocksCache.length;
     qs('stat-hits').textContent = mocksCache.reduce(function(a,m){ return a + (m.hits||0); }, 0);
@@ -588,7 +600,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
       var source = m.source ? '<span class="mono">'+escapeHtml(m.source)+'</span>' : dash();
       html += '<tbody data-mock="'+i+'"><tr>'
         + '<td><span class="'+methodClass(m.method)+'">'+escapeHtml(m.method)+'</span></td>'
-        + '<td class="path-cell">'+escapeHtml(m.path)+'</td>'
+        + '<td class="path-cell">'+escapeHtml(m.path)+tagBadges(m)+'</td>'
         + '<td><span class="status '+statusClass(m.status)+'">'+m.status+'</span></td>'
         + '<td>'+matcherBadges(m)+'</td>'
         + '<td>'+escapeHtml(delay)+'</td>'
