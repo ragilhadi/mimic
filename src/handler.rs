@@ -4,8 +4,8 @@ use crate::matcher::{
 };
 use crate::template::{render_response, TemplateContext};
 use crate::types::{
-    is_sensitive_header, MockConfig, MockStore, RequestLog, RequestRecord, SequenceCounters,
-    SequenceStep,
+    is_sensitive_header, parse_active_tags, ActiveTags, MockConfig, MockStore, RequestLog,
+    RequestRecord, SequenceCounters, SequenceStep,
 };
 use axum::{
     body::Body,
@@ -18,7 +18,7 @@ use chrono::Utc;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -37,10 +37,23 @@ pub struct AppState {
     pub mock_hits: MockHits,
     /// When the process started serving, surfaced as uptime by `/health`
     pub started_at: std::time::Instant,
+    /// Which scenario tags are active, or `None` for "no filter" — the
+    /// default. Read on every request, rewritten by `POST /admin/scenario`.
+    pub active_tags: ActiveTags,
 }
 
 impl AppState {
+    /// State with no scenario filter: every loaded mock is matchable.
+    // The server itself goes through `with_active_tags` so `MIMIC_ACTIVE_TAGS`
+    // is honored; this stays as the no-scenario constructor tests build on.
+    #[allow(dead_code)]
     pub fn new(mocks: MockStore) -> Self {
+        Self::with_active_tags(mocks, None)
+    }
+
+    /// [`AppState::new`] with a starting scenario selection, as
+    /// `MIMIC_ACTIVE_TAGS` provides at startup.
+    pub fn with_active_tags(mocks: MockStore, active_tags: Option<HashSet<String>>) -> Self {
         Self {
             mocks,
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -48,6 +61,7 @@ impl AppState {
             sequence_counters: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             mock_hits: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             started_at: std::time::Instant::now(),
+            active_tags: Arc::new(tokio::sync::RwLock::new(active_tags)),
         }
     }
 }
@@ -180,6 +194,17 @@ pub fn configured_port() -> u16 {
         .unwrap_or(8080)
 }
 
+/// Environment variable selecting the scenario active at startup.
+pub const ACTIVE_TAGS_ENV: &str = "MIMIC_ACTIVE_TAGS";
+
+/// The scenario the server starts in, read from `MIMIC_ACTIVE_TAGS`
+/// (comma-separated). Unset, empty, or all-whitespace means no filter, i.e.
+/// every mock is matchable — the behavior of every Mimic before scenarios
+/// existed.
+pub fn configured_active_tags() -> Option<HashSet<String>> {
+    parse_active_tags(std::env::var(ACTIVE_TAGS_ENV).ok())
+}
+
 pub async fn handle_request(
     method: Method,
     uri: Uri,
@@ -204,12 +229,18 @@ pub async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // The scenario selection is snapshotted once, up front, so every decision
+    // this request makes — whether to read the body, which mock wins, why
+    // nothing did — is taken against the same set of active tags even if
+    // `POST /admin/scenario` lands halfway through.
+    let active_tags = state.active_tags.read().await.clone();
+
     // Decide whether to read the body, scoped to the mocks that could actually
     // serve this method+path — a `body` matcher or `consume_body: true` on some
     // *other* endpoint is none of this request's business (acquire read lock)
     let needs_body = {
         let mocks = state.mocks.read().await;
-        requires_body(&method_str, &path, &mocks)
+        requires_body(&method_str, &path, &mocks, active_tags.as_ref())
     };
 
     // The body is wrapped in `Limited` so the stream is cut off — and the
@@ -256,7 +287,7 @@ pub async fn handle_request(
 
     // Find matching mock using the matcher (acquire read lock)
     let mocks = state.mocks.read().await;
-    let matched = find_matching_mock(&context, &mocks);
+    let matched = find_matching_mock(&context, &mocks, active_tags.as_ref());
     // Release read lock before any await (counter lock, recording, delay)
     drop(mocks);
 
@@ -366,7 +397,7 @@ pub async fn handle_request(
             // for.
             let explanation = {
                 let mocks = state.mocks.read().await;
-                explain_no_match(&context, &mocks)
+                explain_no_match(&context, &mocks, active_tags.as_ref())
             };
             if let Some(ref why) = explanation {
                 debug!("No match for {} {}: {}", method_str, path, why);
@@ -651,7 +682,13 @@ pub async fn list_requests(
 }
 
 /// One loaded mock as `/admin/mocks` reports it.
-fn describe_mock_entry(key: &str, index: usize, mock: &MockConfig, hits: u64) -> serde_json::Value {
+fn describe_mock_entry(
+    key: &str,
+    index: usize,
+    mock: &MockConfig,
+    hits: u64,
+    active_tags: Option<&HashSet<String>>,
+) -> serde_json::Value {
     json!({
         "key": key,
         "index": index,
@@ -670,6 +707,11 @@ fn describe_mock_entry(key: &str, index: usize, mock: &MockConfig, hits: u64) ->
         "response_headers": mock.response_headers.as_ref().map_or(0, |h| h.len()),
         "consume_body": mock.consume_body,
         "hits": hits,
+        // Scenario tags, plus whether the current scenario lets this mock be
+        // matched at all — an inactive mock is loaded but answers nothing,
+        // which is otherwise indistinguishable from a broken matcher.
+        "tags": mock.tags,
+        "active": mock.is_active(active_tags),
         // The whole config, so the dashboard's expand-a-row can show what the
         // file says without a second round trip
         "config": mock,
@@ -684,6 +726,7 @@ fn describe_mock_entry(key: &str, index: usize, mock: &MockConfig, hits: u64) ->
 pub async fn list_mocks(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mocks = state.mocks.read().await;
     let hits = state.mock_hits.read().await;
+    let active_tags = state.active_tags.read().await;
 
     let mut keys: Vec<&String> = mocks.keys().collect();
     keys.sort();
@@ -695,7 +738,13 @@ pub async fn list_mocks(State(state): State<AppState>) -> Json<serde_json::Value
                 .get(&format!("{}#{}", key, index))
                 .copied()
                 .unwrap_or(0);
-            entries.push(describe_mock_entry(key, index, mock, hit_count));
+            entries.push(describe_mock_entry(
+                key,
+                index,
+                mock,
+                hit_count,
+                active_tags.as_ref(),
+            ));
         }
     }
 
@@ -749,6 +798,104 @@ pub async fn list_sequences(State(state): State<AppState>) -> Json<serde_json::V
         "count": sequences.len(),
         "sequences": sequences,
     }))
+}
+
+// ============================================================================
+// Scenario (tagged mock group) endpoints
+// ============================================================================
+
+/// The `/admin/scenario` payload, shared by the GET and the POST so a caller
+/// that just switched scenarios sees exactly what a subsequent GET would say.
+///
+/// `active_tags` is empty and `filtering` false when no filter is configured,
+/// which is also what `POST {"tags": []}` produces — the two ways of saying
+/// "everything is matchable" have one representation.
+async fn scenario_snapshot(state: &AppState) -> serde_json::Value {
+    let active = state.active_tags.read().await;
+    let mocks = state.mocks.read().await;
+
+    let mut active_tags: Vec<String> = active.iter().flatten().cloned().collect();
+    active_tags.sort();
+
+    let mut known_tags: Vec<String> = mocks
+        .values()
+        .flatten()
+        .flat_map(|mock| mock.tags.iter().cloned())
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect();
+    known_tags.sort();
+
+    let all_mocks: Vec<&MockConfig> = mocks.values().flatten().collect();
+    let matchable = all_mocks
+        .iter()
+        .filter(|mock| mock.is_active(active.as_ref()))
+        .count();
+
+    json!({
+        "active_tags": active_tags,
+        "filtering": active.is_some(),
+        "known_tags": known_tags,
+        "matchable_mocks": matchable,
+        "total_mocks": all_mocks.len(),
+    })
+}
+
+/// `GET /admin/scenario` — which scenario tags are active right now.
+pub async fn get_scenario(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(scenario_snapshot(&state).await)
+}
+
+/// Body of `POST /admin/scenario`.
+#[derive(Deserialize, Default)]
+pub struct ScenarioRequest {
+    /// The tags to activate. Each entry may itself be a comma-separated list,
+    /// so `["a,b"]` and `["a", "b"]` mean the same thing — the env var's
+    /// syntax works here too. An empty list clears the filter.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// `POST /admin/scenario` — replace the active tag set, no restart needed.
+///
+/// The body is parsed from raw bytes rather than through the `Json` extractor
+/// so a plain `curl -d '{"tags": [...]}'` works: curl defaults to a form
+/// content type, and rejecting that with a 415 would make the documented
+/// one-liner fail for no good reason.
+pub async fn set_scenario(State(state): State<AppState>, body: Bytes) -> Response {
+    let request: ScenarioRequest = if body.is_empty() {
+        ScenarioRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid scenario request",
+                        "detail": e.to_string(),
+                        "expected": {"tags": ["tag-name"]},
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    {
+        let mut active = state.active_tags.write().await;
+        *active = parse_active_tags(request.tags);
+        match active.as_ref() {
+            Some(tags) => {
+                let mut names: Vec<&str> = tags.iter().map(String::as_str).collect();
+                names.sort();
+                info!("Scenario switched: active tags = {}", names.join(", "));
+            }
+            None => info!("Scenario cleared: all mocks matchable"),
+        }
+    }
+
+    Json(scenario_snapshot(&state).await).into_response()
 }
 
 pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
@@ -898,6 +1045,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -916,6 +1064,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -934,6 +1083,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1101,6 +1251,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1145,6 +1296,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1199,6 +1351,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1251,6 +1404,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1304,6 +1458,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1348,6 +1503,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1409,6 +1565,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1461,6 +1618,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1501,6 +1659,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1536,6 +1695,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1593,6 +1753,7 @@ mod tests {
                     delay_ms: None,
                     repeat: true,
                 }]),
+                tags: Vec::new(),
             }],
         );
 
@@ -1633,6 +1794,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1690,6 +1852,7 @@ mod tests {
                     delay_ms: None,
                     repeat: true,
                 }]),
+                tags: Vec::new(),
             }],
         );
 
@@ -1738,6 +1901,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1790,6 +1954,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1829,6 +1994,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1864,6 +2030,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
         mocks.insert(
@@ -1881,6 +2048,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -1946,6 +2114,7 @@ mod tests {
                         repeat: true,
                     },
                 ]),
+                tags: Vec::new(),
             }],
         );
 
@@ -1996,6 +2165,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -2042,6 +2212,7 @@ mod tests {
                     response_headers: None,
                     source: None,
                     sequence: None,
+                    tags: Vec::new(),
                 },
                 MockConfig {
                     method: "POST".to_string(),
@@ -2060,6 +2231,7 @@ mod tests {
                     response_headers: None,
                     source: None,
                     sequence: None,
+                    tags: Vec::new(),
                 },
             ],
         );
@@ -2338,6 +2510,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: Some(steps),
+            tags: Vec::new(),
         }
     }
 
@@ -2494,6 +2667,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: Some(steps),
+            tags: Vec::new(),
         };
         let mocks = HashMap::from([(
             "POST:/login".to_string(),
@@ -3001,6 +3175,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         }
     }
 
@@ -3118,6 +3293,7 @@ mod tests {
             response_headers: None,
             source: source.map(|s| s.to_string()),
             sequence: None,
+            tags: Vec::new(),
         }
     }
 
@@ -3905,6 +4081,310 @@ mod tests {
             "data-tab=\"sequences\"",
         ] {
             assert!(html.contains(needle), "dashboard is missing {}", needle);
+        }
+    }
+}
+
+// ============================================================================
+// Scenario endpoint tests (#62)
+// ============================================================================
+
+#[cfg(test)]
+mod scenario_tests {
+    use super::*;
+    use crate::types::{MockConfig, SequenceStep};
+    use axum::http::Method;
+    use http_body_util::BodyExt;
+
+    fn mock(method: &str, path: &str, marker: &str, tags: &[&str]) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: json!({"source": marker}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            source: None,
+            sequence: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    fn state_with(mocks: Vec<MockConfig>, active: Option<&[&str]>) -> AppState {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for m in mocks {
+            let key = crate::types::create_mock_key(&m.method, &m.path);
+            map.entry(key).or_default().push(m);
+        }
+        AppState::with_active_tags(
+            Arc::new(tokio::sync::RwLock::new(map)),
+            active.map(|tags| tags.iter().map(|t| t.to_string()).collect()),
+        )
+    }
+
+    /// Two mocks on one path, told apart by scenario — the setup from the
+    /// issue: a happy-path checkout and its 500 counterpart.
+    fn checkout_state(active: Option<&[&str]>) -> AppState {
+        state_with(
+            vec![
+                mock("POST", "/checkout", "ok", &["happy-path"]),
+                mock("POST", "/checkout", "boom", &["error-scenario"]),
+            ],
+            active,
+        )
+    }
+
+    async fn get(state: &AppState, path: &str) -> (StatusCode, serde_json::Value) {
+        request(state, Method::GET, path).await
+    }
+
+    async fn request(
+        state: &AppState,
+        method: Method,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = handle_request(
+            method,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (parts.status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post_scenario(state: &AppState, body: &str) -> (StatusCode, serde_json::Value) {
+        let response = set_scenario(State(state.clone()), Bytes::from(body.to_string())).await;
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (parts.status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    // ── GET /admin/scenario ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scenario_defaults_to_no_filtering() {
+        let state = checkout_state(None);
+        let Json(body) = get_scenario(State(state)).await;
+
+        assert_eq!(body["filtering"], false);
+        assert_eq!(body["active_tags"], json!([]));
+        assert_eq!(body["known_tags"], json!(["error-scenario", "happy-path"]));
+        assert_eq!(body["matchable_mocks"], 2);
+        assert_eq!(body["total_mocks"], 2);
+    }
+
+    #[tokio::test]
+    async fn scenario_reports_the_startup_selection() {
+        let state = checkout_state(Some(&["happy-path"]));
+        let Json(body) = get_scenario(State(state)).await;
+
+        assert_eq!(body["filtering"], true);
+        assert_eq!(body["active_tags"], json!(["happy-path"]));
+        assert_eq!(body["matchable_mocks"], 1);
+    }
+
+    // ── POST /admin/scenario ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn posting_tags_replaces_the_active_set() {
+        let state = checkout_state(Some(&["happy-path"]));
+
+        let (status, body) = post_scenario(&state, r#"{"tags": ["error-scenario"]}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["active_tags"], json!(["error-scenario"]));
+
+        // A follow-up GET agrees with what the POST reported.
+        let Json(after) = get_scenario(State(state)).await;
+        assert_eq!(after["active_tags"], json!(["error-scenario"]));
+    }
+
+    #[tokio::test]
+    async fn posting_an_empty_list_clears_the_filter() {
+        let state = checkout_state(Some(&["happy-path"]));
+
+        let (status, body) = post_scenario(&state, r#"{"tags": []}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["filtering"], false);
+        assert_eq!(body["matchable_mocks"], 2);
+    }
+
+    #[tokio::test]
+    async fn posting_a_comma_separated_tag_works_like_the_env_var() {
+        let state = checkout_state(None);
+
+        let (_, body) = post_scenario(&state, r#"{"tags": ["happy-path, error-scenario"]}"#).await;
+        assert_eq!(body["active_tags"], json!(["error-scenario", "happy-path"]));
+    }
+
+    #[tokio::test]
+    async fn posting_malformed_json_is_a_400_and_leaves_the_scenario_alone() {
+        let state = checkout_state(Some(&["happy-path"]));
+
+        let (status, body) = post_scenario(&state, "not json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid scenario request");
+
+        let Json(after) = get_scenario(State(state)).await;
+        assert_eq!(after["active_tags"], json!(["happy-path"]));
+    }
+
+    // ── End to end: switching scenarios changes what is served ──────────
+
+    #[tokio::test]
+    async fn switching_scenarios_switches_the_served_mock_without_a_restart() {
+        let state = checkout_state(Some(&["happy-path"]));
+
+        let (status, body) = request(&state, Method::POST, "/checkout").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "ok");
+
+        post_scenario(&state, r#"{"tags": ["error-scenario"]}"#).await;
+
+        let (status, body) = request(&state, Method::POST, "/checkout").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "boom");
+    }
+
+    #[tokio::test]
+    async fn an_inactive_mock_404s_as_if_it_were_not_loaded() {
+        let state = state_with(
+            vec![mock("POST", "/checkout", "boom", &["error-scenario"])],
+            Some(&["happy-path"]),
+        );
+
+        let (status, body) = request(&state, Method::POST, "/checkout").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "mock not found");
+        // The 404 body is the same one an unregistered path gets: scenario
+        // configuration is not leaked to API clients.
+        assert!(body.get("tags").is_none());
+        assert!(!body.to_string().contains("error-scenario"));
+
+        // The reason is available to operators through the request log.
+        let log = state.request_log.read().await;
+        let explanation = log[0].match_explanation.as_deref().unwrap_or_default();
+        assert!(explanation.contains("inactive tags"), "{}", explanation);
+    }
+
+    #[tokio::test]
+    async fn untagged_mocks_are_unaffected_by_any_scenario() {
+        let state = state_with(vec![mock("GET", "/users", "plain", &[])], Some(&["chaos"]));
+
+        let (status, body) = get(&state, "/users").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "plain");
+
+        post_scenario(&state, r#"{"tags": ["anything-else"]}"#).await;
+
+        let (status, body) = get(&state, "/users").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "plain");
+    }
+
+    // ── Interaction with other state ────────────────────────────────────
+
+    #[tokio::test]
+    async fn switching_scenarios_does_not_reset_sequence_counters() {
+        let mut sequenced = mock("GET", "/poll", "seq", &["happy-path"]);
+        sequenced.sequence = Some(vec![
+            SequenceStep {
+                status: 200,
+                response: json!({"n": 1}),
+                delay_ms: None,
+                repeat: false,
+            },
+            SequenceStep {
+                status: 200,
+                response: json!({"n": 2}),
+                delay_ms: None,
+                repeat: false,
+            },
+            SequenceStep {
+                status: 200,
+                response: json!({"n": 3}),
+                delay_ms: None,
+                repeat: true,
+            },
+        ]);
+        let state = state_with(vec![sequenced], Some(&["happy-path"]));
+
+        assert_eq!(get(&state, "/poll").await.1["n"], 1);
+        assert_eq!(get(&state, "/poll").await.1["n"], 2);
+
+        // Switch away (the mock stops matching), then back.
+        post_scenario(&state, r#"{"tags": ["error-scenario"]}"#).await;
+        assert_eq!(
+            get(&state, "/poll").await.0,
+            StatusCode::NOT_FOUND,
+            "the sequenced mock is inactive while the scenario is switched away"
+        );
+        post_scenario(&state, r#"{"tags": ["happy-path"]}"#).await;
+
+        // The counter picked up where it left off rather than restarting.
+        assert_eq!(get(&state, "/poll").await.1["n"], 3);
+    }
+
+    #[tokio::test]
+    async fn hit_counts_stay_keyed_to_the_right_mock_across_a_switch() {
+        let state = checkout_state(Some(&["error-scenario"]));
+
+        request(&state, Method::POST, "/checkout").await;
+
+        let hits = state.mock_hits.read().await;
+        // Index 1 is the error-scenario mock's real position in its bucket;
+        // filtering must not renumber the mocks around it.
+        assert_eq!(hits.get("POST:/checkout#1").copied(), Some(1));
+        assert_eq!(hits.get("POST:/checkout#0").copied(), None);
+    }
+
+    #[tokio::test]
+    async fn admin_mocks_reports_tags_and_whether_each_mock_is_active() {
+        let state = checkout_state(Some(&["happy-path"]));
+        let Json(body) = list_mocks(State(state)).await;
+
+        let entries = body["mocks"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["tags"], json!(["happy-path"]));
+        assert_eq!(entries[0]["active"], true);
+        assert_eq!(entries[1]["tags"], json!(["error-scenario"]));
+        assert_eq!(entries[1]["active"], false);
+    }
+
+    // ── MIMIC_ACTIVE_TAGS parsing ───────────────────────────────────────
+
+    #[test]
+    fn configured_active_tags_reads_the_env_var() {
+        // Serialized by the env var itself: this is the only test that touches
+        // MIMIC_ACTIVE_TAGS, so the mutation can't race another test.
+        let restore = std::env::var(ACTIVE_TAGS_ENV).ok();
+
+        std::env::set_var(ACTIVE_TAGS_ENV, "happy-path, smoke-test");
+        assert_eq!(
+            configured_active_tags(),
+            Some(
+                ["happy-path", "smoke-test"]
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<HashSet<String>>()
+            )
+        );
+
+        std::env::set_var(ACTIVE_TAGS_ENV, "");
+        assert_eq!(configured_active_tags(), None);
+
+        std::env::remove_var(ACTIVE_TAGS_ENV);
+        assert_eq!(configured_active_tags(), None);
+
+        if let Some(value) = restore {
+            std::env::set_var(ACTIVE_TAGS_ENV, value);
         }
     }
 }

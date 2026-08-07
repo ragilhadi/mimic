@@ -1,6 +1,6 @@
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -211,6 +211,16 @@ pub struct MockConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<Vec<SequenceStep>>,
 
+    /// Scenario tags this mock belongs to.
+    ///
+    /// Empty — the default, and the shape of every mock file written before
+    /// this field existed — means "always matchable", so an untagged mock set
+    /// behaves exactly as it did before scenarios were a thing. A mock with
+    /// tags is matchable only while at least one of them is active; see
+    /// [`MockConfig::is_active`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
     /// Path of the file this mock was loaded from, filled in by the loader so
     /// `/admin/mocks` can name the file to edit. `None` for mocks built
     /// in-process (tests, generated fixtures) rather than read from disk; a
@@ -268,9 +278,60 @@ impl MockConfig {
     pub fn has_advanced_matchers(&self) -> bool {
         self.query_params.is_some() || self.headers.is_some() || self.body.is_some()
     }
+
+    /// Whether this mock can be matched under the given scenario selection.
+    ///
+    /// `active` is the set of currently active tags, or `None` when no
+    /// scenario filter is configured at all. Two rules, both chosen so that
+    /// adding the feature can't change what an existing mock set serves:
+    ///
+    /// - an untagged mock is always active, filter or no filter;
+    /// - a tagged mock is active only when the filter is off, or when one of
+    ///   its tags is in the active set (exact, case-sensitive match).
+    pub fn is_active(&self, active: Option<&HashSet<String>>) -> bool {
+        match active {
+            None => true,
+            Some(active_tags) => {
+                self.tags.is_empty() || self.tags.iter().any(|tag| active_tags.contains(tag))
+            }
+        }
+    }
 }
 
 pub type MockStore = Arc<RwLock<HashMap<String, Vec<MockConfig>>>>;
+
+/// The scenario selection shared by the server: the set of active tags, or
+/// `None` for "no filter, every mock is matchable" — the default, so a server
+/// started without `MIMIC_ACTIVE_TAGS` behaves like one built before tags
+/// existed. Wrapped in the same `RwLock` discipline as [`MockStore`] so
+/// `POST /admin/scenario` can swap scenarios without racing in-flight matching.
+pub type ActiveTags = Arc<RwLock<Option<HashSet<String>>>>;
+
+/// Parse the comma-separated tag list from `MIMIC_ACTIVE_TAGS` (or a
+/// `/admin/scenario` request) into a scenario selection.
+///
+/// Tags are trimmed and empties dropped, so `"a, b,"` is the two tags `a` and
+/// `b`. A list that ends up with no tags at all means "no filter" (`None`),
+/// which is what makes `MIMIC_ACTIVE_TAGS=` and an unset variable equivalent,
+/// and lets `POST /admin/scenario {"tags": []}` clear the filter.
+pub fn parse_active_tags<I, S>(tags: I) -> Option<HashSet<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let parsed: HashSet<String> = tags
+        .into_iter()
+        .flat_map(|tag| {
+            tag.as_ref()
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    (!parsed.is_empty()).then_some(parsed)
+}
 
 /// Per-mock sequence call counters, keyed by "METHOD:/path#<index>"
 pub type SequenceCounters = Arc<RwLock<HashMap<String, usize>>>;
@@ -399,6 +460,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -476,6 +538,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
 
         let cloned = config.clone();
@@ -502,6 +565,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 sequence: None,
+                tags: Vec::new(),
             }],
         );
 
@@ -578,6 +642,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -665,6 +730,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
         assert!(!simple.has_advanced_matchers());
 
@@ -681,6 +747,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
         assert!(with_query.has_advanced_matchers());
     }
@@ -960,5 +1027,103 @@ mod tests {
                 .unwrap();
         assert!(config.source.is_none());
         assert!(!serde_json::to_string(&config).unwrap().contains("source"));
+    }
+
+    // ========================================================================
+    // Scenario tags (#62)
+    // ========================================================================
+
+    fn tagged(tags: &[&str]) -> MockConfig {
+        MockConfig {
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+            status: 200,
+            response: serde_json::json!({}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            source: None,
+            sequence: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    fn active(tags: &[&str]) -> HashSet<String> {
+        tags.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn mock_config_without_tags_deserializes_to_an_empty_tag_list() {
+        let config: MockConfig =
+            serde_json::from_str(r#"{"method":"GET","path":"/x","status":200,"response":{}}"#)
+                .unwrap();
+        assert!(config.tags.is_empty());
+        // Nothing new appears in the serialized form either, so a round trip
+        // through Mimic doesn't rewrite an existing mock file's shape.
+        assert!(!serde_json::to_string(&config).unwrap().contains("tags"));
+    }
+
+    #[test]
+    fn mock_config_tags_round_trip() {
+        let config: MockConfig = serde_json::from_str(
+            r#"{"method":"POST","path":"/checkout","status":500,
+                "response":{},"tags":["error-scenario","chaos"]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.tags, vec!["error-scenario", "chaos"]);
+        assert!(serde_json::to_string(&config)
+            .unwrap()
+            .contains("error-scenario"));
+    }
+
+    #[test]
+    fn untagged_mocks_are_active_with_and_without_a_filter() {
+        let mock = tagged(&[]);
+        assert!(mock.is_active(None));
+        assert!(mock.is_active(Some(&active(&["happy-path"]))));
+        assert!(mock.is_active(Some(&HashSet::new())));
+    }
+
+    #[test]
+    fn tagged_mocks_need_one_active_tag() {
+        let mock = tagged(&["error-scenario", "chaos"]);
+        // No filter configured: tags are inert.
+        assert!(mock.is_active(None));
+        // One overlapping tag is enough.
+        assert!(mock.is_active(Some(&active(&["chaos"]))));
+        assert!(mock.is_active(Some(&active(&["chaos", "happy-path"]))));
+        // Disjoint sets hide the mock.
+        assert!(!mock.is_active(Some(&active(&["happy-path"]))));
+        assert!(!mock.is_active(Some(&HashSet::new())));
+    }
+
+    #[test]
+    fn tag_matching_is_case_sensitive() {
+        let mock = tagged(&["Error-Scenario"]);
+        assert!(!mock.is_active(Some(&active(&["error-scenario"]))));
+        assert!(mock.is_active(Some(&active(&["Error-Scenario"]))));
+    }
+
+    #[test]
+    fn parse_active_tags_splits_trims_and_drops_empties() {
+        assert_eq!(
+            parse_active_tags(Some("happy-path, smoke-test ,")),
+            Some(active(&["happy-path", "smoke-test"]))
+        );
+        assert_eq!(
+            parse_active_tags(vec!["a,b", "c"]),
+            Some(active(&["a", "b", "c"]))
+        );
+    }
+
+    #[test]
+    fn parse_active_tags_treats_nothing_as_no_filter() {
+        assert_eq!(parse_active_tags(None::<String>), None);
+        assert_eq!(parse_active_tags(Some("")), None);
+        assert_eq!(parse_active_tags(Some("   , ,")), None);
+        assert_eq!(parse_active_tags(Vec::<String>::new()), None);
     }
 }

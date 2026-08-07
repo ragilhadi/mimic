@@ -196,6 +196,44 @@ mod tests {
     }
 
     #[test]
+    fn test_load_mocks_reads_scenario_tags() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        let tagged = r#"{
+            "method": "POST",
+            "path": "/checkout",
+            "status": 500,
+            "tags": ["error-scenario"],
+            "response": {"error": "internal error"}
+        }"#;
+        let untagged = r#"{
+            "method": "GET",
+            "path": "/users",
+            "status": 200,
+            "response": {"users": []}
+        }"#;
+
+        File::create(dir_path.join("checkout_500.json"))
+            .unwrap()
+            .write_all(tagged.as_bytes())
+            .unwrap();
+        File::create(dir_path.join("users.json"))
+            .unwrap()
+            .write_all(untagged.as_bytes())
+            .unwrap();
+
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        assert_eq!(
+            result.mocks["POST:/checkout"][0].tags,
+            vec!["error-scenario"]
+        );
+        // A file written before tags existed still loads, with no tags.
+        assert!(result.mocks["GET:/users"][0].tags.is_empty());
+    }
+
+    #[test]
     fn test_load_mocks_nonexistent_directory() {
         let result = load_mocks_map("/nonexistent/path");
         assert_eq!(result.mocks.len(), 0);
@@ -379,6 +417,7 @@ mod tests {
             response_headers: None,
             source: None,
             sequence: None,
+            tags: Vec::new(),
         };
 
         let key = create_mock_key(&mock.method, &mock.path);
