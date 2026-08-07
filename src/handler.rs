@@ -1,10 +1,11 @@
 use crate::matcher::{
-    find_matching_mock, parse_body, parse_headers, parse_query_string, requires_body, MatchResult,
-    RequestContext,
+    explain_match, explain_no_match, find_matching_mock, is_pattern_path, parse_body,
+    parse_headers, parse_query_string, requires_body, MatchResult, RequestContext,
 };
 use crate::template::{render_response, TemplateContext};
 use crate::types::{
-    is_sensitive_header, MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
+    is_sensitive_header, MockConfig, MockStore, RequestLog, RequestRecord, SequenceCounters,
+    SequenceStep,
 };
 use axum::{
     body::Body,
@@ -22,12 +23,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Per-mock hit counts, keyed like the sequence counters ("METHOD:/path#idx")
+/// so one mock among several registered for a path can be told from the rest.
+pub type MockHits = Arc<tokio::sync::RwLock<HashMap<String, u64>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub mocks: MockStore,
     pub request_log: RequestLog,
     pub request_counter: Arc<AtomicU64>,
     pub sequence_counters: SequenceCounters,
+    /// How many requests each mock has served, surfaced by `/admin/mocks`
+    pub mock_hits: MockHits,
+    /// When the process started serving, surfaced as uptime by `/health`
+    pub started_at: std::time::Instant,
 }
 
 impl AppState {
@@ -37,6 +46,8 @@ impl AppState {
             request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
             sequence_counters: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            mock_hits: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            started_at: std::time::Instant::now(),
         }
     }
 }
@@ -68,6 +79,105 @@ pub fn max_body_size() -> usize {
         },
         Err(_) => DEFAULT_MAX_BODY_SIZE,
     })
+}
+
+/// Default cap on how many requests the in-memory log keeps (see
+/// [`max_log_entries`]).
+const DEFAULT_MAX_LOG_ENTRIES: usize = 1000;
+
+/// Environment variable overriding [`DEFAULT_MAX_LOG_ENTRIES`].
+const MAX_LOG_ENTRIES_ENV: &str = "MIMIC_MAX_LOG_ENTRIES";
+
+/// How many requests the log retains before the oldest are dropped.
+///
+/// The log lives in memory and the dashboard re-reads it every few seconds, so
+/// an unbounded log is a slow leak that degrades the very UI meant to observe
+/// it. Read once from `MIMIC_MAX_LOG_ENTRIES`; `0` disables the bound for the
+/// rare run that genuinely wants every request kept.
+pub fn max_log_entries() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var(MAX_LOG_ENTRIES_ENV) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                warn!(
+                    "Invalid {}='{}', falling back to {} entries",
+                    MAX_LOG_ENTRIES_ENV, raw, DEFAULT_MAX_LOG_ENTRIES
+                );
+                DEFAULT_MAX_LOG_ENTRIES
+            }
+        },
+        Err(_) => DEFAULT_MAX_LOG_ENTRIES,
+    })
+}
+
+/// Default cap on the request/response bodies stored per log entry (64 KB).
+const DEFAULT_MAX_RECORDED_BODY: usize = 64 * 1024;
+
+/// Environment variable overriding [`DEFAULT_MAX_RECORDED_BODY`], in bytes.
+const MAX_RECORDED_BODY_ENV: &str = "MIMIC_MAX_RECORDED_BODY";
+
+/// How much of a body is kept on a log entry, in bytes.
+///
+/// `MIMIC_MAX_BODY_SIZE` caps what Mimic will *read*; it says nothing about
+/// what it keeps. Without a second cap a single 10 MB mock response would be
+/// copied into every log entry that hit it. `0` disables truncation.
+pub fn max_recorded_body_size() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var(MAX_RECORDED_BODY_ENV) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                warn!(
+                    "Invalid {}='{}', falling back to {} bytes",
+                    MAX_RECORDED_BODY_ENV, raw, DEFAULT_MAX_RECORDED_BODY
+                );
+                DEFAULT_MAX_RECORDED_BODY
+            }
+        },
+        Err(_) => DEFAULT_MAX_RECORDED_BODY,
+    })
+}
+
+/// Marker appended to a body the log had to cut short.
+pub const TRUNCATION_MARKER: &str = "…[truncated]";
+
+/// Cut `body` down to `limit` bytes for storage, marking it when anything was
+/// dropped. `limit` of 0 keeps the body whole.
+///
+/// The cut lands on a character boundary, so a body ending mid-multi-byte
+/// character still round-trips as valid UTF-8 through the admin API.
+pub fn truncate_body(body: String, limit: usize) -> String {
+    if limit == 0 || body.len() <= limit {
+        return body;
+    }
+    let mut end = limit;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = body[..end].to_string();
+    truncated.push_str(TRUNCATION_MARKER);
+    truncated
+}
+
+/// Append `record` to `log`, dropping the oldest entries once `cap` is
+/// exceeded. A `cap` of 0 leaves the log unbounded.
+fn push_bounded(log: &mut Vec<RequestRecord>, record: RequestRecord, cap: usize) {
+    log.push(record);
+    if cap > 0 && log.len() > cap {
+        log.drain(..log.len() - cap);
+    }
+}
+
+/// The port the server is configured to listen on.
+///
+/// Lives here so `/health` reports the same number `main` binds to rather than
+/// re-deriving it and risking disagreement.
+pub fn configured_port() -> u16 {
+    std::env::var("PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080)
 }
 
 pub async fn handle_request(
@@ -151,13 +261,20 @@ pub async fn handle_request(
     drop(mocks);
 
     match matched {
-        Some(MatchResult {
-            mock,
-            index,
-            path_params,
-            matched_key: mock_key,
-            ..
-        }) => {
+        Some(result) => {
+            // Built before the result is taken apart: it reads the breakdown
+            // recorded when the score was computed, so the arithmetic shown on
+            // the dashboard is the arithmetic that actually ran.
+            let match_explanation = explain_match(&result);
+            let match_score = result.score;
+            let MatchResult {
+                mock,
+                index,
+                path_params,
+                matched_key: mock_key,
+                ..
+            } = result;
+
             // Named path parameters captured from the mock's pattern (e.g.
             // `/users/:id`), if any, become available to templating below.
             context.path_params = path_params;
@@ -195,8 +312,37 @@ pub async fn handle_request(
             let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
             let matched_key = format!("{}:{}", method_str, path);
 
-            // Record the request with the status actually served
-            record_request(&state, context, Some(matched_key), status_u16).await;
+            // Count the hit against the specific mock that served it, keyed the
+            // same way as its sequence counter so several mocks sharing a path
+            // stay distinguishable.
+            {
+                let hit_key = format!("{}#{}", mock_key, index);
+                let mut hits = state.mock_hits.write().await;
+                *hits.entry(hit_key).or_insert(0) += 1;
+            }
+
+            // Serialize the response once: the same bytes are both sent to the
+            // client and recorded, so the drawer can't show something the
+            // client didn't get.
+            let (header_map, body) =
+                build_response_parts(&response, mock.response_headers.as_ref());
+
+            // Record the request with the status and response actually served
+            let path_params = context.path_params.clone();
+            record_request(
+                &state,
+                context,
+                RequestOutcome {
+                    matched_mock: Some(matched_key),
+                    response_status: status_u16,
+                    response_body: Some(body.clone()),
+                    response_headers: recorded_response_headers(&header_map),
+                    match_score: Some(match_score),
+                    path_params,
+                    match_explanation: Some(match_explanation),
+                },
+            )
+            .await;
 
             // Resolve the delay: a sequence step's own delay wins, otherwise the
             // mock-level delay_ms (fixed or sampled from a range) applies
@@ -210,29 +356,72 @@ pub async fn handle_request(
             }
 
             // Return configured response with any custom headers
-            build_response(status, &response, mock.response_headers.as_ref())
+            assemble_response(status, header_map, body)
         }
         None => {
             info!("No mock found for: {} {}", method_str, path);
 
+            // Diagnose the miss. Only reached on the 404 path — it walks the
+            // mock map and formats strings, which the matched path must not pay
+            // for.
+            let explanation = {
+                let mocks = state.mocks.read().await;
+                explain_no_match(&context, &mocks)
+            };
+            if let Some(ref why) = explanation {
+                debug!("No match for {} {}: {}", method_str, path, why);
+            }
+
             // Record the request (clone query_params for use in error response)
             let query_params_clone = context.query_params.clone();
-            record_request(&state, context, None, 404).await;
+            let error_body = json!({
+                "error": "mock not found",
+                "method": method_str,
+                "path": path,
+                "query_params": query_params_clone,
+                "headers_received": parsed_headers.keys().collect::<Vec<_>>()
+            });
+
+            record_request(
+                &state,
+                context,
+                RequestOutcome {
+                    matched_mock: None,
+                    response_status: 404,
+                    response_body: Some(error_body.to_string()),
+                    response_headers: HashMap::new(),
+                    match_score: None,
+                    path_params: HashMap::new(),
+                    match_explanation: explanation,
+                },
+            )
+            .await;
 
             // Return 404 with detailed error message
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": "mock not found",
-                    "method": method_str,
-                    "path": path,
-                    "query_params": query_params_clone,
-                    "headers_received": parsed_headers.keys().collect::<Vec<_>>()
-                })),
-            )
-                .into_response()
+            (StatusCode::NOT_FOUND, Json(error_body)).into_response()
         }
     }
+}
+
+/// The response headers to store on a log entry, with sensitive values
+/// replaced.
+///
+/// Response headers are a new output surface. Request headers have always been
+/// redacted on the way into the log; a mock is perfectly capable of returning
+/// `Set-Cookie`, and without this it would walk straight into the dashboard.
+fn recorded_response_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str().to_string();
+            let value = if is_sensitive_header(&name) {
+                "[REDACTED]".to_string()
+            } else {
+                value.to_str().unwrap_or("[non-UTF-8]").to_string()
+            };
+            (name, value)
+        })
+        .collect()
 }
 
 /// True if `err`, or anything it wraps, is a body-length-limit error.
@@ -270,20 +459,41 @@ fn payload_too_large(method: &str, path: &str, max_body: usize) -> Response {
 
 pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mocks = state.mocks.read().await;
+    // `mocks_loaded` counts registered routes, which is what it has always
+    // meant; `mock_count` is the number of mock definitions behind them, since
+    // several can share one METHOD:path.
+    let mock_count: usize = mocks.values().map(|list| list.len()).sum();
     Json(json!({
         "status": "healthy",
         "mocks_loaded": mocks.len(),
-        "service": "mimic"
+        "mock_count": mock_count,
+        "service": "mimic",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+        "port": configured_port(),
+        "max_body_size": max_body_size(),
+        "max_log_entries": max_log_entries(),
+        "max_recorded_body": max_recorded_body_size(),
+        "requests_recorded": state.request_counter.load(Ordering::Relaxed),
     }))
 }
 
-/// Record a request into the request log, redacting sensitive headers
-async fn record_request(
-    state: &AppState,
-    context: RequestContext,
+/// Everything known about how a request was answered, handed to
+/// [`record_request`] as one value so the recorder's signature doesn't grow a
+/// row of same-typed positional arguments.
+#[derive(Default)]
+struct RequestOutcome {
     matched_mock: Option<String>,
     response_status: u16,
-) {
+    response_body: Option<String>,
+    response_headers: HashMap<String, String>,
+    match_score: Option<u32>,
+    path_params: HashMap<String, String>,
+    match_explanation: Option<String>,
+}
+
+/// Record a request into the request log, redacting sensitive headers
+async fn record_request(state: &AppState, context: RequestContext, outcome: RequestOutcome) {
     let redacted_headers = context
         .headers
         .into_iter()
@@ -296,6 +506,7 @@ async fn record_request(
         })
         .collect();
 
+    let body_limit = max_recorded_body_size();
     let mut record = RequestRecord {
         id: 0,
         timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -305,43 +516,127 @@ async fn record_request(
         headers: redacted_headers,
         body: context
             .body
-            .and_then(|b| String::from_utf8(b.to_vec()).ok()),
-        matched_mock,
-        response_status,
+            .and_then(|b| String::from_utf8(b.to_vec()).ok())
+            .map(|b| truncate_body(b, body_limit)),
+        matched_mock: outcome.matched_mock,
+        response_status: outcome.response_status,
+        response_body: outcome.response_body.map(|b| truncate_body(b, body_limit)),
+        response_headers: outcome.response_headers,
+        match_score: outcome.match_score,
+        path_params: outcome.path_params,
+        match_explanation: outcome.match_explanation,
     };
     // IDs are unique but may not be strictly sequential under concurrent load
     let mut log = state.request_log.write().await;
     record.id = state.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    log.push(record);
+    push_bounded(&mut log, record, max_log_entries());
 }
 
 #[derive(Deserialize, Default)]
 pub struct RequestFilter {
+    /// Substring of the request path, not an exact match — the dashboard's
+    /// "Filter by path…" box has always read like a search, and now is one.
     pub path: Option<String>,
     pub method: Option<String>,
-    pub status: Option<u16>,
+    /// An exact code (`404`) or a status class (`4xx`, `5xx`).
+    pub status: Option<String>,
+    /// Keep only requests that matched no mock. Accepts `true`/`1`/`yes`.
+    pub unmatched_only: Option<String>,
+    /// Case-insensitive free-text search over the body, headers, and query
+    /// parameters of each recorded request.
+    pub search: Option<String>,
+}
+
+/// True if `value` reads as an affirmative in a query string. An absent or
+/// empty value is false, so `?unmatched_only=` behaves like "off" rather than
+/// failing the whole request.
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// True if `status` satisfies a `status` filter of either an exact code
+/// (`"404"`) or a class (`"4xx"`).
+///
+/// An unparsable filter matches nothing: silently ignoring it would show a
+/// full log and read as "no filtering happened", which is exactly the
+/// confusion this endpoint is meant to end.
+fn status_matches(filter: &str, status: u16) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    let lowered = filter.to_ascii_lowercase();
+    if let Some(class) = lowered.strip_suffix("xx") {
+        return match class.parse::<u16>() {
+            Ok(class) => status / 100 == class,
+            Err(_) => false,
+        };
+    }
+    match filter.parse::<u16>() {
+        Ok(code) => status == code,
+        Err(_) => false,
+    }
+}
+
+/// True if `needle` (already lowercased) appears anywhere in the request's
+/// body, headers, or query parameters.
+///
+/// Header *values* are searched as stored — which means a redacted credential
+/// is `[REDACTED]` here too, and can't be recovered by guessing at it.
+fn record_matches_search(record: &RequestRecord, needle: &str) -> bool {
+    if let Some(ref body) = record.body {
+        if body.to_lowercase().contains(needle) {
+            return true;
+        }
+    }
+    record
+        .headers
+        .iter()
+        .any(|(k, v)| k.to_lowercase().contains(needle) || v.to_lowercase().contains(needle))
+        || record
+            .query_params
+            .iter()
+            .any(|(k, v)| k.to_lowercase().contains(needle) || v.to_lowercase().contains(needle))
 }
 
 pub async fn list_requests(
     State(state): State<AppState>,
     Query(filter): Query<RequestFilter>,
 ) -> Json<serde_json::Value> {
+    let unmatched_only = filter.unmatched_only.as_deref().is_some_and(is_truthy);
+    let search = filter
+        .search
+        .as_ref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+
     let log = state.request_log.read().await;
     let filtered: Vec<&RequestRecord> = log
         .iter()
         .filter(|r| {
             if let Some(ref p) = filter.path {
-                if &r.path != p {
+                if !p.is_empty() && !r.path.contains(p.as_str()) {
                     return false;
                 }
             }
             if let Some(ref m) = filter.method {
-                if !r.method.eq_ignore_ascii_case(m) {
+                if !m.is_empty() && !r.method.eq_ignore_ascii_case(m) {
                     return false;
                 }
             }
-            if let Some(s) = filter.status {
-                if r.response_status != s {
+            if let Some(ref s) = filter.status {
+                if !status_matches(s, r.response_status) {
+                    return false;
+                }
+            }
+            if unmatched_only && r.matched_mock.is_some() {
+                return false;
+            }
+            if let Some(ref needle) = search {
+                if !record_matches_search(r, needle) {
                     return false;
                 }
             }
@@ -355,24 +650,128 @@ pub async fn list_requests(
     }))
 }
 
+/// One loaded mock as `/admin/mocks` reports it.
+fn describe_mock_entry(key: &str, index: usize, mock: &MockConfig, hits: u64) -> serde_json::Value {
+    json!({
+        "key": key,
+        "index": index,
+        "method": mock.method,
+        "path": mock.path,
+        "status": mock.status,
+        "source": mock.source,
+        "has_path_params": is_pattern_path(&mock.path),
+        "matchers": {
+            "query_params": mock.query_params.is_some(),
+            "headers": mock.headers.is_some(),
+            "body": mock.body.is_some(),
+        },
+        "delay_ms": mock.delay_ms,
+        "sequence_steps": mock.sequence.as_ref().map(|s| s.len()),
+        "response_headers": mock.response_headers.as_ref().map_or(0, |h| h.len()),
+        "consume_body": mock.consume_body,
+        "hits": hits,
+        // The whole config, so the dashboard's expand-a-row can show what the
+        // file says without a second round trip
+        "config": mock,
+    })
+}
+
+/// `GET /admin/mocks` — every mock currently loaded, with its matchers, source
+/// file, and hit count.
+///
+/// Reads through the same lock hot reload writes to, so what it reports is the
+/// mock set serving requests right now, not a snapshot taken at startup.
+pub async fn list_mocks(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mocks = state.mocks.read().await;
+    let hits = state.mock_hits.read().await;
+
+    let mut keys: Vec<&String> = mocks.keys().collect();
+    keys.sort();
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for key in keys {
+        for (index, mock) in mocks[key].iter().enumerate() {
+            let hit_count = hits
+                .get(&format!("{}#{}", key, index))
+                .copied()
+                .unwrap_or(0);
+            entries.push(describe_mock_entry(key, index, mock, hit_count));
+        }
+    }
+
+    Json(json!({
+        "count": entries.len(),
+        "mocks": entries,
+    }))
+}
+
+/// `GET /admin/sequences` — where each stateful sequence currently stands.
+///
+/// `step` is the number of calls served so far, i.e. the index of the step the
+/// *next* request will get; `total` is the sequence's length, read back from
+/// the mock the counter belongs to.
+pub async fn list_sequences(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let counters = state.sequence_counters.read().await;
+    let mocks = state.mocks.read().await;
+
+    let mut keys: Vec<&String> = counters.keys().collect();
+    keys.sort();
+
+    let sequences: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|counter_key| {
+            // Counter keys look like "METHOD:/path#idx"
+            let (mock_key, index) = counter_key
+                .rsplit_once('#')
+                .map_or((counter_key.as_str(), None), |(k, i)| {
+                    (k, i.parse::<usize>().ok())
+                });
+            let (method, path) = mock_key
+                .split_once(':')
+                .map_or(("", mock_key), |(m, p)| (m, p));
+
+            let mock = index
+                .and_then(|i| mocks.get(mock_key).and_then(|list| list.get(i)))
+                .filter(|mock| mock.sequence.is_some());
+
+            json!({
+                "key": counter_key,
+                "method": method,
+                "path": path,
+                "step": counters[counter_key],
+                "total": mock.and_then(|m| m.sequence.as_ref().map(|s| s.len())),
+                "source": mock.and_then(|m| m.source.clone()),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "count": sequences.len(),
+        "sequences": sequences,
+    }))
+}
+
 pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
     let mut log = state.request_log.write().await;
     log.clear();
     StatusCode::NO_CONTENT
 }
 
-/// Build the mock response: status, custom headers, and body.
+/// Resolve the headers and serialize the body of a mock response.
 ///
 /// Custom header names are case-insensitive; invalid names/values are skipped
 /// with a warning. `Content-Type: application/json` is added only when the
 /// custom headers don't already set a content type. When a non-JSON content
 /// type is configured and the response value is a JSON string, the raw string
 /// is sent as the body (so XML/CSV/plain-text mocks aren't JSON-quoted).
-fn build_response(
-    status: StatusCode,
+///
+/// Returns the parts rather than a finished [`Response`] so the handler can
+/// record exactly what it is about to send, instead of serializing a second
+/// copy for the log and trusting the two to agree.
+fn build_response_parts(
     response: &serde_json::Value,
     custom_headers: Option<&HashMap<String, String>>,
-) -> Response {
+) -> (HeaderMap, String) {
     let mut header_map = HeaderMap::new();
     if let Some(custom) = custom_headers {
         for (name, value) in custom {
@@ -403,6 +802,11 @@ fn build_response(
         other => serde_json::to_string(other).unwrap_or_default(),
     };
 
+    (header_map, body)
+}
+
+/// Put an already-resolved status, header set, and body on the wire.
+fn assemble_response(status: StatusCode, header_map: HeaderMap, body: String) -> Response {
     let mut res = Response::new(Body::from(body));
     *res.status_mut() = status;
     *res.headers_mut() = header_map;
@@ -492,6 +896,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -509,6 +914,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -526,6 +932,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -692,6 +1099,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -735,6 +1143,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -788,6 +1197,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -839,6 +1249,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -891,6 +1302,7 @@ mod tests {
                 })),
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -934,6 +1346,7 @@ mod tests {
                 })),
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -994,6 +1407,7 @@ mod tests {
                 })),
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1045,6 +1459,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1084,6 +1499,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1118,6 +1534,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1169,6 +1586,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: Some(vec![SequenceStep {
                     status: 200,
                     response: json!({"echoed": "{{body.message}}"}),
@@ -1213,6 +1631,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1264,6 +1683,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: Some(vec![SequenceStep {
                     status: 202,
                     response: json!({"job_id": "{{faker.uuid}}"}),
@@ -1316,6 +1736,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1367,6 +1788,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1405,6 +1827,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1439,6 +1862,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1455,6 +1879,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1506,6 +1931,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: Some(vec![
                     SequenceStep {
                         status: 503,
@@ -1568,6 +1994,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1613,6 +2040,7 @@ mod tests {
                     })),
                     delay_ms: None,
                     response_headers: None,
+                    source: None,
                     sequence: None,
                 },
                 MockConfig {
@@ -1630,6 +2058,7 @@ mod tests {
                     })),
                     delay_ms: None,
                     response_headers: None,
+                    source: None,
                     sequence: None,
                 },
             ],
@@ -1743,8 +2172,7 @@ mod tests {
 
         let filter = Query(RequestFilter {
             path: Some("/users".to_string()),
-            method: None,
-            status: None,
+            ..Default::default()
         });
         let response = list_requests(State(state), filter).await;
         assert_eq!(response.0["count"], 1);
@@ -1773,9 +2201,8 @@ mod tests {
         .await;
 
         let filter = Query(RequestFilter {
-            path: None,
             method: Some("POST".to_string()),
-            status: None,
+            ..Default::default()
         });
         let response = list_requests(State(state), filter).await;
         assert_eq!(response.0["count"], 1);
@@ -1804,9 +2231,8 @@ mod tests {
         .await;
 
         let filter = Query(RequestFilter {
-            path: None,
-            method: None,
-            status: Some(404),
+            status: Some("404".to_string()),
+            ..Default::default()
         });
         let response = list_requests(State(state), filter).await;
         assert_eq!(response.0["count"], 1);
@@ -1910,6 +2336,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: Some(steps),
         }
     }
@@ -2065,6 +2492,7 @@ mod tests {
             })),
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: Some(steps),
         };
         let mocks = HashMap::from([(
@@ -2571,6 +2999,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         }
     }
@@ -2668,5 +3097,814 @@ mod tests {
         let state = state_with(vec![body_mock("/trigger-job", false)]);
         let recorded = post_and_read_recorded_body(&state, "/nowhere", "debug=me").await;
         assert_eq!(recorded.as_deref(), Some("debug=me"));
+    }
+
+    // ========================================================================
+    // Admin dashboard v2: /admin/mocks, /admin/sequences, richer records
+    // ========================================================================
+
+    /// A mock with no matchers, loaded from `source`.
+    fn dash_mock(method: &str, path: &str, source: Option<&str>) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: json!({"ok": true}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            source: source.map(|s| s.to_string()),
+            sequence: None,
+        }
+    }
+
+    fn dash_state(mocks: Vec<MockConfig>) -> AppState {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for mock in mocks {
+            let key = crate::types::create_mock_key(&mock.method, &mock.path);
+            map.entry(key).or_default().push(mock);
+        }
+        AppState::new(Arc::new(tokio::sync::RwLock::new(map)))
+    }
+
+    async fn send(state: &AppState, method: Method, path: &str) -> Response {
+        handle_request(
+            method,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await
+    }
+
+    /// The single recorded request, for tests that make exactly one.
+    async fn only_record(state: &AppState) -> RequestRecord {
+        let log = state.request_log.read().await;
+        assert_eq!(log.len(), 1, "expected exactly one recorded request");
+        log[0].clone()
+    }
+
+    // ── GET /admin/mocks ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_mocks_reports_every_loaded_mock() {
+        let state = dash_state(vec![
+            dash_mock("GET", "/users", Some("mocks/get_users.json")),
+            dash_mock("POST", "/login", Some("mocks/post_login.json")),
+        ]);
+
+        let body = list_mocks(State(state)).await.0;
+        assert_eq!(body["count"], 2);
+
+        let mocks = body["mocks"].as_array().unwrap();
+        // Sorted by key, so the listing doesn't reshuffle between refreshes
+        assert_eq!(mocks[0]["key"], "GET:/users");
+        assert_eq!(mocks[0]["method"], "GET");
+        assert_eq!(mocks[0]["path"], "/users");
+        assert_eq!(mocks[0]["status"], 200);
+        assert_eq!(mocks[0]["source"], "mocks/get_users.json");
+        assert_eq!(mocks[1]["key"], "POST:/login");
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_reports_matchers_and_shape() {
+        let mut mock = dash_mock("GET", "/users/:id", Some("mocks/get_user.json"));
+        mock.headers = Some(HeaderMatcher {
+            required: HashMap::from([(
+                "x-api-key".to_string(),
+                HeaderValue::Pattern(HeaderPattern::Any),
+            )]),
+            forbidden: Vec::new(),
+            strict: false,
+        });
+        mock.delay_ms = Some(DelayConfig::Fixed(250));
+        mock.response_headers = Some(HashMap::from([("x-trace".to_string(), "on".to_string())]));
+
+        let body = list_mocks(State(dash_state(vec![mock]))).await.0;
+        let entry = &body["mocks"][0];
+
+        assert_eq!(entry["has_path_params"], true);
+        assert_eq!(entry["matchers"]["headers"], true);
+        assert_eq!(entry["matchers"]["query_params"], false);
+        assert_eq!(entry["matchers"]["body"], false);
+        assert_eq!(entry["delay_ms"], 250);
+        assert_eq!(entry["response_headers"], 1);
+        assert_eq!(entry["sequence_steps"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_includes_the_full_config() {
+        // The Mocks tab expands a row into the mock file's own JSON, so the
+        // whole config has to come down with the summary.
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/a.json"))]);
+        let body = list_mocks(State(state)).await.0;
+
+        let config = &body["mocks"][0]["config"];
+        assert_eq!(config["method"], "GET");
+        assert_eq!(config["path"], "/users");
+        assert_eq!(config["response"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_renders_a_mock_without_a_source() {
+        // A mock built in-process has no file to link to; the field is absent
+        // rather than an empty string the UI would have to special-case.
+        let state = dash_state(vec![dash_mock("GET", "/users", None)]);
+        let body = list_mocks(State(state)).await.0;
+        assert_eq!(body["mocks"][0]["source"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_counts_hits() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/a.json"))]);
+
+        for _ in 0..3 {
+            let _ = send(&state, Method::GET, "/users").await;
+        }
+        let _ = send(&state, Method::GET, "/nowhere").await;
+
+        let body = list_mocks(State(state)).await.0;
+        assert_eq!(body["mocks"][0]["hits"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_counts_hits_per_mock_not_per_path() {
+        // Two mocks share GET:/users; only the one that actually served the
+        // request should show a hit.
+        let mut picky = dash_mock("GET", "/users", Some("mocks/picky.json"));
+        picky.headers = Some(HeaderMatcher {
+            required: HashMap::from([(
+                "x-api-key".to_string(),
+                HeaderValue::Pattern(HeaderPattern::Any),
+            )]),
+            forbidden: Vec::new(),
+            strict: false,
+        });
+        let state = dash_state(vec![
+            picky,
+            dash_mock("GET", "/users", Some("mocks/plain.json")),
+        ]);
+
+        let _ = send(&state, Method::GET, "/users").await;
+
+        let body = list_mocks(State(state)).await.0;
+        let mocks = body["mocks"].as_array().unwrap();
+        let plain = mocks
+            .iter()
+            .find(|m| m["source"] == "mocks/plain.json")
+            .unwrap();
+        let picky = mocks
+            .iter()
+            .find(|m| m["source"] == "mocks/picky.json")
+            .unwrap();
+        assert_eq!(plain["hits"], 1);
+        assert_eq!(picky["hits"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_reflects_a_hot_reload() {
+        // Hot reload swaps the map behind the same lock; the endpoint reads
+        // through rather than caching, so a reload is visible immediately.
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/a.json"))]);
+        assert_eq!(list_mocks(State(state.clone())).await.0["count"], 1);
+
+        {
+            let mut mocks = state.mocks.write().await;
+            mocks.insert(
+                "POST:/login".to_string(),
+                vec![dash_mock("POST", "/login", Some("mocks/b.json"))],
+            );
+        }
+
+        let body = list_mocks(State(state)).await.0;
+        assert_eq!(body["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_mocks_on_an_empty_store() {
+        let state = dash_state(vec![]);
+        let body = list_mocks(State(state)).await.0;
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["mocks"].as_array().unwrap().len(), 0);
+    }
+
+    // ── GET /admin/sequences ────────────────────────────────────────────
+
+    fn dash_sequence_mock() -> MockConfig {
+        let mut mock = dash_mock("POST", "/submit", Some("mocks/post_submit.json"));
+        mock.sequence = Some(vec![
+            SequenceStep {
+                status: 202,
+                response: json!({"state": "pending"}),
+                delay_ms: None,
+                repeat: false,
+            },
+            SequenceStep {
+                status: 200,
+                response: json!({"state": "done"}),
+                delay_ms: None,
+                repeat: false,
+            },
+            SequenceStep {
+                status: 200,
+                response: json!({"state": "done"}),
+                delay_ms: None,
+                repeat: true,
+            },
+        ]);
+        mock
+    }
+
+    #[tokio::test]
+    async fn test_list_sequences_reports_the_current_step() {
+        let state = dash_state(vec![dash_sequence_mock()]);
+
+        let empty = list_sequences(State(state.clone())).await.0;
+        assert_eq!(empty["count"], 0, "no counter exists until a request lands");
+
+        let _ = send(&state, Method::POST, "/submit").await;
+        let _ = send(&state, Method::POST, "/submit").await;
+
+        let body = list_sequences(State(state)).await.0;
+        assert_eq!(body["count"], 1);
+        let seq = &body["sequences"][0];
+        assert_eq!(seq["key"], "POST:/submit#0");
+        assert_eq!(seq["method"], "POST");
+        assert_eq!(seq["path"], "/submit");
+        assert_eq!(seq["step"], 2);
+        assert_eq!(seq["total"], 3);
+        assert_eq!(seq["source"], "mocks/post_submit.json");
+    }
+
+    #[tokio::test]
+    async fn test_list_sequences_after_a_reset() {
+        let state = dash_state(vec![dash_sequence_mock()]);
+        let _ = send(&state, Method::POST, "/submit").await;
+
+        let filter = Query(SequenceResetFilter {
+            path: Some("/submit".to_string()),
+        });
+        let reset = reset_sequences(State(state.clone()), filter).await.0;
+        assert_eq!(reset["reset"], 1);
+
+        let body = list_sequences(State(state)).await.0;
+        assert_eq!(body["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_sequences_survives_a_counter_with_no_mock() {
+        // Hot reload can delete the mock a live counter belongs to. The panel
+        // must still render the counter rather than blow up looking for it.
+        let state = dash_state(vec![]);
+        {
+            let mut counters = state.sequence_counters.write().await;
+            counters.insert("POST:/gone#0".to_string(), 4);
+        }
+
+        let body = list_sequences(State(state)).await.0;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["sequences"][0]["step"], 4);
+        assert_eq!(body["sequences"][0]["path"], "/gone");
+        assert_eq!(body["sequences"][0]["total"], serde_json::Value::Null);
+    }
+
+    // ── request record: response, score, path params, explanation ───────
+
+    #[tokio::test]
+    async fn test_record_captures_the_response_that_was_served() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/a.json"))]);
+        let response = send(&state, Method::GET, "/users").await;
+
+        let sent = response.into_body().collect().await.unwrap().to_bytes();
+        let record = only_record(&state).await;
+
+        assert_eq!(record.response_status, 200);
+        assert_eq!(
+            record.response_body.as_deref(),
+            Some(String::from_utf8(sent.to_vec()).unwrap().as_str()),
+            "the recorded body must be the bytes the client got"
+        );
+        assert_eq!(
+            record
+                .response_headers
+                .get("content-type")
+                .map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_captures_score_and_explanation_on_a_match() {
+        let state = dash_state(vec![dash_mock(
+            "GET",
+            "/users",
+            Some("mocks/get_users.json"),
+        )]);
+        let _ = send(&state, Method::GET, "/users").await;
+
+        let record = only_record(&state).await;
+        assert_eq!(record.match_score, Some(1000));
+        let explanation = record.match_explanation.unwrap();
+        assert!(
+            explanation.contains("matched mocks/get_users.json"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("score 1000"), "{}", explanation);
+    }
+
+    #[tokio::test]
+    async fn test_record_captures_path_params() {
+        let state = dash_state(vec![dash_mock("GET", "/users/:id", Some("mocks/u.json"))]);
+        let _ = send(&state, Method::GET, "/users/42").await;
+
+        let record = only_record(&state).await;
+        assert_eq!(record.path_params.get("id").map(String::as_str), Some("42"));
+        assert_eq!(record.match_score, Some(900));
+    }
+
+    #[tokio::test]
+    async fn test_record_explains_an_unmatched_request() {
+        let mut mock = dash_mock("GET", "/users", Some("mocks/get_users.json"));
+        mock.headers = Some(HeaderMatcher {
+            required: HashMap::from([(
+                "x-api-key".to_string(),
+                HeaderValue::Pattern(HeaderPattern::Any),
+            )]),
+            forbidden: Vec::new(),
+            strict: false,
+        });
+        let state = dash_state(vec![mock]);
+
+        let _ = send(&state, Method::GET, "/users").await;
+
+        let record = only_record(&state).await;
+        assert_eq!(record.response_status, 404);
+        assert!(record.matched_mock.is_none());
+        assert!(record.match_score.is_none());
+        let explanation = record.match_explanation.unwrap();
+        assert!(
+            explanation.contains("mocks/get_users.json"),
+            "{}",
+            explanation
+        );
+        assert!(
+            explanation.contains("required header `x-api-key` was absent"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_of_a_404_keeps_the_error_body() {
+        let state = dash_state(vec![]);
+        let _ = send(&state, Method::GET, "/nowhere").await;
+
+        let record = only_record(&state).await;
+        let body: serde_json::Value =
+            serde_json::from_str(record.response_body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"], "mock not found");
+        assert_eq!(body["path"], "/nowhere");
+    }
+
+    // ── redaction on the new output surfaces ────────────────────────────
+
+    #[tokio::test]
+    async fn test_response_headers_redact_set_cookie() {
+        // A mock returning a credential must not have it rendered in the
+        // dashboard's new Response section.
+        let mut mock = dash_mock("POST", "/login", Some("mocks/login.json"));
+        mock.response_headers = Some(HashMap::from([
+            ("set-cookie".to_string(), "session=super-secret".to_string()),
+            ("x-request-id".to_string(), "abc-123".to_string()),
+        ]));
+        let state = dash_state(vec![mock]);
+
+        let response = send(&state, Method::POST, "/login").await;
+        // The client still gets the real cookie — only the log is redacted
+        assert_eq!(
+            response.headers().get("set-cookie").unwrap(),
+            "session=super-secret"
+        );
+
+        let record = only_record(&state).await;
+        assert_eq!(
+            record
+                .response_headers
+                .get("set-cookie")
+                .map(String::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            record
+                .response_headers
+                .get("x-request-id")
+                .map(String::as_str),
+            Some("abc-123"),
+            "ordinary headers are still useful and must survive"
+        );
+
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(
+            !serialized.contains("super-secret"),
+            "a credential reached the admin API: {}",
+            serialized
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_headers_redact_authorization_and_cookie() {
+        for name in ["authorization", "cookie", "Set-Cookie"] {
+            let mut mock = dash_mock("GET", "/echo", Some("mocks/echo.json"));
+            mock.response_headers =
+                Some(HashMap::from([(name.to_string(), "leak-me".to_string())]));
+            let state = dash_state(vec![mock]);
+
+            let _ = send(&state, Method::GET, "/echo").await;
+
+            let record = only_record(&state).await;
+            let serialized = serde_json::to_string(&record).unwrap();
+            assert!(
+                !serialized.contains("leak-me"),
+                "{} leaked into the log: {}",
+                name,
+                serialized
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explanation_never_carries_a_request_credential() {
+        let mut mock = dash_mock("GET", "/vault", Some("mocks/vault.json"));
+        mock.headers = Some(HeaderMatcher {
+            required: HashMap::from([(
+                "authorization".to_string(),
+                HeaderValue::Exact("Bearer expected-secret".to_string()),
+            )]),
+            forbidden: Vec::new(),
+            strict: false,
+        });
+        let state = dash_state(vec![mock]);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sent-secret".parse().unwrap());
+        let _ = handle_request(
+            Method::GET,
+            "/vault".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+
+        let record = only_record(&state).await;
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(!serialized.contains("sent-secret"), "{}", serialized);
+        assert!(!serialized.contains("expected-secret"), "{}", serialized);
+        assert!(record.match_explanation.unwrap().contains("[REDACTED]"));
+    }
+
+    // ── filters ─────────────────────────────────────────────────────────
+
+    /// State with one recorded request per (method, path) given.
+    async fn state_with_traffic(traffic: &[(Method, &str)]) -> AppState {
+        let state = dash_state(vec![
+            dash_mock("GET", "/users", Some("mocks/users.json")),
+            dash_mock("GET", "/users/active", Some("mocks/active.json")),
+            dash_mock("POST", "/login", Some("mocks/login.json")),
+        ]);
+        for (method, path) in traffic {
+            let _ = send(&state, method.clone(), path).await;
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn test_path_filter_matches_a_substring() {
+        // The placeholder has always read like a search box. Now it is one.
+        let state = state_with_traffic(&[
+            (Method::GET, "/users"),
+            (Method::GET, "/users/active"),
+            (Method::POST, "/login"),
+        ])
+        .await;
+
+        let filter = Query(RequestFilter {
+            path: Some("user".to_string()),
+            ..Default::default()
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_path_filter_still_matches_an_exact_path() {
+        let state = state_with_traffic(&[(Method::GET, "/users"), (Method::POST, "/login")]).await;
+
+        let filter = Query(RequestFilter {
+            path: Some("/login".to_string()),
+            ..Default::default()
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["requests"][0]["path"], "/login");
+    }
+
+    #[tokio::test]
+    async fn test_status_filter_accepts_a_class() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
+        let _ = send(&state, Method::GET, "/users").await; // 200
+        let _ = send(&state, Method::GET, "/nope").await; // 404
+        let _ = send(&state, Method::GET, "/also-nope").await; // 404
+
+        for (class, expected) in [("4xx", 2), ("2xx", 1), ("5xx", 0)] {
+            let filter = Query(RequestFilter {
+                status: Some(class.to_string()),
+                ..Default::default()
+            });
+            let body = list_requests(State(state.clone()), filter).await.0;
+            assert_eq!(body["count"], expected, "status={}", class);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_status_filter_accepts_an_exact_code() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
+        let _ = send(&state, Method::GET, "/users").await;
+        let _ = send(&state, Method::GET, "/nope").await;
+
+        let filter = Query(RequestFilter {
+            status: Some("404".to_string()),
+            ..Default::default()
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["requests"][0]["response_status"], 404);
+    }
+
+    #[tokio::test]
+    async fn test_unmatched_only_filter() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
+        let _ = send(&state, Method::GET, "/users").await;
+        let _ = send(&state, Method::GET, "/nope").await;
+
+        let filter = Query(RequestFilter {
+            unmatched_only: Some("true".to_string()),
+            ..Default::default()
+        });
+        let body = list_requests(State(state.clone()), filter).await.0;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["requests"][0]["path"], "/nope");
+
+        // An empty value reads as "off" rather than failing the request
+        let filter = Query(RequestFilter {
+            unmatched_only: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(list_requests(State(state), filter).await.0["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_filter_looks_in_the_body() {
+        let state = dash_state(vec![]);
+        for body in ["needle in here", "nothing to see"] {
+            let _ = handle_request(
+                Method::POST,
+                "/inbox".parse().unwrap(),
+                HeaderMap::new(),
+                State(state.clone()),
+                Body::from(body),
+            )
+            .await;
+        }
+
+        let filter = Query(RequestFilter {
+            search: Some("NEEDLE".to_string()), // case-insensitive
+            ..Default::default()
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_filter_looks_in_the_headers() {
+        let state = dash_state(vec![]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant", "acme-corp".parse().unwrap());
+        let _ = handle_request(
+            Method::GET,
+            "/a".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let _ = send(&state, Method::GET, "/b").await;
+
+        let filter = Query(RequestFilter {
+            search: Some("acme".to_string()),
+            ..Default::default()
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["requests"][0]["path"], "/a");
+    }
+
+    #[tokio::test]
+    async fn test_filters_combine() {
+        let state = state_with_traffic(&[
+            (Method::GET, "/users"),
+            (Method::GET, "/users/active"),
+            (Method::POST, "/login"),
+        ])
+        .await;
+
+        let filter = Query(RequestFilter {
+            path: Some("user".to_string()),
+            method: Some("GET".to_string()),
+            status: Some("2xx".to_string()),
+            ..Default::default()
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_empty_filters_are_ignored() {
+        // The dashboard omits empty boxes, but a hand-written curl may not.
+        let state = state_with_traffic(&[(Method::GET, "/users"), (Method::POST, "/login")]).await;
+
+        let filter = Query(RequestFilter {
+            path: Some(String::new()),
+            method: Some(String::new()),
+            status: Some(String::new()),
+            search: Some("   ".to_string()),
+            unmatched_only: None,
+        });
+        let body = list_requests(State(state), filter).await.0;
+        assert_eq!(body["count"], 2);
+    }
+
+    #[test]
+    fn test_status_matches() {
+        assert!(status_matches("404", 404));
+        assert!(!status_matches("404", 400));
+        assert!(status_matches("4xx", 404));
+        assert!(status_matches("4XX", 451));
+        assert!(!status_matches("4xx", 500));
+        assert!(status_matches("5xx", 503));
+        assert!(status_matches("", 200), "an empty filter filters nothing");
+        // A filter that can't be understood matches nothing, so a typo shows an
+        // empty table rather than a full one that looks unfiltered.
+        assert!(!status_matches("nonsense", 200));
+        assert!(!status_matches("xx", 200));
+    }
+
+    #[test]
+    fn test_is_truthy() {
+        for yes in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(is_truthy(yes), "{}", yes);
+        }
+        for no in ["", "0", "false", "no", "maybe"] {
+            assert!(!is_truthy(no), "{}", no);
+        }
+    }
+
+    // ── bounded log and truncated bodies ────────────────────────────────
+
+    #[test]
+    fn test_truncate_body() {
+        assert_eq!(truncate_body("short".to_string(), 10), "short");
+        assert_eq!(truncate_body("exactly10!".to_string(), 10), "exactly10!");
+
+        let truncated = truncate_body("0123456789abc".to_string(), 10);
+        assert_eq!(truncated, format!("0123456789{}", TRUNCATION_MARKER));
+
+        // 0 opts out entirely
+        let long = "x".repeat(5000);
+        assert_eq!(truncate_body(long.clone(), 0), long);
+    }
+
+    #[test]
+    fn test_truncate_body_respects_character_boundaries() {
+        // Cutting a multi-byte character in half would make the record
+        // unserializable; the cut walks back to a boundary instead.
+        let body = "héllo wörld".to_string();
+        for limit in 1..body.len() {
+            let truncated = truncate_body(body.clone(), limit);
+            assert!(
+                truncated.ends_with(TRUNCATION_MARKER),
+                "limit {} should truncate",
+                limit
+            );
+            // Round-trips through JSON, which only accepts valid UTF-8
+            assert!(serde_json::to_string(&truncated).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_push_bounded_drops_the_oldest() {
+        let mut log: Vec<RequestRecord> = Vec::new();
+        for id in 1..=10 {
+            let record = RequestRecord {
+                id,
+                ..Default::default()
+            };
+            push_bounded(&mut log, record, 3);
+        }
+
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.iter().map(|r| r.id).collect::<Vec<_>>(), vec![8, 9, 10]);
+    }
+
+    #[test]
+    fn test_push_bounded_with_no_cap() {
+        let mut log: Vec<RequestRecord> = Vec::new();
+        for id in 1..=50 {
+            push_bounded(
+                &mut log,
+                RequestRecord {
+                    id,
+                    ..Default::default()
+                },
+                0,
+            );
+        }
+        assert_eq!(log.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_a_large_response_body_is_truncated_in_the_log() {
+        let mut mock = dash_mock("GET", "/big", Some("mocks/big.json"));
+        mock.response = json!({"blob": "x".repeat(200_000)});
+        let state = dash_state(vec![mock]);
+
+        let response = send(&state, Method::GET, "/big").await;
+        let sent = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(sent.len() > 100_000, "the client still gets the whole body");
+
+        let record = only_record(&state).await;
+        let stored = record.response_body.unwrap();
+        assert!(
+            stored.len() < sent.len(),
+            "the log kept the whole {}-byte body",
+            sent.len()
+        );
+        assert!(stored.ends_with(TRUNCATION_MARKER));
+    }
+
+    // ── /health summary ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_reports_the_dashboard_summary() {
+        let state = dash_state(vec![
+            dash_mock("GET", "/users", Some("mocks/a.json")),
+            dash_mock("POST", "/login", Some("mocks/b.json")),
+        ]);
+        let _ = send(&state, Method::GET, "/users").await;
+
+        let body = health_check(State(state)).await.0;
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["mocks_loaded"], 2);
+        assert_eq!(body["mock_count"], 2);
+        assert_eq!(body["requests_recorded"], 1);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(body["port"].is_number());
+        assert!(body["max_body_size"].is_number());
+        assert!(body["uptime_seconds"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_health_counts_mocks_behind_a_shared_route() {
+        // Two mocks, one route: `mocks_loaded` keeps its old meaning and
+        // `mock_count` reports the definitions.
+        let state = dash_state(vec![
+            dash_mock("GET", "/users", Some("mocks/a.json")),
+            dash_mock("GET", "/users", Some("mocks/b.json")),
+        ]);
+        let body = health_check(State(state)).await.0;
+        assert_eq!(body["mocks_loaded"], 1);
+        assert_eq!(body["mock_count"], 2);
+    }
+
+    // ── the dashboard page itself ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_dashboard_html_wires_up_the_new_surfaces() {
+        let html = admin_dashboard().await.0;
+        for needle in [
+            "/admin/mocks",
+            "/admin/sequences",
+            "unmatched_only=true",
+            "prefers-color-scheme",
+            "data-tab=\"mocks\"",
+            "data-tab=\"sequences\"",
+        ] {
+            assert!(html.contains(needle), "dashboard is missing {}", needle);
+        }
     }
 }

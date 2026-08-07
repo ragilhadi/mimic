@@ -210,6 +210,13 @@ pub struct MockConfig {
     /// Optional stateful response sequence (one step consumed per request)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<Vec<SequenceStep>>,
+
+    /// Path of the file this mock was loaded from, filled in by the loader so
+    /// `/admin/mocks` can name the file to edit. `None` for mocks built
+    /// in-process (tests, generated fixtures) rather than read from disk; a
+    /// value present in the mock JSON itself is overwritten at load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Response delay configuration: a fixed duration or a random range
@@ -272,8 +279,13 @@ pub type SequenceCounters = Arc<RwLock<HashMap<String, usize>>>;
 // Request History Types
 // ============================================================================
 
-/// A recorded incoming request and its outcome
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A recorded incoming request and its outcome.
+///
+/// Every field added after `response_status` is `#[serde(default)]`, so a
+/// request log captured by an older Mimic still deserializes here and an
+/// existing consumer of `/admin/requests` keeps seeing the shape it knows —
+/// the new keys are simply absent when there's nothing to report.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestRecord {
     pub id: u64,
     pub timestamp: String,
@@ -281,11 +293,33 @@ pub struct RequestRecord {
     pub path: String,
     pub query_params: HashMap<String, String>,
     pub headers: HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_mock: Option<String>,
     pub response_status: u16,
+
+    /// The response body actually served, truncated past
+    /// [`crate::handler::max_recorded_body_size`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+
+    /// The response headers actually served, with sensitive values redacted.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub response_headers: HashMap<String, String>,
+
+    /// Score the winning mock earned, as computed by the matcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_score: Option<u32>,
+
+    /// Values captured from the winning mock's path pattern (`/users/:id`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub path_params: HashMap<String, String>,
+
+    /// Why this mock won, or — for an unmatched request — why each candidate
+    /// was rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_explanation: Option<String>,
 }
 
 pub type RequestLog = Arc<tokio::sync::RwLock<Vec<RequestRecord>>>;
@@ -363,6 +397,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
 
@@ -439,6 +474,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
 
@@ -464,6 +500,7 @@ mod tests {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -539,6 +576,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
 
@@ -625,6 +663,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
         assert!(!simple.has_advanced_matchers());
@@ -640,6 +679,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
         assert!(with_query.has_advanced_matchers());
@@ -812,5 +852,113 @@ mod tests {
         // Serialized output must omit the field so round-trips stay clean
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(!serialized.contains("sequence"));
+    }
+
+    // ========================================================================
+    // RequestRecord: the admin API's wire shape
+    // ========================================================================
+
+    /// A record as an older Mimic would have written it: none of the fields
+    /// added for the mock inspector.
+    const LEGACY_RECORD: &str = r#"{
+        "id": 7,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "method": "GET",
+        "path": "/users",
+        "query_params": {"page": "1"},
+        "headers": {"accept": "application/json"},
+        "body": null,
+        "matched_mock": "GET:/users",
+        "response_status": 200
+    }"#;
+
+    #[test]
+    fn request_record_reads_a_log_written_before_the_new_fields() {
+        let record: RequestRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
+
+        assert_eq!(record.id, 7);
+        assert_eq!(record.path, "/users");
+        assert_eq!(record.matched_mock.as_deref(), Some("GET:/users"));
+        // Everything new defaults to "nothing to report" rather than failing
+        assert!(record.response_body.is_none());
+        assert!(record.response_headers.is_empty());
+        assert!(record.match_score.is_none());
+        assert!(record.path_params.is_empty());
+        assert!(record.match_explanation.is_none());
+    }
+
+    #[test]
+    fn request_record_omits_empty_new_fields() {
+        // An existing consumer of /admin/requests must not suddenly start
+        // seeing a wall of nulls it has to skip past.
+        let record = RequestRecord {
+            id: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            method: "GET".to_string(),
+            path: "/users".to_string(),
+            response_status: 200,
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&record).unwrap();
+        for absent in [
+            "response_body",
+            "response_headers",
+            "match_score",
+            "path_params",
+            "match_explanation",
+        ] {
+            assert!(
+                !serialized.contains(absent),
+                "{} should be omitted when empty: {}",
+                absent,
+                serialized
+            );
+        }
+        // The fields that were always there stay unconditional
+        assert!(serialized.contains("\"response_status\":200"));
+    }
+
+    #[test]
+    fn request_record_serializes_the_new_fields_when_present() {
+        let record = RequestRecord {
+            id: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            method: "GET".to_string(),
+            path: "/users/42".to_string(),
+            response_status: 200,
+            response_body: Some(r#"{"id":42}"#.to_string()),
+            response_headers: HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            match_score: Some(900),
+            path_params: HashMap::from([("id".to_string(), "42".to_string())]),
+            match_explanation: Some("matched mocks/get_user.json".to_string()),
+            ..Default::default()
+        };
+
+        let round_tripped: RequestRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+
+        assert_eq!(round_tripped.response_body, record.response_body);
+        assert_eq!(round_tripped.match_score, Some(900));
+        assert_eq!(
+            round_tripped.path_params.get("id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            round_tripped.match_explanation.as_deref(),
+            Some("matched mocks/get_user.json")
+        );
+    }
+
+    #[test]
+    fn mock_config_source_is_optional_and_omitted_when_unset() {
+        let config: MockConfig =
+            serde_json::from_str(r#"{"method":"GET","path":"/x","status":200,"response":{}}"#)
+                .unwrap();
+        assert!(config.source.is_none());
+        assert!(!serde_json::to_string(&config).unwrap().contains("source"));
     }
 }

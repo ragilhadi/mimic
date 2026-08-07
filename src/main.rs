@@ -12,8 +12,8 @@ use axum::{
     Router,
 };
 use handler::{
-    admin_dashboard, clear_requests, handle_request, health_check, list_requests, max_body_size,
-    reset_sequences, AppState,
+    admin_dashboard, clear_requests, configured_port, handle_request, health_check, list_mocks,
+    list_requests, list_sequences, max_body_size, max_log_entries, reset_sequences, AppState,
 };
 use loader::{load_mocks, load_mocks_map};
 use std::collections::HashMap;
@@ -77,15 +77,16 @@ async fn run_server() {
     const MOCKS_DIR: &str = "/app/mocks";
 
     // Get port from environment variable
-    let port = env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
+    let port = configured_port();
 
     info!("Configuration:");
     info!("  Mocks directory: {}", MOCKS_DIR);
     info!("  Port: {}", port);
     info!("  Max request body: {} bytes", max_body_size());
+    match max_log_entries() {
+        0 => info!("  Request log: unbounded"),
+        n => info!("  Request log: last {} request(s)", n),
+    }
 
     // Load mock configurations
     let mocks = load_mocks(MOCKS_DIR);
@@ -204,6 +205,8 @@ fn create_router(state: AppState) -> Router {
         // Admin dashboard and request history API
         .route("/admin/dashboard", get(admin_dashboard))
         .route("/admin/requests", get(list_requests).delete(clear_requests))
+        .route("/admin/mocks", get(list_mocks))
+        .route("/admin/sequences", get(list_sequences))
         .route("/admin/sequences/reset", post(reset_sequences))
         // Catch-all route for mock requests
         .fallback(any(handle_request))
@@ -475,6 +478,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         }
     }

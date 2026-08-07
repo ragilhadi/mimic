@@ -22,6 +22,7 @@
 - **Dynamic Response Templating** - Echo path, query, header, and body fields back into responses with `{{path.x}}` syntax
 - **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
 - **OpenAPI Import** - Generate a whole mocks directory from an OpenAPI 3.x spec with `mimic import-openapi ./spec.yaml`
+- **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
 
 ---
 
@@ -112,6 +113,13 @@ RUST_LOG=info
 
 # Maximum request body Mimic will buffer, in bytes (default: 10485760 = 10 MB)
 MIMIC_MAX_BODY_SIZE=10485760
+
+# How many requests the admin request log keeps (default: 1000, 0 = unbounded)
+MIMIC_MAX_LOG_ENTRIES=1000
+
+# How much of each request/response body the log stores, in bytes
+# (default: 65536 = 64 KB, 0 = store whole bodies)
+MIMIC_MAX_RECORDED_BODY=65536
 ```
 
 **Log Levels**:
@@ -1075,6 +1083,85 @@ When there's no example, the schema is walked recursively and each field gets a 
 
 ---
 
+## 🖥️ Admin Dashboard
+
+```
+http://localhost:8080/admin/dashboard
+```
+
+A single dependency-free page — no build step, no CDN — for answering the two
+questions that otherwise send you back to `RUST_LOG=debug`: *what is this
+server configured to do?* and *why didn't my mock match?*
+
+### Tabs
+
+| Tab | What it shows |
+|-----|---------------|
+| **Requests** | Every recorded request. Expand a row for its headers, query params and body, **the response that was actually served** (status, headers, body), and a **Match** section explaining which mock won and why — or, for a 404, which mocks were in the running and what rejected each. |
+| **Mocks** | Every loaded mock: method, path, status, which matchers it declares, delay, sequence length, hit count, and the file it came from. Expand a row for the full `MockConfig` JSON. |
+| **Sequences** | Each stateful sequence's current step, with a per-path **Reset** button. |
+
+The header bar reads `/health` for mocks loaded, uptime, port, and max body size.
+
+### Match explanations
+
+A matched request records the arithmetic behind its score:
+
+```
+matched mocks/get_users_id.json (score 1150: method+path 1000, headers +50, path pattern -100)
+```
+
+An unmatched one records the near-miss diagnosis instead — the mocks that
+shared its `METHOD:path`, and the first matcher that turned each down:
+
+```
+2 candidate mock(s) for `GET:/users`, none matched:
+  mocks/get_users.json — required header `x-api-key` was absent;
+  mocks/get_users_admin.json — query param `role` was `viewer`, expected `admin`
+```
+
+When nothing is registered at all, the explanation says so — and points out the
+wrong-verb case, which is what it usually is:
+
+```
+no mock is registered for `GET:/users` — `/users` is registered for POST, PUT
+```
+
+Explanations are produced by the matchers themselves (each `match_*` predicate
+is defined as "no rejection reason"), so an explanation can never describe a
+rule the server doesn't actually enforce.
+
+### Filtering
+
+| Filter | Behaviour |
+|--------|-----------|
+| Path | **Substring** match (`user` finds `/users` and `/users/active`) |
+| Method | Exact, case-insensitive |
+| Status | An exact code (`404`) or a class (`4xx`, `5xx`) |
+| Unmatched only | Keeps just the requests no mock served |
+| Search | Case-insensitive, over each request's body, headers and query params |
+
+All of them are query parameters on `/admin/requests`, so they work from
+`curl` too — the dashboard is a client of the same public API.
+
+### Other behaviour
+
+- **Auto-refresh appends** new rows rather than rebuilding the table, and
+  **pauses while the pointer is over it** — new requests collect behind a
+  "*N* new requests" banner instead of shifting the row you're reading.
+- **Copy as curl** per row, and **Export log** for the whole filtered view.
+- **Theme** follows `prefers-color-scheme`, with a manual toggle that sticks.
+- **Redaction**: `authorization`, `cookie` and `set-cookie` values are replaced
+  with `[REDACTED]` in request headers, response headers, and explanations. A
+  mock returning `Set-Cookie` still sends the real value to the client; only
+  the log and the UI see the placeholder.
+- **Bounded by default**: the log keeps the last `MIMIC_MAX_LOG_ENTRIES`
+  requests (1000), and stored bodies are truncated past
+  `MIMIC_MAX_RECORDED_BODY` (64 KB) with a `…[truncated]` marker — so a
+  long-running server doesn't degrade the very UI meant to observe it.
+
+---
+
 ## 🎯 Use Cases
 
 ### 1. **Frontend Development**
@@ -1253,9 +1340,21 @@ curl http://localhost:8080/health
 {
   "status": "healthy",
   "mocks_loaded": 5,
-  "service": "mimic"
+  "mock_count": 7,
+  "service": "mimic",
+  "version": "1.11.0",
+  "uptime_seconds": 4021,
+  "port": 8080,
+  "max_body_size": 10485760,
+  "max_log_entries": 1000,
+  "max_recorded_body": 65536,
+  "requests_recorded": 138
 }
 ```
+
+`mocks_loaded` counts registered `METHOD:path` routes; `mock_count` counts mock
+definitions, which is larger when several mocks share one route. The admin
+dashboard reads this endpoint for its header summary bar.
 
 Use this endpoint for:
 - Docker health checks
@@ -1379,27 +1478,118 @@ active limit is printed at startup.
 GET /health
 ```
 
-Returns server status and number of loaded mocks.
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "mocks_loaded": 5,
-  "service": "mimic"
-}
-```
+Returns server status, loaded mock counts, and the runtime configuration the
+dashboard's summary bar displays. See [Health Check](#-health-check).
 
 #### Admin
 
 ```
-GET    /admin/dashboard         # Web dashboard for request history
-GET    /admin/requests          # List recorded requests (filters: ?path=&method=&status=)
+GET    /admin/dashboard         # Web dashboard (Requests / Mocks / Sequences)
+GET    /admin/requests          # List recorded requests (see filters below)
 DELETE /admin/requests          # Clear recorded requests
+GET    /admin/mocks             # List every loaded mock, with matchers and hit counts
+GET    /admin/sequences         # Current step of every in-progress sequence
 POST   /admin/sequences/reset   # Reset sequence counters (optional: ?path=/api/submit)
 ```
 
-`POST /admin/sequences/reset` returns the number of counters that were reset:
+All admin endpoints are read-only apart from the two that say otherwise, and
+all return JSON — the dashboard is just one client of them.
+
+##### `GET /admin/requests`
+
+| Query param | Meaning |
+|-------------|---------|
+| `path` | Substring of the request path |
+| `method` | Exact method, case-insensitive |
+| `status` | Exact code (`404`) or class (`4xx`, `5xx`) |
+| `unmatched_only` | `true`/`1`/`yes` — only requests no mock served |
+| `search` | Case-insensitive text search over body, headers and query params |
+
+```bash
+# Every 4xx whose path mentions "user" and that nothing matched
+curl "http://localhost:8080/admin/requests?path=user&status=4xx&unmatched_only=true"
+```
+
+Each record carries the request as before, plus — when there is something to
+report — the response served and the match diagnosis:
+
+```json
+{
+  "id": 12,
+  "timestamp": "2026-08-07T10:15:04Z",
+  "method": "GET",
+  "path": "/users/42",
+  "query_params": {},
+  "headers": { "accept": "application/json", "authorization": "[REDACTED]" },
+  "matched_mock": "GET:/users/42",
+  "response_status": 200,
+  "response_body": "{\"id\":42}",
+  "response_headers": { "content-type": "application/json" },
+  "match_score": 900,
+  "path_params": { "id": "42" },
+  "match_explanation": "matched mocks/get_users_id.json (score 900: method+path 1000, path pattern -100)"
+}
+```
+
+Every field after `response_status` is additive and omitted when empty, so
+existing consumers of this endpoint keep working unchanged.
+
+##### `GET /admin/mocks`
+
+```json
+{
+  "count": 12,
+  "mocks": [
+    {
+      "key": "GET:/users/:id",
+      "index": 0,
+      "method": "GET",
+      "path": "/users/:id",
+      "status": 200,
+      "source": "mocks/generated/get_users_id.json",
+      "has_path_params": true,
+      "matchers": { "query_params": false, "headers": true, "body": false },
+      "delay_ms": null,
+      "sequence_steps": null,
+      "response_headers": 1,
+      "consume_body": false,
+      "hits": 4,
+      "config": { "method": "GET", "path": "/users/:id", "status": 200, "response": {} }
+    }
+  ]
+}
+```
+
+`source` is the file the mock was loaded from, and is absent for mocks not read
+from disk. `config` is the full `MockConfig`. `hits` counts requests served by
+that specific mock, so two mocks sharing a path stay distinguishable. The
+endpoint reads through the same lock hot reload writes to, so it always reflects
+the mock set currently serving.
+
+##### `GET /admin/sequences`
+
+```json
+{
+  "count": 1,
+  "sequences": [
+    {
+      "key": "POST:/submit#0",
+      "method": "POST",
+      "path": "/submit",
+      "step": 2,
+      "total": 3,
+      "source": "mocks/post_submit.json"
+    }
+  ]
+}
+```
+
+`step` is how many calls the sequence has served — the index of the step the
+next request will get. A sequence appears only once it has served a request.
+
+##### `POST /admin/sequences/reset`
+
+Returns the number of counters that were reset:
 
 ```json
 { "reset": 2 }
