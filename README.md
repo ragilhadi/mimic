@@ -1342,7 +1342,7 @@ curl http://localhost:8080/health
   "mocks_loaded": 5,
   "mock_count": 7,
   "service": "mimic",
-  "version": "0.1.0",
+  "version": "1.11.0",
   "uptime_seconds": 4021,
   "port": 8080,
   "max_body_size": 10485760,
