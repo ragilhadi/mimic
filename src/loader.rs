@@ -132,8 +132,14 @@ fn load_single_mock(path: &Path) -> Result<MockConfig, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
 
-    let mock: MockConfig = serde_json::from_str(&contents)
+    let mut mock: MockConfig = serde_json::from_str(&contents)
         .map_err(|e| format!("Failed to parse JSON in {}: {}", path.display(), e))?;
+
+    // The file this mock came from is the answer to "where do I go to change
+    // this?", so it's recorded here rather than dropped after the parse.
+    // Assigned unconditionally: `source` is loader-owned, and a value written
+    // into the mock JSON by hand must not be able to misattribute a mock.
+    mock.source = Some(path.display().to_string());
 
     // Validate required fields
     if mock.method.is_empty() {
@@ -371,6 +377,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
 
@@ -516,5 +523,58 @@ mod tests {
             assert_eq!(mocks.len(), 1);
             assert!(mocks.contains_key("GET:/users"));
         }
+    }
+
+    #[test]
+    fn test_loader_records_the_source_file() {
+        // `/admin/mocks` answers "where do I go to change this?", which needs
+        // the file the mock came from rather than just its contents.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("get_users.json");
+        fs::write(
+            &file,
+            r#"{"method":"GET","path":"/users","status":200,"response":{"ok":true}}"#,
+        )
+        .unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        let mock = &result.mocks["GET:/users"][0];
+        assert_eq!(mock.source.as_deref(), Some(file.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_loader_records_the_source_of_a_single_file_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.json");
+        fs::write(
+            &file,
+            r#"{"method":"POST","path":"/login","status":201,"response":{}}"#,
+        )
+        .unwrap();
+
+        let result = load_mocks_map(file.to_str().unwrap());
+        assert_eq!(
+            result.mocks["POST:/login"][0].source.as_deref(),
+            Some(file.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_loader_overrides_a_source_written_into_the_mock_file() {
+        // `source` is loader-owned. A value typed into the JSON by hand must
+        // not be able to point the dashboard at someone else's file.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sneaky.json");
+        fs::write(
+            &file,
+            r#"{"method":"GET","path":"/x","status":200,"response":{},"source":"/etc/passwd"}"#,
+        )
+        .unwrap();
+
+        let result = load_mocks_map(file.to_str().unwrap());
+        assert_eq!(
+            result.mocks["GET:/x"][0].source.as_deref(),
+            Some(file.to_str().unwrap())
+        );
     }
 }

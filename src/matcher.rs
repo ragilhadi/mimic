@@ -7,14 +7,269 @@
 
 use crate::regex_cache::{cached, compiled_regex, CompileCache};
 use crate::types::{
-    BodyMatcher, FormBodyMatcher, HeaderMatcher, HeaderPattern, HeaderValue, JsonBodyMatcher,
-    MockConfig, QueryParamMatcher, QueryParamPattern, QueryParamValue, TextBodyMatcher,
+    is_sensitive_header, BodyMatcher, FormBodyMatcher, HeaderMatcher, HeaderPattern, HeaderValue,
+    JsonBodyMatcher, MockConfig, QueryParamMatcher, QueryParamPattern, QueryParamValue,
+    TextBodyMatcher,
 };
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
+
+// ============================================================================
+// Rejection Reasons - why a matcher turned a mock down
+// ============================================================================
+
+/// Placeholder substituted for any value belonging to a sensitive header.
+const REDACTED: &str = "[REDACTED]";
+
+/// Longest value echoed back inside a rejection reason, in characters.
+const MAX_DISPLAY_LEN: usize = 80;
+
+/// The first thing about a request that made a mock's matchers turn it down.
+///
+/// Produced by the `*_reject_reason` functions — which *are* the matchers,
+/// with the `match_*` booleans defined as `reason.is_none()` — so an
+/// explanation can never describe a rule the server doesn't enforce.
+///
+/// Values carried here are display-ready: already truncated, and already
+/// redacted when they belong to a sensitive header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    QueryParamMissing {
+        name: String,
+    },
+    QueryParamMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+    /// `strict: true` and the request carried a query param the mock doesn't declare
+    QueryParamExtra {
+        name: String,
+    },
+    HeaderMissing {
+        name: String,
+    },
+    HeaderMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+    HeaderForbidden {
+        name: String,
+    },
+    /// `strict: true` and the request carried a header the mock doesn't declare
+    HeaderExtra {
+        name: String,
+    },
+    /// The mock declares a body matcher, but no body was read for this request
+    BodyAbsent,
+    /// The mock expects an empty body and the request carried one
+    BodyNotEmpty,
+    /// The body couldn't be read as the kind the matcher expects
+    BodyWrongKind {
+        expected: &'static str,
+    },
+    JsonExact,
+    JsonFieldMissing {
+        field: String,
+    },
+    JsonFieldMismatch {
+        field: String,
+    },
+    JsonFieldExtra {
+        field: String,
+    },
+    JsonArrayLength {
+        field: String,
+        expected: usize,
+        actual: usize,
+    },
+    TextExact,
+    TextContains {
+        substring: String,
+    },
+    TextRegex {
+        pattern: String,
+    },
+    /// A configured regex failed to compile, so nothing can match it
+    InvalidRegex {
+        pattern: String,
+    },
+    FormFieldMissing {
+        field: String,
+    },
+    FormFieldMismatch {
+        field: String,
+    },
+    FormFieldExtra {
+        field: String,
+    },
+}
+
+impl fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RejectReason::QueryParamMissing { name } => {
+                write!(f, "required query param `{}` was absent", name)
+            }
+            RejectReason::QueryParamMismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "query param `{}` was `{}`, expected {}",
+                name, actual, expected
+            ),
+            RejectReason::QueryParamExtra { name } => write!(
+                f,
+                "strict query matching rejected the undeclared param `{}`",
+                name
+            ),
+            RejectReason::HeaderMissing { name } => {
+                write!(f, "required header `{}` was absent", name)
+            }
+            RejectReason::HeaderMismatch {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "header `{}` was `{}`, expected {}",
+                name, actual, expected
+            ),
+            RejectReason::HeaderForbidden { name } => {
+                write!(f, "forbidden header `{}` was present", name)
+            }
+            RejectReason::HeaderExtra { name } => write!(
+                f,
+                "strict header matching rejected the undeclared header `{}`",
+                name
+            ),
+            RejectReason::BodyAbsent => {
+                write!(f, "the mock requires a request body and none was sent")
+            }
+            RejectReason::BodyNotEmpty => {
+                write!(f, "the mock requires an empty body and one was sent")
+            }
+            RejectReason::BodyWrongKind { expected } => {
+                write!(f, "the body could not be read as {}", expected)
+            }
+            RejectReason::JsonExact => write!(f, "the JSON body did not match `exact`"),
+            RejectReason::JsonFieldMissing { field } => {
+                write!(f, "JSON body is missing the field `{}`", field)
+            }
+            RejectReason::JsonFieldMismatch { field } => {
+                write!(f, "JSON body field `{}` has a different value", field)
+            }
+            RejectReason::JsonFieldExtra { field } => write!(
+                f,
+                "strict JSON matching rejected the undeclared field `{}`",
+                field
+            ),
+            RejectReason::JsonArrayLength {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "strict JSON matching expected {} item(s) in `{}`, got {}",
+                expected, field, actual
+            ),
+            RejectReason::TextExact => write!(f, "the text body did not match `exact`"),
+            RejectReason::TextContains { substring } => {
+                write!(f, "the text body does not contain `{}`", substring)
+            }
+            RejectReason::TextRegex { pattern } => {
+                write!(f, "the text body does not match the regex `{}`", pattern)
+            }
+            RejectReason::InvalidRegex { pattern } => {
+                write!(f, "the configured regex `{}` is invalid", pattern)
+            }
+            RejectReason::FormFieldMissing { field } => {
+                write!(f, "form body is missing the field `{}`", field)
+            }
+            RejectReason::FormFieldMismatch { field } => {
+                write!(f, "form body field `{}` has a different value", field)
+            }
+            RejectReason::FormFieldExtra { field } => write!(
+                f,
+                "strict form matching rejected the undeclared field `{}`",
+                field
+            ),
+        }
+    }
+}
+
+/// Shorten `value` to [`MAX_DISPLAY_LEN`] characters (not bytes, so a
+/// multi-byte character is never cut in half), marking anything dropped.
+fn truncate_for_display(value: &str) -> String {
+    match value.char_indices().nth(MAX_DISPLAY_LEN) {
+        Some((byte_idx, _)) => format!("{}…", &value[..byte_idx]),
+        None => value.to_string(),
+    }
+}
+
+/// Describe the root of a dotted field path, which is empty when the mismatch
+/// is the JSON document itself rather than a field within it.
+fn describe_field_path(field_path: &str) -> String {
+    if field_path.is_empty() {
+        "(root)".to_string()
+    } else {
+        field_path.to_string()
+    }
+}
+
+/// Render a query param expectation the way a human would read it.
+fn describe_query_value(expected: &QueryParamValue) -> String {
+    match expected {
+        QueryParamValue::Exact(value) => format!("`{}`", truncate_for_display(value)),
+        QueryParamValue::Pattern(QueryParamPattern::Regex(pattern)) => {
+            format!("a match for `{}`", truncate_for_display(pattern))
+        }
+        QueryParamValue::Pattern(QueryParamPattern::Any) => "any value".to_string(),
+    }
+}
+
+/// Render a header expectation the way a human would read it.
+fn describe_header_value(expected: &HeaderValue) -> String {
+    match expected {
+        HeaderValue::Exact(value) => format!("`{}`", truncate_for_display(value)),
+        HeaderValue::Pattern(HeaderPattern::Regex(pattern)) => {
+            format!("a match for `{}`", truncate_for_display(pattern))
+        }
+        HeaderValue::Pattern(HeaderPattern::Any) => "any value".to_string(),
+        HeaderValue::Pattern(HeaderPattern::Prefix(prefix)) => {
+            format!("a value starting with `{}`", truncate_for_display(prefix))
+        }
+        HeaderValue::Pattern(HeaderPattern::Contains(substring)) => {
+            format!("a value containing `{}`", truncate_for_display(substring))
+        }
+    }
+}
+
+/// A map's entries, ordered by key.
+///
+/// `HashMap` iteration order is reseeded per process, so walking a matcher's
+/// requirements directly would let two equally-failing rules take turns being
+/// "the reason" across restarts. Explanations are compared and screenshotted
+/// by humans; they need to be reproducible.
+fn sorted_by_key<V>(map: &HashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut entries: Vec<(&String, &V)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+}
+
+/// A map's keys, ordered — see [`sorted_by_key`].
+fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<&String> {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    keys
+}
 
 // ============================================================================
 // Request Context - Parsed request data for matching
@@ -82,12 +337,26 @@ pub fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
 }
 
 /// Check if request query params match the mock's requirements
+#[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
 pub fn match_query_params(
     request_params: &HashMap<String, String>,
     matcher: &QueryParamMatcher,
 ) -> bool {
-    // Check all required params match
-    for (key, expected_value) in &matcher.params {
+    query_params_reject_reason(request_params, matcher).is_none()
+}
+
+/// Why `matcher` rejects `request_params`, or `None` if it accepts them.
+///
+/// This is the query-parameter matcher; [`match_query_params`] is the boolean
+/// view of it. Keeping one implementation is what stops the dashboard's
+/// explanations from describing a matcher the server doesn't actually run.
+pub fn query_params_reject_reason(
+    request_params: &HashMap<String, String>,
+    matcher: &QueryParamMatcher,
+) -> Option<RejectReason> {
+    // Check all required params match. Iterated in name order so a mock with
+    // several failing params always reports the same one.
+    for (key, expected_value) in sorted_by_key(&matcher.params) {
         match request_params.get(key) {
             Some(actual_value) => {
                 if !match_query_param_value(actual_value, expected_value) {
@@ -95,27 +364,31 @@ pub fn match_query_params(
                         "Query param '{}' mismatch: expected {:?}, got '{}'",
                         key, expected_value, actual_value
                     );
-                    return false;
+                    return Some(RejectReason::QueryParamMismatch {
+                        name: key.clone(),
+                        expected: describe_query_value(expected_value),
+                        actual: truncate_for_display(actual_value),
+                    });
                 }
             }
             None => {
                 debug!("Required query param '{}' is missing", key);
-                return false;
+                return Some(RejectReason::QueryParamMissing { name: key.clone() });
             }
         }
     }
 
     // If strict mode, check for extra params
     if matcher.strict {
-        for key in request_params.keys() {
+        for key in sorted_keys(request_params) {
             if !matcher.params.contains_key(key) {
                 debug!("Strict mode: extra query param '{}' found", key);
-                return false;
+                return Some(RejectReason::QueryParamExtra { name: key.clone() });
             }
         }
     }
 
-    true
+    None
 }
 
 /// Match a single query parameter value
@@ -168,9 +441,25 @@ pub const IGNORED_HEADERS: &[&str] = &[
 ];
 
 /// Check if request headers match the mock's requirements
+#[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
 pub fn match_headers(request_headers: &HashMap<String, String>, matcher: &HeaderMatcher) -> bool {
-    // Check all required headers match
-    for (name, expected_value) in &matcher.required {
+    headers_reject_reason(request_headers, matcher).is_none()
+}
+
+/// Why `matcher` rejects `request_headers`, or `None` if it accepts them.
+///
+/// This is the header matcher; [`match_headers`] is the boolean view of it.
+///
+/// Header *values* — both the request's and the mock's expectation — are
+/// redacted here, at construction, whenever the header is sensitive. The
+/// reason value therefore never carries a credential in the first place, so
+/// no downstream formatting or serialization can leak one.
+pub fn headers_reject_reason(
+    request_headers: &HashMap<String, String>,
+    matcher: &HeaderMatcher,
+) -> Option<RejectReason> {
+    // Check all required headers match, in name order for a stable report
+    for (name, expected_value) in sorted_by_key(&matcher.required) {
         let normalized_name = name.to_lowercase();
 
         match request_headers.get(&normalized_name) {
@@ -180,12 +469,29 @@ pub fn match_headers(request_headers: &HashMap<String, String>, matcher: &Header
                         "Header '{}' mismatch: expected {:?}, got '{}'",
                         name, expected_value, actual_value
                     );
-                    return false;
+                    let sensitive = is_sensitive_header(&normalized_name);
+                    return Some(RejectReason::HeaderMismatch {
+                        name: normalized_name,
+                        // Backticked to match the shape of a real expectation,
+                        // so both halves of the message read alike
+                        expected: if sensitive {
+                            format!("`{}`", REDACTED)
+                        } else {
+                            describe_header_value(expected_value)
+                        },
+                        actual: if sensitive {
+                            REDACTED.to_string()
+                        } else {
+                            truncate_for_display(actual_value)
+                        },
+                    });
                 }
             }
             None => {
                 debug!("Required header '{}' is missing", name);
-                return false;
+                return Some(RejectReason::HeaderMissing {
+                    name: normalized_name,
+                });
             }
         }
     }
@@ -196,13 +502,15 @@ pub fn match_headers(request_headers: &HashMap<String, String>, matcher: &Header
 
         if request_headers.contains_key(&normalized_name) {
             debug!("Forbidden header '{}' is present", forbidden_name);
-            return false;
+            return Some(RejectReason::HeaderForbidden {
+                name: normalized_name,
+            });
         }
     }
 
     // If strict mode, check for extra headers (excluding standard ones)
     if matcher.strict {
-        for name in request_headers.keys() {
+        for name in sorted_keys(request_headers) {
             if IGNORED_HEADERS.contains(&name.as_str()) {
                 continue;
             }
@@ -214,12 +522,12 @@ pub fn match_headers(request_headers: &HashMap<String, String>, matcher: &Header
 
             if !is_required {
                 debug!("Strict mode: extra header '{}' found", name);
-                return false;
+                return Some(RejectReason::HeaderExtra { name: name.clone() });
             }
         }
     }
 
-    true
+    None
 }
 
 /// Match a single header value
@@ -311,97 +619,156 @@ fn parse_form_data(text: &str) -> HashMap<String, String> {
 }
 
 /// Check if request body matches the mock's requirements
+#[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
 pub fn match_body(parsed_body: &ParsedBody, matcher: &BodyMatcher) -> bool {
-    match matcher {
-        BodyMatcher::Any => true,
+    body_reject_reason(parsed_body, matcher).is_none()
+}
 
-        BodyMatcher::Empty => matches!(parsed_body, ParsedBody::Empty),
+/// Why `matcher` rejects `parsed_body`, or `None` if it accepts it.
+///
+/// This is the body matcher; [`match_body`] is the boolean view of it.
+///
+/// Reasons name the *shape* of the mismatch — which JSON field, which form
+/// field, which configured substring — and never quote the request body back.
+/// The body is already stored on the record verbatim; repeating it inside an
+/// explanation only widens the surface a secret can appear on.
+pub fn body_reject_reason(parsed_body: &ParsedBody, matcher: &BodyMatcher) -> Option<RejectReason> {
+    match matcher {
+        BodyMatcher::Any => None,
+
+        BodyMatcher::Empty => {
+            if matches!(parsed_body, ParsedBody::Empty) {
+                None
+            } else {
+                Some(RejectReason::BodyNotEmpty)
+            }
+        }
 
         BodyMatcher::Json(json_matcher) => {
             if let ParsedBody::Json(actual) = parsed_body {
-                match_json_body(actual, json_matcher)
+                json_body_reject_reason(actual, json_matcher)
             } else if let ParsedBody::Text(text) = parsed_body {
                 // Try to parse text as JSON
                 if let Ok(actual) = serde_json::from_str(text) {
-                    match_json_body(&actual, json_matcher)
+                    json_body_reject_reason(&actual, json_matcher)
                 } else {
                     debug!("Body is not valid JSON");
-                    false
+                    Some(RejectReason::BodyWrongKind { expected: "JSON" })
                 }
             } else {
                 debug!("Expected JSON body, got {:?}", parsed_body);
-                false
+                Some(RejectReason::BodyWrongKind { expected: "JSON" })
             }
         }
 
         BodyMatcher::Text(text_matcher) => {
             if let ParsedBody::Text(actual) = parsed_body {
-                match_text_body(actual, text_matcher)
+                text_body_reject_reason(actual, text_matcher)
             } else if let ParsedBody::Json(json) = parsed_body {
                 // Convert JSON to string for text matching
                 let text = json.to_string();
-                match_text_body(&text, text_matcher)
+                text_body_reject_reason(&text, text_matcher)
             } else {
                 debug!("Expected text body");
-                false
+                Some(RejectReason::BodyWrongKind { expected: "text" })
             }
         }
 
         BodyMatcher::Form(form_matcher) => {
             if let ParsedBody::Form(actual) = parsed_body {
-                match_form_body(actual, form_matcher)
+                form_body_reject_reason(actual, form_matcher)
             } else if let ParsedBody::Text(text) = parsed_body {
                 // Try to parse as form data
                 let form = parse_form_data(text);
-                match_form_body(&form, form_matcher)
+                form_body_reject_reason(&form, form_matcher)
             } else {
                 debug!("Expected form body");
-                false
+                Some(RejectReason::BodyWrongKind {
+                    expected: "form data",
+                })
             }
         }
     }
 }
 
-/// Match JSON body
+#[allow(dead_code)] // boolean view of the matcher below; exercised by the test suite
 fn match_json_body(actual: &serde_json::Value, matcher: &JsonBodyMatcher) -> bool {
+    json_body_reject_reason(actual, matcher).is_none()
+}
+
+/// Why a JSON body matcher rejects `actual`, or `None` if it accepts it.
+fn json_body_reject_reason(
+    actual: &serde_json::Value,
+    matcher: &JsonBodyMatcher,
+) -> Option<RejectReason> {
     // Exact match
     if let Some(ref expected) = matcher.exact {
         if actual != expected {
             debug!("JSON exact match failed");
-            return false;
+            return Some(RejectReason::JsonExact);
         }
     }
 
     // Partial match
     if let Some(ref expected) = matcher.partial {
-        if !match_json_partial(actual, expected, matcher.strict) {
+        if let Some(reason) = json_partial_reject_reason(actual, expected, matcher.strict, "") {
             debug!("JSON partial match failed");
-            return false;
+            return Some(reason);
         }
     }
 
-    true
+    None
 }
 
 /// Partial JSON match: check if actual contains all fields from expected
+#[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
 fn match_json_partial(
     actual: &serde_json::Value,
     expected: &serde_json::Value,
     strict: bool,
 ) -> bool {
+    json_partial_reject_reason(actual, expected, strict, "").is_none()
+}
+
+/// Why a partial JSON match rejects `actual`, or `None` if it accepts it.
+///
+/// `field_path` is the dotted path walked so far (empty at the root), so a
+/// nested mismatch can name `user.address.city` rather than just "some field".
+fn json_partial_reject_reason(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    strict: bool,
+    field_path: &str,
+) -> Option<RejectReason> {
+    /// Extend a dotted field path with one more segment.
+    fn child(field_path: &str, key: &str) -> String {
+        if field_path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}.{}", field_path, key)
+        }
+    }
+
     match (actual, expected) {
         (serde_json::Value::Object(actual_obj), serde_json::Value::Object(expected_obj)) => {
             // Check all expected fields exist and match
             for (key, expected_value) in expected_obj {
                 match actual_obj.get(key) {
                     Some(actual_value) => {
-                        if !match_json_partial(actual_value, expected_value, strict) {
-                            return false;
+                        if let Some(reason) = json_partial_reject_reason(
+                            actual_value,
+                            expected_value,
+                            strict,
+                            &child(field_path, key),
+                        ) {
+                            return Some(reason);
                         }
                     }
                     None => {
                         debug!("Expected field '{}' missing in actual", key);
-                        return false;
+                        return Some(RejectReason::JsonFieldMissing {
+                            field: child(field_path, key),
+                        });
                     }
                 }
             }
@@ -411,44 +778,71 @@ fn match_json_partial(
                 for key in actual_obj.keys() {
                     if !expected_obj.contains_key(key) {
                         debug!("Strict mode: extra field '{}' in actual", key);
-                        return false;
+                        return Some(RejectReason::JsonFieldExtra {
+                            field: child(field_path, key),
+                        });
                     }
                 }
             }
 
-            true
+            None
         }
 
         (serde_json::Value::Array(actual_arr), serde_json::Value::Array(expected_arr)) => {
             if strict && actual_arr.len() != expected_arr.len() {
-                return false;
+                return Some(RejectReason::JsonArrayLength {
+                    field: describe_field_path(field_path),
+                    expected: expected_arr.len(),
+                    actual: actual_arr.len(),
+                });
             }
 
             // Check if all expected items match in order
             for (i, expected_item) in expected_arr.iter().enumerate() {
                 if let Some(actual_item) = actual_arr.get(i) {
-                    if !match_json_partial(actual_item, expected_item, strict) {
-                        return false;
+                    if let Some(reason) = json_partial_reject_reason(
+                        actual_item,
+                        expected_item,
+                        strict,
+                        &format!("{}[{}]", field_path, i),
+                    ) {
+                        return Some(reason);
                     }
                 } else {
-                    return false;
+                    return Some(RejectReason::JsonFieldMissing {
+                        field: format!("{}[{}]", field_path, i),
+                    });
                 }
             }
 
-            true
+            None
         }
 
-        _ => actual == expected,
+        _ => {
+            if actual == expected {
+                None
+            } else {
+                Some(RejectReason::JsonFieldMismatch {
+                    field: describe_field_path(field_path),
+                })
+            }
+        }
     }
 }
 
 /// Match text body
+#[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
 fn match_text_body(actual: &str, matcher: &TextBodyMatcher) -> bool {
+    text_body_reject_reason(actual, matcher).is_none()
+}
+
+/// Why a text body matcher rejects `actual`, or `None` if it accepts it.
+fn text_body_reject_reason(actual: &str, matcher: &TextBodyMatcher) -> Option<RejectReason> {
     // Exact match
     if let Some(ref expected) = matcher.exact {
         if actual != expected {
             debug!("Text exact match failed");
-            return false;
+            return Some(RejectReason::TextExact);
         }
     }
 
@@ -456,7 +850,9 @@ fn match_text_body(actual: &str, matcher: &TextBodyMatcher) -> bool {
     if let Some(ref substring) = matcher.contains {
         if !actual.contains(substring) {
             debug!("Text does not contain '{}'", substring);
-            return false;
+            return Some(RejectReason::TextContains {
+                substring: truncate_for_display(substring),
+            });
         }
     }
 
@@ -466,20 +862,35 @@ fn match_text_body(actual: &str, matcher: &TextBodyMatcher) -> bool {
             Some(re) => {
                 if !re.is_match(actual) {
                     debug!("Text does not match regex '{}'", pattern);
-                    return false;
+                    return Some(RejectReason::TextRegex {
+                        pattern: truncate_for_display(pattern),
+                    });
                 }
             }
-            None => return false,
+            None => {
+                return Some(RejectReason::InvalidRegex {
+                    pattern: truncate_for_display(pattern),
+                })
+            }
         }
     }
 
-    true
+    None
 }
 
 /// Match form body
+#[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
 fn match_form_body(actual: &HashMap<String, String>, matcher: &FormBodyMatcher) -> bool {
-    // Check all required fields match
-    for (key, expected_value) in &matcher.fields {
+    form_body_reject_reason(actual, matcher).is_none()
+}
+
+/// Why a form body matcher rejects `actual`, or `None` if it accepts it.
+fn form_body_reject_reason(
+    actual: &HashMap<String, String>,
+    matcher: &FormBodyMatcher,
+) -> Option<RejectReason> {
+    // Check all required fields match, in name order for a stable report
+    for (key, expected_value) in sorted_by_key(&matcher.fields) {
         match actual.get(key) {
             Some(actual_value) => {
                 if actual_value != expected_value {
@@ -487,27 +898,27 @@ fn match_form_body(actual: &HashMap<String, String>, matcher: &FormBodyMatcher) 
                         "Form field '{}' mismatch: expected '{}', got '{}'",
                         key, expected_value, actual_value
                     );
-                    return false;
+                    return Some(RejectReason::FormFieldMismatch { field: key.clone() });
                 }
             }
             None => {
                 debug!("Required form field '{}' is missing", key);
-                return false;
+                return Some(RejectReason::FormFieldMissing { field: key.clone() });
             }
         }
     }
 
     // If strict, check for extra fields
     if matcher.strict {
-        for key in actual.keys() {
+        for key in sorted_keys(actual) {
             if !matcher.fields.contains_key(key) {
                 debug!("Strict mode: extra form field '{}' found", key);
-                return false;
+                return Some(RejectReason::FormFieldExtra { field: key.clone() });
             }
         }
     }
 
-    true
+    None
 }
 
 // ============================================================================
@@ -628,6 +1039,9 @@ pub struct MatchResult {
     /// Number of literal (non-parameter) segments in the mock's declared
     /// path, used to break score ties in favor of the more specific route
     pub specificity: u32,
+    /// The components `score` was assembled from, so the win can be explained
+    /// without re-running the matchers
+    pub breakdown: ScoreBreakdown,
 }
 
 /// Count the literal — i.e. non-`:name`, non-`{name}` — segments of a declared
@@ -733,14 +1147,15 @@ pub fn find_matching_mock(
     // Exact match: O(1) lookup, no path params, full score.
     if let Some(mock_list) = mocks.get(&base_key) {
         for (index, mock) in mock_list.iter().enumerate() {
-            if let Some(score) = calculate_match_score(context, mock) {
+            if let Some(breakdown) = calculate_match_score(context, mock) {
                 candidates.push(MatchResult {
                     mock: mock.clone(),
-                    score,
+                    score: breakdown.total(),
                     index,
                     path_params: HashMap::new(),
                     matched_key: base_key.clone(),
                     specificity: path_specificity(&context.path),
+                    breakdown,
                 });
             }
         }
@@ -770,14 +1185,15 @@ pub fn find_matching_mock(
             };
 
             for (index, mock) in mock_list.iter().enumerate() {
-                if let Some(score) = calculate_match_score(context, mock) {
+                if let Some(breakdown) = calculate_match_score(context, mock) {
                     candidates.push(MatchResult {
                         mock: mock.clone(),
-                        score: score.saturating_sub(PATTERN_MATCH_PENALTY),
+                        score: breakdown.total().saturating_sub(PATTERN_MATCH_PENALTY),
                         index,
                         path_params: params.clone(),
                         matched_key: key.clone(),
                         specificity: path_specificity(path_part),
+                        breakdown,
                     });
                 }
             }
@@ -810,45 +1226,245 @@ pub fn find_matching_mock(
     }
 }
 
-/// Calculate match score for a mock
-/// Returns None if the mock doesn't match, Some(score) if it matches
-fn calculate_match_score(context: &RequestContext, mock: &MockConfig) -> Option<u32> {
-    let mut score: u32 = 1000; // Base score for method + path match
+/// Score awarded for a method + path match, before any matcher bonuses.
+const BASE_SCORE: u32 = 1000;
+/// Score added per declared query parameter.
+const QUERY_PARAM_SCORE: u32 = 100;
+/// Score added per declared required header.
+const HEADER_SCORE: u32 = 50;
+/// Score added for a satisfied body matcher.
+const BODY_SCORE: u32 = 500;
+
+/// How a mock's score was arrived at, kept so the dashboard can show the
+/// arithmetic instead of an unexplained number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScoreBreakdown {
+    pub base: u32,
+    pub query_params: u32,
+    pub headers: u32,
+    pub body: u32,
+}
+
+impl ScoreBreakdown {
+    fn total(&self) -> u32 {
+        self.base + self.query_params + self.headers + self.body
+    }
+}
+
+/// The outcome of running every one of a mock's matchers against a request.
+#[derive(Debug, Clone)]
+pub enum Evaluation {
+    Matched(ScoreBreakdown),
+    Rejected(RejectReason),
+}
+
+/// Run a mock's matchers against a request: the single place matching is
+/// decided.
+///
+/// [`calculate_match_score`] (does it match, and how well?) and
+/// [`explain_no_match`] (why didn't it?) are both views of this one function,
+/// which is what keeps the dashboard's explanations honest.
+pub fn evaluate_mock(context: &RequestContext, mock: &MockConfig) -> Evaluation {
+    let mut breakdown = ScoreBreakdown {
+        base: BASE_SCORE, // Base score for method + path match
+        ..Default::default()
+    };
 
     // Check query params
     if let Some(ref query_matcher) = mock.query_params {
-        if !match_query_params(&context.query_params, query_matcher) {
-            return None;
+        if let Some(reason) = query_params_reject_reason(&context.query_params, query_matcher) {
+            return Evaluation::Rejected(reason);
         }
         // Add score based on number of matched params
-        score += (query_matcher.params.len() as u32) * 100;
+        breakdown.query_params = (query_matcher.params.len() as u32) * QUERY_PARAM_SCORE;
     }
 
     // Check headers
     if let Some(ref header_matcher) = mock.headers {
-        if !match_headers(&context.headers, header_matcher) {
-            return None;
+        if let Some(reason) = headers_reject_reason(&context.headers, header_matcher) {
+            return Evaluation::Rejected(reason);
         }
         // Add score based on number of matched headers
-        score += (header_matcher.required.len() as u32) * 50;
+        breakdown.headers = (header_matcher.required.len() as u32) * HEADER_SCORE;
     }
 
     // Check body
     if let Some(ref body_matcher) = mock.body {
         if let Some(ref body_bytes) = context.body {
             let parsed_body = parse_body(body_bytes, context.content_type.as_deref());
-            if !match_body(&parsed_body, body_matcher) {
-                return None;
+            if let Some(reason) = body_reject_reason(&parsed_body, body_matcher) {
+                return Evaluation::Rejected(reason);
             }
             // Body matching is worth the most
-            score += 500;
+            breakdown.body = BODY_SCORE;
         } else if !matches!(body_matcher, BodyMatcher::Empty | BodyMatcher::Any) {
             // Body required but not present
-            return None;
+            return Evaluation::Rejected(RejectReason::BodyAbsent);
         }
     }
 
-    Some(score)
+    Evaluation::Matched(breakdown)
+}
+
+/// Calculate match score for a mock
+/// Returns None if the mock doesn't match, Some(score) if it matches
+fn calculate_match_score(context: &RequestContext, mock: &MockConfig) -> Option<ScoreBreakdown> {
+    match evaluate_mock(context, mock) {
+        Evaluation::Matched(breakdown) => Some(breakdown),
+        Evaluation::Rejected(_) => None,
+    }
+}
+
+// ============================================================================
+// Match Explanations - why this mock, or why none
+// ============================================================================
+
+/// How a mock is named in an explanation: its source file when it was loaded
+/// from one, otherwise its registration key and position.
+fn describe_mock(mock: &MockConfig, key: &str, index: usize) -> String {
+    match mock.source {
+        Some(ref source) => source.clone(),
+        None => format!("`{}` #{}", key, index),
+    }
+}
+
+/// Explain, in one line, why the winning mock won.
+///
+/// Reads only the [`MatchResult`], whose breakdown was recorded when the score
+/// was computed — nothing is re-derived here, so the arithmetic shown is
+/// always the arithmetic that ran.
+pub fn explain_match(result: &MatchResult) -> String {
+    let mut parts = vec![format!("method+path {}", result.breakdown.base)];
+    if result.breakdown.query_params > 0 {
+        parts.push(format!("query params +{}", result.breakdown.query_params));
+    }
+    if result.breakdown.headers > 0 {
+        parts.push(format!("headers +{}", result.breakdown.headers));
+    }
+    if result.breakdown.body > 0 {
+        parts.push(format!("body +{}", result.breakdown.body));
+    }
+    // A pattern route always captures at least one parameter, so a non-empty
+    // capture map is exactly the case the penalty was applied to.
+    if !result.path_params.is_empty() {
+        parts.push(format!("path pattern -{}", PATTERN_MATCH_PENALTY));
+    }
+
+    format!(
+        "matched {} (score {}: {})",
+        describe_mock(&result.mock, &result.matched_key, result.index),
+        result.score,
+        parts.join(", ")
+    )
+}
+
+/// Longest list of near-miss candidates spelled out in a no-match explanation.
+const MAX_EXPLAINED_CANDIDATES: usize = 5;
+
+/// Explain why nothing matched: which mocks were even in the running, and the
+/// first matcher that rejected each.
+///
+/// Candidates are gathered exactly the way [`find_matching_mock`] gathers
+/// them — the mocks under the request's `METHOD:path` key, plus any pattern
+/// route whose template the path fits — and each is judged by the same
+/// [`evaluate_mock`] that produced the 404.
+///
+/// Meant to be called only on the 404 path: it walks the mock map and formats
+/// strings, so the matched path never pays for it.
+pub fn explain_no_match(
+    context: &RequestContext,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+) -> Option<String> {
+    let base_key = crate::types::create_mock_key(&context.method, &context.path);
+    let mut candidates: Vec<(String, RejectReason)> = Vec::new();
+
+    let mut collect = |key: &str, mock_list: &[MockConfig]| {
+        for (index, mock) in mock_list.iter().enumerate() {
+            if let Evaluation::Rejected(reason) = evaluate_mock(context, mock) {
+                candidates.push((describe_mock(mock, key, index), reason));
+            }
+        }
+    };
+
+    if let Some(mock_list) = mocks.get(&base_key) {
+        collect(&base_key, mock_list);
+    }
+
+    // Pattern routes are candidates for this path too — sorted so the report
+    // doesn't reshuffle with `HashMap` iteration order.
+    let method_prefix = format!("{}:", context.method.to_uppercase());
+    for key in sorted_keys(mocks) {
+        if *key == base_key {
+            continue;
+        }
+        let Some(path_part) = key.strip_prefix(method_prefix.as_str()) else {
+            continue;
+        };
+        if !is_pattern_path(path_part) {
+            continue;
+        }
+        let Some(pattern) = compile_path_pattern(path_part) else {
+            continue;
+        };
+        if match_path_pattern(&pattern, &context.path).is_none() {
+            continue;
+        }
+        if let Some(mock_list) = mocks.get(key) {
+            collect(key, mock_list);
+        }
+    }
+
+    if candidates.is_empty() {
+        // Nothing was even registered for this method+path. The most common
+        // cause by far is the right path on the wrong method, so say so when
+        // that's what happened.
+        let other_methods = methods_registered_for_path(&context.path, mocks);
+        return Some(if other_methods.is_empty() {
+            format!("no mock is registered for `{}`", base_key)
+        } else {
+            format!(
+                "no mock is registered for `{}` — `{}` is registered for {}",
+                base_key,
+                context.path,
+                other_methods.join(", ")
+            )
+        });
+    }
+
+    let shown: Vec<String> = candidates
+        .iter()
+        .take(MAX_EXPLAINED_CANDIDATES)
+        .map(|(name, reason)| format!("{} — {}", name, reason))
+        .collect();
+
+    let mut explanation = format!(
+        "{} candidate mock(s) for `{}`, none matched: {}",
+        candidates.len(),
+        base_key,
+        shown.join("; ")
+    );
+    if candidates.len() > shown.len() {
+        explanation.push_str(&format!(" (+{} more)", candidates.len() - shown.len()));
+    }
+    Some(explanation)
+}
+
+/// The methods, sorted, that some mock is registered under for `path` —
+/// the "you meant POST, didn't you?" hint.
+fn methods_registered_for_path(
+    path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+) -> Vec<String> {
+    let mut methods: Vec<String> = mocks
+        .keys()
+        .filter_map(|key| {
+            let (method, key_path) = key.split_once(':')?;
+            (key_path == path).then(|| method.to_string())
+        })
+        .collect();
+    methods.sort();
+    methods.dedup();
+    methods
 }
 
 // ============================================================================
@@ -1187,6 +1803,7 @@ mod tests {
             })),
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         };
 
@@ -1309,6 +1926,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         }
     }
@@ -1441,6 +2059,7 @@ mod tests {
             body: None,
             delay_ms: None,
             response_headers: None,
+            source: None,
             sequence: None,
         }
     }
@@ -1744,6 +2363,7 @@ mod benches {
                     body: None,
                     delay_ms: None,
                     response_headers: None,
+                    source: None,
                     sequence: None,
                 }],
             );
@@ -1761,6 +2381,7 @@ mod benches {
                 body: None,
                 delay_ms: None,
                 response_headers: None,
+                source: None,
                 sequence: None,
             }],
         );
@@ -1797,6 +2418,654 @@ mod benches {
         println!(
             "recompiling 20 path templates: {:?}/op",
             start.elapsed() / n
+        );
+    }
+}
+
+// ============================================================================
+// Match Explanation Tests
+// ============================================================================
+
+#[cfg(test)]
+mod explanation_tests {
+    use super::*;
+    use crate::types::{FormBodyMatcher, TextBodyMatcher};
+
+    /// A bare mock with no matchers, which every request matches.
+    fn plain_mock(method: &str, path: &str) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: serde_json::json!({"ok": true}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            source: None,
+            sequence: None,
+        }
+    }
+
+    fn ctx(method: &str, path: &str) -> RequestContext {
+        RequestContext::new(method.to_string(), path.to_string())
+    }
+
+    fn store(mocks: Vec<MockConfig>) -> HashMap<String, Vec<MockConfig>> {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for mock in mocks {
+            let key = crate::types::create_mock_key(&mock.method, &mock.path);
+            map.entry(key).or_default().push(mock);
+        }
+        map
+    }
+
+    fn header_matcher(name: &str, value: HeaderValue) -> HeaderMatcher {
+        let mut required = HashMap::new();
+        required.insert(name.to_string(), value);
+        HeaderMatcher {
+            required,
+            forbidden: Vec::new(),
+            strict: false,
+        }
+    }
+
+    // ── explain_no_match: nothing registered ────────────────────────────
+
+    #[test]
+    fn explain_no_match_reports_an_unregistered_route() {
+        let mocks = store(vec![plain_mock("GET", "/users")]);
+        let explanation = explain_no_match(&ctx("GET", "/orders"), &mocks).unwrap();
+        assert!(
+            explanation.contains("no mock is registered for `GET:/orders`"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_points_at_the_other_method_on_the_same_path() {
+        // The most common 404 by far: right path, wrong verb.
+        let mocks = store(vec![
+            plain_mock("POST", "/users"),
+            plain_mock("PUT", "/users"),
+        ]);
+        let explanation = explain_no_match(&ctx("GET", "/users"), &mocks).unwrap();
+        assert!(explanation.contains("no mock is registered for `GET:/users`"));
+        assert!(explanation.contains("POST"), "{}", explanation);
+        assert!(explanation.contains("PUT"), "{}", explanation);
+    }
+
+    // ── explain_no_match: one case per matcher kind ─────────────────────
+
+    #[test]
+    fn explain_no_match_names_an_absent_required_header() {
+        let mut mock = plain_mock("GET", "/users");
+        mock.source = Some("mocks/get_users.json".to_string());
+        mock.headers = Some(header_matcher(
+            "x-api-key",
+            HeaderValue::Exact("secret".to_string()),
+        ));
+
+        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![mock])).unwrap();
+        assert!(explanation.contains("1 candidate mock(s) for `GET:/users`"));
+        assert!(
+            explanation.contains("mocks/get_users.json"),
+            "{}",
+            explanation
+        );
+        assert!(
+            explanation.contains("required header `x-api-key` was absent"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_names_a_mismatched_header_value() {
+        let mut mock = plain_mock("GET", "/users");
+        mock.headers = Some(header_matcher(
+            "x-tenant",
+            HeaderValue::Exact("acme".to_string()),
+        ));
+
+        let mut context = ctx("GET", "/users");
+        context
+            .headers
+            .insert("x-tenant".to_string(), "globex".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("header `x-tenant` was `globex`"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("expected `acme`"), "{}", explanation);
+    }
+
+    #[test]
+    fn explain_no_match_names_a_forbidden_header() {
+        let mut mock = plain_mock("GET", "/users");
+        mock.headers = Some(HeaderMatcher {
+            required: HashMap::new(),
+            forbidden: vec!["x-debug".to_string()],
+            strict: false,
+        });
+
+        let mut context = ctx("GET", "/users");
+        context
+            .headers
+            .insert("x-debug".to_string(), "1".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("forbidden header `x-debug` was present"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_names_an_absent_query_param() {
+        let mut mock = plain_mock("GET", "/users");
+        let mut params = HashMap::new();
+        params.insert("page".to_string(), QueryParamValue::Exact("1".to_string()));
+        mock.query_params = Some(QueryParamMatcher {
+            params,
+            strict: false,
+        });
+
+        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("required query param `page` was absent"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_describes_a_query_param_pattern() {
+        let mut mock = plain_mock("GET", "/users");
+        let mut params = HashMap::new();
+        params.insert(
+            "page".to_string(),
+            QueryParamValue::Pattern(QueryParamPattern::Regex("^[0-9]+$".to_string())),
+        );
+        mock.query_params = Some(QueryParamMatcher {
+            params,
+            strict: false,
+        });
+
+        let mut context = ctx("GET", "/users");
+        context
+            .query_params
+            .insert("page".to_string(), "abc".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("query param `page` was `abc`"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("^[0-9]+$"), "{}", explanation);
+    }
+
+    #[test]
+    fn explain_no_match_reports_a_missing_body() {
+        let mut mock = plain_mock("POST", "/login");
+        mock.body = Some(BodyMatcher::Json(JsonBodyMatcher {
+            exact: None,
+            partial: Some(serde_json::json!({"user": "alice"})),
+            strict: false,
+        }));
+
+        let explanation = explain_no_match(&ctx("POST", "/login"), &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("requires a request body and none was sent"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_names_the_missing_json_field() {
+        let mut mock = plain_mock("POST", "/login");
+        mock.body = Some(BodyMatcher::Json(JsonBodyMatcher {
+            exact: None,
+            partial: Some(serde_json::json!({"user": {"name": "alice"}})),
+            strict: false,
+        }));
+
+        let mut context = ctx("POST", "/login");
+        context.body = Some(Bytes::from(r#"{"user":{"id":1}}"#));
+        context.content_type = Some("application/json".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("missing the field `user.name`"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_names_the_mismatched_json_field() {
+        let mut mock = plain_mock("POST", "/login");
+        mock.body = Some(BodyMatcher::Json(JsonBodyMatcher {
+            exact: None,
+            partial: Some(serde_json::json!({"role": "admin"})),
+            strict: false,
+        }));
+
+        let mut context = ctx("POST", "/login");
+        context.body = Some(Bytes::from(r#"{"role":"guest"}"#));
+        context.content_type = Some("application/json".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("field `role` has a different value"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_reports_a_text_body_substring() {
+        let mut mock = plain_mock("POST", "/notes");
+        mock.body = Some(BodyMatcher::Text(TextBodyMatcher {
+            exact: None,
+            contains: Some("urgent".to_string()),
+            regex: None,
+        }));
+
+        let mut context = ctx("POST", "/notes");
+        context.body = Some(Bytes::from("just a note"));
+        context.content_type = Some("text/plain".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("does not contain `urgent`"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_reports_a_form_field() {
+        let mut mock = plain_mock("POST", "/form");
+        let mut fields = HashMap::new();
+        fields.insert("plan".to_string(), "pro".to_string());
+        mock.body = Some(BodyMatcher::Form(FormBodyMatcher {
+            fields,
+            strict: false,
+        }));
+
+        let mut context = ctx("POST", "/form");
+        context.body = Some(Bytes::from("plan=free"));
+        context.content_type = Some("application/x-www-form-urlencoded".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("form body field `plan` has a different value"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_reports_an_expected_empty_body() {
+        let mut mock = plain_mock("POST", "/ping");
+        mock.body = Some(BodyMatcher::Empty);
+
+        let mut context = ctx("POST", "/ping");
+        context.body = Some(Bytes::from("nope"));
+        context.content_type = Some("text/plain".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("requires an empty body"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_covers_pattern_routes() {
+        // `/users/42` never matches an exact key, so the candidate has to be
+        // found through the same pattern scan the matcher itself uses.
+        let mut mock = plain_mock("GET", "/users/:id");
+        mock.source = Some("mocks/get_user.json".to_string());
+        mock.headers = Some(header_matcher(
+            "x-api-key",
+            HeaderValue::Pattern(HeaderPattern::Any),
+        ));
+
+        let explanation = explain_no_match(&ctx("GET", "/users/42"), &store(vec![mock])).unwrap();
+        assert!(
+            explanation.contains("mocks/get_user.json"),
+            "{}",
+            explanation
+        );
+        assert!(
+            explanation.contains("required header `x-api-key` was absent"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn explain_no_match_lists_every_candidate() {
+        let mut a = plain_mock("GET", "/users");
+        a.source = Some("mocks/a.json".to_string());
+        a.headers = Some(header_matcher(
+            "x-a",
+            HeaderValue::Pattern(HeaderPattern::Any),
+        ));
+        let mut b = plain_mock("GET", "/users");
+        b.source = Some("mocks/b.json".to_string());
+        b.headers = Some(header_matcher(
+            "x-b",
+            HeaderValue::Pattern(HeaderPattern::Any),
+        ));
+
+        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![a, b])).unwrap();
+        assert!(
+            explanation.starts_with("2 candidate mock(s)"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("mocks/a.json"), "{}", explanation);
+        assert!(explanation.contains("mocks/b.json"), "{}", explanation);
+    }
+
+    #[test]
+    fn explain_no_match_caps_the_candidate_list() {
+        let mocks: Vec<MockConfig> = (0..8)
+            .map(|i| {
+                let mut mock = plain_mock("GET", "/users");
+                mock.source = Some(format!("mocks/{}.json", i));
+                mock.headers = Some(header_matcher(
+                    &format!("x-{}", i),
+                    HeaderValue::Pattern(HeaderPattern::Any),
+                ));
+                mock
+            })
+            .collect();
+
+        let explanation = explain_no_match(&ctx("GET", "/users"), &store(mocks)).unwrap();
+        assert!(
+            explanation.starts_with("8 candidate mock(s)"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("(+3 more)"), "{}", explanation);
+    }
+
+    #[test]
+    fn explain_no_match_falls_back_to_the_key_when_a_mock_has_no_source() {
+        // Single-file and in-process mocks have no source file to name.
+        let mut mock = plain_mock("GET", "/users");
+        mock.headers = Some(header_matcher(
+            "x-api-key",
+            HeaderValue::Pattern(HeaderPattern::Any),
+        ));
+
+        let explanation = explain_no_match(&ctx("GET", "/users"), &store(vec![mock])).unwrap();
+        assert!(explanation.contains("`GET:/users` #0"), "{}", explanation);
+    }
+
+    // ── redaction ───────────────────────────────────────────────────────
+
+    #[test]
+    fn explanations_never_quote_a_sensitive_header_value() {
+        for name in ["authorization", "cookie", "set-cookie"] {
+            let mut mock = plain_mock("GET", "/vault");
+            mock.headers = Some(header_matcher(
+                name,
+                HeaderValue::Exact("Bearer super-secret-token".to_string()),
+            ));
+
+            let mut context = ctx("GET", "/vault");
+            context
+                .headers
+                .insert(name.to_string(), "Bearer leaked-value".to_string());
+
+            let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+            assert!(
+                explanation.contains(name),
+                "the header name is still useful: {}",
+                explanation
+            );
+            assert!(
+                !explanation.contains("super-secret-token"),
+                "expected value leaked: {}",
+                explanation
+            );
+            assert!(
+                !explanation.contains("leaked-value"),
+                "request value leaked: {}",
+                explanation
+            );
+            assert!(explanation.contains("[REDACTED]"), "{}", explanation);
+        }
+    }
+
+    #[test]
+    fn redaction_of_header_names_is_case_insensitive() {
+        let mut mock = plain_mock("GET", "/vault");
+        mock.headers = Some(header_matcher(
+            "Authorization",
+            HeaderValue::Exact("Bearer super-secret-token".to_string()),
+        ));
+
+        let mut context = ctx("GET", "/vault");
+        context
+            .headers
+            .insert("authorization".to_string(), "Bearer nope".to_string());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            !explanation.contains("super-secret-token"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("[REDACTED]"), "{}", explanation);
+    }
+
+    // ── stability and bounds ────────────────────────────────────────────
+
+    #[test]
+    fn explanations_are_stable_across_runs() {
+        // Two failing headers on one mock: whichever is reported must not
+        // depend on HashMap iteration order, or screenshots and diffs of the
+        // dashboard become worthless.
+        let mut required = HashMap::new();
+        required.insert(
+            "x-zebra".to_string(),
+            HeaderValue::Pattern(HeaderPattern::Any),
+        );
+        required.insert(
+            "x-alpha".to_string(),
+            HeaderValue::Pattern(HeaderPattern::Any),
+        );
+        let mut mock = plain_mock("GET", "/users");
+        mock.headers = Some(HeaderMatcher {
+            required,
+            forbidden: Vec::new(),
+            strict: false,
+        });
+        let mocks = store(vec![mock]);
+
+        let first = explain_no_match(&ctx("GET", "/users"), &mocks).unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                first,
+                explain_no_match(&ctx("GET", "/users"), &mocks).unwrap()
+            );
+        }
+        assert!(first.contains("x-alpha"), "{}", first);
+    }
+
+    #[test]
+    fn long_values_are_truncated_in_explanations() {
+        let long = "v".repeat(500);
+        let mut mock = plain_mock("GET", "/users");
+        mock.headers = Some(header_matcher(
+            "x-long",
+            HeaderValue::Exact("expected".to_string()),
+        ));
+
+        let mut context = ctx("GET", "/users");
+        context.headers.insert("x-long".to_string(), long.clone());
+
+        let explanation = explain_no_match(&context, &store(vec![mock])).unwrap();
+        assert!(
+            !explanation.contains(&long),
+            "the full value was echoed back"
+        );
+        assert!(explanation.contains('…'), "{}", explanation);
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // A cut mid-character would produce invalid UTF-8; `truncate_for_display`
+        // counts characters, so this must round-trip.
+        let value = "é".repeat(200);
+        let truncated = truncate_for_display(&value);
+        assert!(truncated.chars().count() <= MAX_DISPLAY_LEN + 1);
+        assert!(truncated.ends_with('…'));
+    }
+
+    // ── the matched case ────────────────────────────────────────────────
+
+    #[test]
+    fn explain_match_shows_the_score_arithmetic() {
+        let mut mock = plain_mock("GET", "/users");
+        mock.source = Some("mocks/get_users.json".to_string());
+        mock.headers = Some(header_matcher(
+            "x-api-key",
+            HeaderValue::Pattern(HeaderPattern::Any),
+        ));
+
+        let mut context = ctx("GET", "/users");
+        context
+            .headers
+            .insert("x-api-key".to_string(), "abc".to_string());
+
+        let result = find_matching_mock(&context, &store(vec![mock])).unwrap();
+        let explanation = explain_match(&result);
+
+        assert_eq!(result.score, 1050);
+        assert!(
+            explanation.contains("matched mocks/get_users.json"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("score 1050"), "{}", explanation);
+        assert!(explanation.contains("method+path 1000"), "{}", explanation);
+        assert!(explanation.contains("headers +50"), "{}", explanation);
+    }
+
+    #[test]
+    fn explain_match_notes_the_path_pattern_penalty() {
+        let mock = plain_mock("GET", "/users/:id");
+        let result = find_matching_mock(&ctx("GET", "/users/42"), &store(vec![mock])).unwrap();
+        let explanation = explain_match(&result);
+
+        assert_eq!(result.score, 900);
+        assert!(explanation.contains("path pattern -100"), "{}", explanation);
+        assert_eq!(result.path_params.get("id").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn the_breakdown_always_adds_up_to_the_score() {
+        // The breakdown is what the dashboard shows; if it ever stopped summing
+        // to the score the explanation would be quietly lying.
+        let mut mock = plain_mock("POST", "/login");
+        let mut params = HashMap::new();
+        params.insert("v".to_string(), QueryParamValue::Exact("2".to_string()));
+        mock.query_params = Some(QueryParamMatcher {
+            params,
+            strict: false,
+        });
+        mock.headers = Some(header_matcher(
+            "x-api-key",
+            HeaderValue::Pattern(HeaderPattern::Any),
+        ));
+        mock.body = Some(BodyMatcher::Any);
+
+        let mut context = ctx("POST", "/login");
+        context
+            .query_params
+            .insert("v".to_string(), "2".to_string());
+        context
+            .headers
+            .insert("x-api-key".to_string(), "abc".to_string());
+        context.body = Some(Bytes::from("{}"));
+        context.content_type = Some("application/json".to_string());
+
+        let result = find_matching_mock(&context, &store(vec![mock])).unwrap();
+        assert_eq!(result.breakdown.total(), result.score);
+        assert_eq!(result.score, 1000 + 100 + 50 + 500);
+    }
+
+    // ── the boolean view and the reason view agree ──────────────────────
+
+    #[test]
+    fn a_reason_is_produced_exactly_when_the_matcher_rejects() {
+        // The guarantee the whole design rests on: `match_*` is defined as
+        // `reject_reason().is_none()`, so the dashboard can never describe a
+        // rule the server doesn't enforce.
+        let mut required = HashMap::new();
+        required.insert(
+            "x-api-key".to_string(),
+            HeaderValue::Exact("secret".to_string()),
+        );
+        let matcher = HeaderMatcher {
+            required,
+            forbidden: Vec::new(),
+            strict: false,
+        };
+
+        let mut accepted = HashMap::new();
+        accepted.insert("x-api-key".to_string(), "secret".to_string());
+        assert!(match_headers(&accepted, &matcher));
+        assert!(headers_reject_reason(&accepted, &matcher).is_none());
+
+        let mut rejected = HashMap::new();
+        rejected.insert("x-api-key".to_string(), "wrong".to_string());
+        assert!(!match_headers(&rejected, &matcher));
+        assert!(headers_reject_reason(&rejected, &matcher).is_some());
+    }
+
+    #[test]
+    fn evaluate_mock_and_calculate_match_score_agree() {
+        let mut mock = plain_mock("GET", "/users");
+        mock.headers = Some(header_matcher(
+            "x-api-key",
+            HeaderValue::Exact("secret".to_string()),
+        ));
+
+        let missing = ctx("GET", "/users");
+        assert!(matches!(
+            evaluate_mock(&missing, &mock),
+            Evaluation::Rejected(RejectReason::HeaderMissing { .. })
+        ));
+        assert!(calculate_match_score(&missing, &mock).is_none());
+
+        let mut present = ctx("GET", "/users");
+        present
+            .headers
+            .insert("x-api-key".to_string(), "secret".to_string());
+        assert!(matches!(
+            evaluate_mock(&present, &mock),
+            Evaluation::Matched(_)
+        ));
+        assert_eq!(
+            calculate_match_score(&present, &mock).map(|b| b.total()),
+            Some(1050)
         );
     }
 }

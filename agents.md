@@ -25,17 +25,20 @@
 - **Responsibilities:** Setup routes (`/health`, catch-all), middleware, lifecycle management
 
 ### 3. **Matcher Agent** (`src/matcher.rs`)
-- **Purpose:** Find best matching mock using pattern matching
+- **Purpose:** Find best matching mock using pattern matching, and explain the outcome
 - **Inputs:** `RequestContext` (method, path, query, headers, body), available mocks
-- **Outputs:** Best matching `MockConfig` or `None`
-- **Responsibilities:** Score each mock, match on query params/headers/body
-- **Scoring:** Base 1000 (method+path) + 100/query + 50/header + 500 (body)
+- **Outputs:** Best matching `MockConfig` or `None`; a `RejectReason` per mock that didn't match
+- **Responsibilities:** Score each mock, match on query params/headers/body, redact sensitive header values out of explanations
+- **Scoring:** Base 1000 (method+path) + 100/query + 50/header + 500 (body), −100 for a path-pattern match
+- **One implementation rule:** each matcher is written as `*_reject_reason() -> Option<RejectReason>`, and the `match_*` booleans are defined as `reason.is_none()`. `evaluate_mock` is the single entry point; `calculate_match_score` and `explain_no_match` are both views of it, so an explanation can never describe a rule the server doesn't enforce.
 
 ### 4. **Handler Agent** (`src/handler.rs`)
-- **Purpose:** Process requests and generate responses
+- **Purpose:** Process requests and generate responses; serve the admin API
 - **Inputs:** Raw HTTP request, loaded mocks
-- **Outputs:** HTTP response (status, JSON body, headers), logs
-- **Responsibilities:** Parse request → build context → call Matcher → return response/404
+- **Outputs:** HTTP response (status, JSON body, headers), logs, admin JSON
+- **Responsibilities:** Parse request → build context → call Matcher → return response/404; record each request with the response served, its match score, captured path params, and the match explanation
+- **Admin endpoints:** `/admin/requests` (filters: `path` substring, `method`, `status` code or class, `unmatched_only`, `search`), `/admin/mocks`, `/admin/sequences`, `/admin/sequences/reset`, `/admin/dashboard`
+- **Bounded by construction:** the request log keeps `MIMIC_MAX_LOG_ENTRIES` entries (default 1000) and stored bodies are cut at `MIMIC_MAX_RECORDED_BODY` (default 64 KB)
 
 ### 5. **Importer Agent** (`src/openapi.rs`)
 - **Purpose:** Generate mock files from an OpenAPI 3.x spec
@@ -87,7 +90,7 @@ HTTP Request → Router Agent → Handler Agent → Matcher Agent
 - **Type Safety:** Use Rust types, Serde, `Result<T, E>`, no unsafe code
 - **Performance:** async/await, minimize allocations, HashMap O(1) lookup, default `consume_body: false`
 - **Code Style:** rustfmt, zero clippy warnings, document public APIs
-- **Testing:** 35+ unit tests, ~90% coverage, test edge cases
+- **Testing:** 350+ unit tests, ~90% coverage, test edge cases
 
 ### Error Handling
 - **Loader:** Log parse errors, continue loading other files, never panic
@@ -100,6 +103,9 @@ HTTP Request → Router Agent → Handler Agent → Matcher Agent
 - Read-only volume mounts for mocks
 - No request data persistence
 - Never log auth tokens
+- Every new output surface — response headers, match explanations — must run
+  values through `is_sensitive_header` before they can reach the request log or
+  the dashboard
 - Regular `cargo audit`
 
 ### Performance Targets
@@ -169,4 +175,4 @@ make fmt          # Format code
 
 ---
 
-**Last Updated:** 2026-02-18 | **Version:** 1.0.0 | **Maintained by:** Mimic Contributors
+**Last Updated:** 2026-08-07 | **Version:** 1.1.0 | **Maintained by:** Mimic Contributors

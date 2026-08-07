@@ -555,6 +555,7 @@ pub fn generate_mocks(
                         body: None,
                         delay_ms: None,
                         response_headers: None,
+                        source: None,
                         sequence: None,
                     },
                 ));
