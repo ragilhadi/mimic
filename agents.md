@@ -14,7 +14,7 @@
 
 ### 1. **Loader Agent** (`src/loader.rs`)
 - **Purpose:** Load mock configurations from JSON files
-- **Inputs:** `/app/mocks/` directory with JSON mock files
+- **Inputs:** the resolved mocks directory with JSON mock files — `MIMIC_MOCKS_DIR`, else `/app/mocks` when it exists, else `./mocks`
 - **Outputs:** `HashMap<String, MockConfig>` for O(1) lookup
 - **Responsibilities:** Scan, parse, validate mock files; build method:path index
 
@@ -59,7 +59,7 @@
 
 ### Startup Phase
 1. **Logger Agent** → Initialize logging
-2. **Loader Agent** → Scan `/app/mocks/`, parse JSON, build HashMap
+2. **Loader Agent** → Resolve the mocks directory, scan it, parse JSON, build HashMap
 3. **Router Agent** → Start HTTP server on port 8080
 
 ### Request Phase

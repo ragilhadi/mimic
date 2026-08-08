@@ -46,6 +46,9 @@ fn run_import(args: &[String]) -> i32 {
                 println!("{}", path.display());
             }
             println!("✅ Generated {} mock file(s)", written.len());
+            if let Some(out_dir) = written.first().and_then(|p| p.parent()) {
+                print_serve_hint(out_dir);
+            }
             0
         }
         Err(openapi::ImportError::Usage(message)) => {
@@ -65,6 +68,36 @@ fn run_import(args: &[String]) -> i32 {
     }
 }
 
+/// Tell the operator how to make the server serve what the importer just
+/// wrote.
+///
+/// The default output directory sits under `./mocks`, which the server reads
+/// by default on a local run — but not when it resolves the Docker mount or a
+/// directory named by `MIMIC_MOCKS_DIR`, and not when `--out` pointed
+/// somewhere else entirely. Rather than assume, this prints whichever of the
+/// two statements is true right now.
+fn print_serve_hint(out_dir: &std::path::Path) {
+    let resolved = loader::resolve_mocks_dir();
+    let already_served = std::path::Path::new(&resolved.path)
+        .canonicalize()
+        .ok()
+        .zip(out_dir.canonicalize().ok())
+        .is_some_and(|(root, out)| out.starts_with(root));
+
+    if already_served {
+        println!(
+            "   {} is already the directory Mimic reads — start it with: mimic",
+            resolved.path
+        );
+    } else {
+        println!(
+            "   Serve them with: {}={} mimic",
+            loader::MOCKS_DIR_ENV,
+            out_dir.display()
+        );
+    }
+}
+
 /// Initializes logging, loads mock configurations, sets up the HTTP server,
 /// and starts listening for incoming requests.
 #[tokio::main]
@@ -74,8 +107,9 @@ async fn run_server() {
 
     info!("🧩 Starting Mimic Mock API Server");
 
-    // Hardcoded mocks directory - Docker volume mount handles the path mapping
-    const MOCKS_DIR: &str = "/app/mocks";
+    // Where mocks are read from: MIMIC_MOCKS_DIR, else /app/mocks when it
+    // exists (the Docker image), else ./mocks.
+    let mocks_dir = loader::resolve_mocks_dir();
 
     // Get port from environment variable
     let port = configured_port();
@@ -84,7 +118,11 @@ async fn run_server() {
     let active_tags = configured_active_tags();
 
     info!("Configuration:");
-    info!("  Mocks directory: {}", MOCKS_DIR);
+    info!(
+        "  Mocks directory: {} ({})",
+        mocks_dir.path,
+        mocks_dir.origin.describe()
+    );
     info!("  Port: {}", port);
     info!("  Max request body: {} bytes", max_body_size());
     match active_tags.as_ref() {
@@ -101,10 +139,13 @@ async fn run_server() {
     }
 
     // Load mock configurations
-    let mocks = load_mocks(MOCKS_DIR);
+    let mocks = load_mocks(&mocks_dir.path);
     {
         let m = mocks.read().await;
         info!("Loaded {} mock(s)", m.len());
+        if m.is_empty() {
+            warn_empty_mock_set(&mocks_dir);
+        }
     }
 
     // Create application state
@@ -113,6 +154,9 @@ async fn run_server() {
     // Spawn background task for hot-reloading mock files
     const RELOAD_INTERVAL_SECS: u64 = 2;
     let reload_mocks = mocks;
+    // The reloader watches the directory that was actually resolved, not a
+    // second copy of the resolution rule that could disagree with it.
+    let reload_dir = mocks_dir.path.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
@@ -121,9 +165,9 @@ async fn run_server() {
         interval.tick().await;
         loop {
             interval.tick().await;
-            let mocks_dir = MOCKS_DIR;
+            let mocks_dir = reload_dir.clone();
             // Run blocking file I/O off the async runtime to avoid stalling request handling
-            let result = tokio::task::spawn_blocking(move || load_mocks_map(mocks_dir))
+            let result = tokio::task::spawn_blocking(move || load_mocks_map(&mocks_dir))
                 .await
                 .unwrap_or_else(|e| {
                     warn!("Hot reload task panicked: {}", e);
@@ -169,6 +213,30 @@ async fn run_server() {
     axum::serve(listener, app).await.unwrap_or_else(|e| {
         panic!("Server error: {}", e);
     });
+}
+
+/// Explain a startup that registered no mocks at all.
+///
+/// A server answering `404 mock not found` for everything is indistinguishable
+/// from a server that loaded fine, so the two ways of getting there are named
+/// separately: the directory isn't there, or it is there and holds no mock
+/// files. Previously both produced the same near-silence.
+fn warn_empty_mock_set(dir: &loader::ResolvedMocksDir) {
+    if !dir.exists {
+        warn!(
+            "No mocks loaded: '{}' does not exist. Point Mimic at your mocks with {}=<dir>, \
+             or create '{}' next to the working directory.",
+            dir.path,
+            loader::MOCKS_DIR_ENV,
+            dir.path
+        );
+    } else {
+        warn!(
+            "No mocks loaded: '{}' exists but contains no readable *.json mock files \
+             (subdirectories are searched too). Every request will answer 404 mock not found.",
+            dir.path
+        );
+    }
 }
 
 /// Build the mock map a hot-reload cycle should install, given what's

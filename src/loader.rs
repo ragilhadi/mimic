@@ -12,6 +12,106 @@ pub struct LoadResult {
     pub errors: usize,
 }
 
+// ============================================================================
+// Mocks directory resolution
+// ============================================================================
+
+/// Environment variable naming the directory (or single file) mocks are read
+/// from, overriding the defaults below.
+pub const MOCKS_DIR_ENV: &str = "MIMIC_MOCKS_DIR";
+
+/// Where the Docker image mounts mocks. Probed first when the variable is
+/// unset, so every existing `docker run -v ./mocks:/app/mocks` keeps resolving
+/// exactly where it always did.
+pub const DOCKER_MOCKS_DIR: &str = "/app/mocks";
+
+/// Where a local run keeps its mocks — the directory the README has always
+/// said Mimic reads, and the parent of the importer's default output.
+pub const LOCAL_MOCKS_DIR: &str = "./mocks";
+
+/// How [`resolve_mocks_dir`] arrived at a directory.
+///
+/// Carried alongside the path so startup can say *why* it is reading where it
+/// is reading: "loaded 0 mocks" is a very different problem depending on
+/// whether the operator named the directory or Mimic guessed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MocksDirOrigin {
+    /// `MIMIC_MOCKS_DIR` was set to a non-empty value.
+    Configured,
+    /// Defaulted to the Docker mount point, which exists.
+    Docker,
+    /// Defaulted to `./mocks`, relative to the working directory.
+    Local,
+}
+
+impl MocksDirOrigin {
+    /// A short phrase for the startup log.
+    pub fn describe(self) -> &'static str {
+        match self {
+            MocksDirOrigin::Configured => "from MIMIC_MOCKS_DIR",
+            MocksDirOrigin::Docker => "default, Docker mount point",
+            MocksDirOrigin::Local => "default, relative to the working directory",
+        }
+    }
+}
+
+/// The mocks directory a run will read, and how it was chosen.
+#[derive(Debug, Clone)]
+pub struct ResolvedMocksDir {
+    pub path: String,
+    pub origin: MocksDirOrigin,
+    /// Whether the resolved path exists at resolution time. Only a snapshot —
+    /// hot reload re-checks every cycle, so a directory created after startup
+    /// still gets picked up.
+    pub exists: bool,
+}
+
+/// Resolve the mocks directory from the environment and the filesystem.
+///
+/// `MIMIC_MOCKS_DIR` wins outright and is used verbatim, present or not: an
+/// operator who named a directory wants to be told it's missing, not to have
+/// Mimic quietly read a different one. With the variable unset, `/app/mocks`
+/// is used when it exists — that's the Docker image — and `./mocks` otherwise.
+pub fn resolve_mocks_dir() -> ResolvedMocksDir {
+    resolve_mocks_dir_from(std::env::var(MOCKS_DIR_ENV).ok(), |path| {
+        Path::new(path).exists()
+    })
+}
+
+/// [`resolve_mocks_dir`] with the environment and the filesystem injected.
+///
+/// Split out so the resolution rule is testable without mutating a
+/// process-wide environment variable that every other test shares.
+pub fn resolve_mocks_dir_from(
+    configured: Option<String>,
+    path_exists: impl Fn(&str) -> bool,
+) -> ResolvedMocksDir {
+    if let Some(raw) = configured {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return ResolvedMocksDir {
+                exists: path_exists(trimmed),
+                path: trimmed.to_string(),
+                origin: MocksDirOrigin::Configured,
+            };
+        }
+    }
+
+    if path_exists(DOCKER_MOCKS_DIR) {
+        return ResolvedMocksDir {
+            path: DOCKER_MOCKS_DIR.to_string(),
+            origin: MocksDirOrigin::Docker,
+            exists: true,
+        };
+    }
+
+    ResolvedMocksDir {
+        exists: path_exists(LOCAL_MOCKS_DIR),
+        path: LOCAL_MOCKS_DIR.to_string(),
+        origin: MocksDirOrigin::Local,
+    }
+}
+
 /// Loads mock configurations from a directory or file into a raw HashMap.
 ///
 /// Args:
@@ -596,6 +696,105 @@ mod tests {
             result.mocks["POST:/login"][0].source.as_deref(),
             Some(file.to_str().unwrap())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Mocks directory resolution (#84)
+    // ------------------------------------------------------------------
+
+    /// A filesystem stub: only the listed paths exist.
+    fn only<'a>(existing: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
+        move |path: &str| existing.contains(&path)
+    }
+
+    #[test]
+    fn test_docker_default_is_unchanged_when_the_mount_point_exists() {
+        // The whole point of probing /app/mocks first: every published
+        // `docker run -v ./mocks:/app/mocks` command has to keep working
+        // byte-for-byte.
+        let resolved = resolve_mocks_dir_from(None, only(&[DOCKER_MOCKS_DIR, LOCAL_MOCKS_DIR]));
+        assert_eq!(resolved.path, DOCKER_MOCKS_DIR);
+        assert_eq!(resolved.origin, MocksDirOrigin::Docker);
+        assert!(resolved.exists);
+    }
+
+    #[test]
+    fn test_falls_back_to_local_mocks_outside_docker() {
+        // `cargo run` from a fresh clone: /app/mocks is not a directory
+        // anyone has, ./mocks is the one the repo ships.
+        let resolved = resolve_mocks_dir_from(None, only(&[LOCAL_MOCKS_DIR]));
+        assert_eq!(resolved.path, LOCAL_MOCKS_DIR);
+        assert_eq!(resolved.origin, MocksDirOrigin::Local);
+        assert!(resolved.exists);
+    }
+
+    #[test]
+    fn test_falls_back_to_local_mocks_even_when_nothing_exists() {
+        // Nothing to read, but the path reported has to be the one a user can
+        // act on — `./mocks`, not a Docker path they'll never have.
+        let resolved = resolve_mocks_dir_from(None, only(&[]));
+        assert_eq!(resolved.path, LOCAL_MOCKS_DIR);
+        assert!(!resolved.exists);
+    }
+
+    #[test]
+    fn test_env_var_wins_over_both_defaults() {
+        let resolved = resolve_mocks_dir_from(
+            Some("/srv/fixtures".to_string()),
+            only(&["/srv/fixtures", DOCKER_MOCKS_DIR, LOCAL_MOCKS_DIR]),
+        );
+        assert_eq!(resolved.path, "/srv/fixtures");
+        assert_eq!(resolved.origin, MocksDirOrigin::Configured);
+    }
+
+    #[test]
+    fn test_env_var_is_honored_even_when_it_does_not_exist() {
+        // Silently falling back would leave a typo'd MIMIC_MOCKS_DIR looking
+        // exactly like a working one that happens to be empty.
+        let resolved = resolve_mocks_dir_from(
+            Some("/typo/mocks".to_string()),
+            only(&[DOCKER_MOCKS_DIR, LOCAL_MOCKS_DIR]),
+        );
+        assert_eq!(resolved.path, "/typo/mocks");
+        assert_eq!(resolved.origin, MocksDirOrigin::Configured);
+        assert!(!resolved.exists);
+    }
+
+    #[test]
+    fn test_env_var_is_trimmed_and_an_empty_value_means_unset() {
+        let trimmed = resolve_mocks_dir_from(Some("  /srv/fixtures  ".to_string()), only(&[]));
+        assert_eq!(trimmed.path, "/srv/fixtures");
+
+        // `MIMIC_MOCKS_DIR=` in a .env file must not resolve to "".
+        for blank in ["", "   "] {
+            let resolved =
+                resolve_mocks_dir_from(Some(blank.to_string()), only(&[LOCAL_MOCKS_DIR]));
+            assert_eq!(
+                resolved.path, LOCAL_MOCKS_DIR,
+                "an empty {} should behave as if it were unset",
+                MOCKS_DIR_ENV
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolved_directory_actually_loads_the_mocks_in_it() {
+        // The end-to-end shape of #84: resolve, then load, and get mocks.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("get_users.json"),
+            r#"{"method":"GET","path":"/users","status":200,"response":{"users":[]}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_mocks_dir_from(Some(dir.path().display().to_string()), |p| {
+            Path::new(p).exists()
+        });
+        assert!(resolved.exists);
+
+        let result = load_mocks_map(&resolved.path);
+        assert_eq!(result.errors, 0);
+        assert!(result.mocks.contains_key("GET:/users"));
     }
 
     #[test]
