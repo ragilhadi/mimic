@@ -112,6 +112,10 @@ PORT=8080
 # Logging level: trace, debug, info, warn, error (default: info)
 RUST_LOG=info
 
+# Directory (or single JSON file) mocks are read from.
+# Default: /app/mocks when it exists (the Docker image), else ./mocks.
+MIMIC_MOCKS_DIR=./mocks
+
 # Maximum request body Mimic will buffer, in bytes (default: 10485760 = 10 MB)
 MIMIC_MAX_BODY_SIZE=10485760
 
@@ -136,7 +140,28 @@ MIMIC_ACTIVE_TAGS=happy-path,smoke-test
 
 ### Mock Files
 
-Mimic reads mock definitions from JSON files in the `/app/mocks` directory (or `./mocks` locally).
+Mimic reads mock definitions from JSON files, searching the directory it
+resolves at startup and every subdirectory beneath it.
+
+**Where it reads from**, in order:
+
+1. `MIMIC_MOCKS_DIR`, if set — a directory or a single `.json` file. Used
+   verbatim: a path that doesn't exist is reported as missing rather than
+   silently replaced by a default.
+2. `/app/mocks`, if it exists — the Docker image's mount point, so every
+   `docker run -v $(pwd)/mocks:/app/mocks` command below resolves exactly there.
+3. `./mocks`, relative to the working directory — what `cargo run`, `make dev`,
+   an installed binary, or a release build picks up from a clone of this repo.
+
+The directory Mimic actually resolved is logged at startup, and a run that
+registers no mocks says which of the two reasons applies — the directory isn't
+there, or it's there and holds no mock files:
+
+```
+INFO mimic: Configuration:
+INFO mimic:   Mocks directory: ./mocks (default, relative to the working directory)
+INFO mimic: Loaded 31 mock(s)
+```
 
 **Mock File Structure:**
 
@@ -1071,6 +1096,12 @@ mimic import-openapi ./spec.yaml --out ./mocks/generated
 
 JSON and YAML specs are both accepted. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status. The output is plain `MockConfig` JSON, so it hot-reloads like any other mock and can be hand-edited afterwards.
 
+The default output directory, `./mocks/generated`, sits inside the `./mocks`
+the server falls back to locally — so `mimic import-openapi ./spec.yaml && mimic`
+serves the generated mocks with nothing else to configure. When `--out` points
+elsewhere, the importer prints the exact command to start the server against
+it.
+
 ### Options
 
 | Option | Default | Description |
@@ -1324,6 +1355,13 @@ make dev
 
 # Or using Cargo directly
 cargo run
+```
+
+Either one serves the mocks in this repo's `./mocks` directory — no
+configuration needed. To read a different directory, set `MIMIC_MOCKS_DIR`:
+
+```bash
+MIMIC_MOCKS_DIR=./fixtures/staging cargo run
 ```
 
 3. **Run tests:**
