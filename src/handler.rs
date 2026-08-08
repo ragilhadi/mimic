@@ -1641,6 +1641,114 @@ mod tests {
         assert_eq!(json["welcomed_on_page"], "2");
     }
 
+    /// #85, end to end: `+` is a space on the way into templating, so a
+    /// response echoing `{{query.q}}` returns what the client meant rather
+    /// than the wire encoding of it.
+    #[tokio::test]
+    async fn test_template_query_param_decodes_plus_as_a_space() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/search".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/search".to_string(),
+                status: 200,
+                response: json!({"echo": "{{query.q}}"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                source: None,
+                sequence: None,
+                tags: Vec::new(),
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        for query in ["q=hello+world", "q=hello%20world"] {
+            let uri = format!("/search?{}", query).parse().unwrap();
+            let response = handle_request(
+                Method::GET,
+                uri,
+                HeaderMap::new(),
+                State(state.clone()),
+                Body::empty(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["echo"], "hello world", "for query '{}'", query);
+        }
+    }
+
+    /// The reported repro: a form matcher written in decoded form has to
+    /// accept the `+`-encoded body a browser or `curl -d` actually sends, and
+    /// `{{body.*}}` has to render the decoded value.
+    #[tokio::test]
+    async fn test_form_body_with_a_plus_encoded_space_matches_and_templates() {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "POST:/form/login".to_string(),
+            vec![MockConfig {
+                method: "POST".to_string(),
+                path: "/form/login".to_string(),
+                status: 200,
+                response: json!({"ok": true, "password_seen": "{{body.password}}"}),
+                consume_body: true,
+                query_params: None,
+                headers: None,
+                body: Some(BodyMatcher::Form(crate::types::FormBodyMatcher {
+                    fields: HashMap::from([
+                        ("username".to_string(), "alice".to_string()),
+                        ("password".to_string(), "secret pass".to_string()),
+                    ]),
+                    strict: false,
+                })),
+                delay_ms: None,
+                response_headers: None,
+                source: None,
+                sequence: None,
+                tags: Vec::new(),
+            }],
+        );
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        for raw in [
+            "username=alice&password=secret+pass",
+            "username=alice&password=secret%20pass",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "content-type",
+                "application/x-www-form-urlencoded".parse().unwrap(),
+            );
+            let response = handle_request(
+                Method::POST,
+                "/form/login".parse().unwrap(),
+                headers,
+                State(state.clone()),
+                Body::from(raw),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "'{}' should match the form matcher",
+                raw
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["password_seen"], "secret pass");
+        }
+    }
+
     #[tokio::test]
     async fn test_template_nested_body_field() {
         let mut mocks = HashMap::new();

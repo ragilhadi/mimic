@@ -13,6 +13,7 @@ use crate::types::{
 };
 use bytes::Bytes;
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -309,8 +310,39 @@ impl RequestContext {
 // Query Parameter Parsing and Matching
 // ============================================================================
 
+/// Decode one `application/x-www-form-urlencoded` component — a query-string
+/// key, a query-string value, or a form field.
+///
+/// `+` means space in form encoding. That is how every browser form post,
+/// `URLSearchParams`, `curl --data-urlencode`, jQuery, and axios encode a
+/// space, and how query strings are conventionally decoded too;
+/// `urlencoding::decode` implements percent-decoding only and leaves the plus
+/// alone.
+///
+/// The order matters and is the reason this is one function rather than two
+/// lines at four call sites: `+` is replaced **first**, percent escapes
+/// **second**. The reverse order would decode `%2B` — the encoding of a
+/// literal plus — into `+` and then corrupt it into a space.
+fn decode_component(raw: &str) -> String {
+    // `replace` allocates unconditionally, so the common plus-free component
+    // keeps borrowing the slice it came in on.
+    let plus_decoded: Cow<'_, str> = if raw.contains('+') {
+        Cow::Owned(raw.replace('+', " "))
+    } else {
+        Cow::Borrowed(raw)
+    };
+
+    urlencoding::decode(plus_decoded.as_ref())
+        .unwrap_or_default()
+        .into_owned()
+}
+
 /// Parse query string into HashMap
 /// Example: "page=1&limit=10" -> {"page": "1", "limit": "10"}
+///
+/// Keys and values arrive decoded: `?q=hello+world` and `?q=hello%20world`
+/// both yield `hello world`, which is the form a mock's matcher — and
+/// `{{query.q}}` — sees.
 pub fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
     let mut params = HashMap::new();
 
@@ -321,14 +353,10 @@ pub fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
             }
 
             if let Some((key, value)) = pair.split_once('=') {
-                // URL decode key and value
-                let key = urlencoding::decode(key).unwrap_or_default().to_string();
-                let value = urlencoding::decode(value).unwrap_or_default().to_string();
-                params.insert(key, value);
+                params.insert(decode_component(key), decode_component(value));
             } else {
                 // Handle params without values (e.g., ?debug)
-                let key = urlencoding::decode(pair).unwrap_or_default().to_string();
-                params.insert(key, String::new());
+                params.insert(decode_component(pair), String::new());
             }
         }
     }
@@ -600,6 +628,11 @@ pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
 }
 
 /// Parse form data (application/x-www-form-urlencoded)
+///
+/// Keys and values are decoded the same way query parameters are — see
+/// [`decode_component`] — so `password=secret+pass` and
+/// `password=secret%20pass` both produce `secret pass`, and a mock's
+/// `"password": "secret pass"` matches either.
 fn parse_form_data(text: &str) -> HashMap<String, String> {
     let mut fields = HashMap::new();
 
@@ -609,9 +642,7 @@ fn parse_form_data(text: &str) -> HashMap<String, String> {
         }
 
         if let Some((key, value)) = pair.split_once('=') {
-            let key = urlencoding::decode(key).unwrap_or_default().to_string();
-            let value = urlencoding::decode(value).unwrap_or_default().to_string();
-            fields.insert(key, value);
+            fields.insert(decode_component(key), decode_component(value));
         }
     }
 
@@ -1579,6 +1610,123 @@ mod tests {
 
         let params = parse_query_string(Some(""));
         assert!(params.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // `+` means space in form encoding (#85)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_query_string_decodes_plus_as_a_space() {
+        // Both standard encodings of the same value have to produce the same
+        // value, or a mock accepts one client and rejects another for a
+        // difference neither of them chose.
+        for query in ["q=hello+world", "q=hello%20world"] {
+            let params = parse_query_string(Some(query));
+            assert_eq!(
+                params.get("q"),
+                Some(&"hello world".to_string()),
+                "'{}' should decode to a space",
+                query
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_query_string_decodes_plus_in_keys_too() {
+        let params = parse_query_string(Some("sort+by=name"));
+        assert_eq!(params.get("sort by"), Some(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_parse_query_string_keeps_an_escaped_literal_plus() {
+        // The decode order is what this pins down: `+` -> space first, then
+        // percent-decoding. Reversed, `%2B` would become `+` and then be
+        // corrupted into a space.
+        let params = parse_query_string(Some("formula=1%2B1&filter=a%2Bb+c"));
+        assert_eq!(params.get("formula"), Some(&"1+1".to_string()));
+        assert_eq!(params.get("filter"), Some(&"a+b c".to_string()));
+    }
+
+    #[test]
+    fn test_parse_query_string_valueless_param_decodes_plus() {
+        let params = parse_query_string(Some("debug+mode"));
+        assert_eq!(params.get("debug mode"), Some(&String::new()));
+    }
+
+    #[test]
+    fn test_query_param_matcher_accepts_either_encoding_of_a_space() {
+        let matcher = QueryParamMatcher {
+            params: HashMap::from([(
+                "q".to_string(),
+                QueryParamValue::Exact("hello world".to_string()),
+            )]),
+            strict: false,
+        };
+
+        for query in ["q=hello+world", "q=hello%20world"] {
+            assert!(
+                match_query_params(&parse_query_string(Some(query)), &matcher),
+                "matcher written in decoded form should accept '{}'",
+                query
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_body_form_decodes_plus_as_a_space() {
+        // The reported case: `curl -d 'password=secret+pass'` against a mock
+        // whose matcher reads `"password": "secret pass"`.
+        for body in ["password=secret+pass", "password=secret%20pass"] {
+            let parsed = parse_body(
+                &Bytes::from(body),
+                Some("application/x-www-form-urlencoded"),
+            );
+            let ParsedBody::Form(form) = parsed else {
+                panic!("expected a form body for '{}'", body);
+            };
+            assert_eq!(form.get("password"), Some(&"secret pass".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_form_body_matcher_accepts_either_encoding_of_a_space() {
+        let matcher = BodyMatcher::Form(FormBodyMatcher {
+            fields: HashMap::from([
+                ("username".to_string(), "alice".to_string()),
+                ("password".to_string(), "secret pass".to_string()),
+            ]),
+            strict: false,
+        });
+
+        for body in [
+            "username=alice&password=secret+pass",
+            "username=alice&password=secret%20pass",
+        ] {
+            let parsed = parse_body(
+                &Bytes::from(body),
+                Some("application/x-www-form-urlencoded"),
+            );
+            assert_eq!(
+                body_reject_reason(&parsed, &matcher),
+                None,
+                "'{}' should match a matcher written in decoded form",
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn test_form_body_keeps_an_escaped_literal_plus() {
+        let parsed = parse_body(
+            &Bytes::from("token=a%2Bb&note=one+two"),
+            Some("application/x-www-form-urlencoded"),
+        );
+        let ParsedBody::Form(form) = parsed else {
+            panic!("expected a form body");
+        };
+        assert_eq!(form.get("token"), Some(&"a+b".to_string()));
+        assert_eq!(form.get("note"), Some(&"one two".to_string()));
     }
 
     #[test]
