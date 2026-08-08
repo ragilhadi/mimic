@@ -28,6 +28,153 @@ use tracing::{debug, info, warn};
 /// can be told from the rest, and keeps its count across a hot reload.
 pub type MockHits = Arc<tokio::sync::RwLock<HashMap<MockIdentity, u64>>>;
 
+// ============================================================================
+// Reserved Routes
+// ============================================================================
+
+/// Environment variable moving the admin API off `/admin`.
+pub const ADMIN_PREFIX_ENV: &str = "MIMIC_ADMIN_PREFIX";
+
+/// Environment variable switching the admin API off entirely.
+pub const DISABLE_ADMIN_ENV: &str = "MIMIC_DISABLE_ADMIN";
+
+/// Environment variable moving — or, when empty, removing — the health check.
+pub const HEALTH_PATH_ENV: &str = "MIMIC_HEALTH_PATH";
+
+/// Default path of the health check endpoint.
+pub const DEFAULT_HEALTH_PATH: &str = "/health";
+
+/// Default prefix the admin API is mounted under.
+pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
+
+/// The paths under the admin prefix, paired with the methods they answer.
+///
+/// This is the list `create_router` registers, and the list a mock is checked
+/// against — one array, so a route can't be reserved in the diagnostic and
+/// unregistered in the router, or the reverse.
+const ADMIN_ROUTES: &[(&str, &[&str])] = &[
+    ("/dashboard", &["GET"]),
+    ("/requests", &["GET", "DELETE"]),
+    ("/mocks", &["GET"]),
+    ("/sequences", &["GET"]),
+    ("/sequences/reset", &["POST"]),
+    ("/scenario", &["GET", "POST"]),
+];
+
+/// The method+path pairs Mimic answers itself, and which a mock therefore
+/// cannot serve.
+///
+/// Explicit routes are matched ahead of the fallback by design, so a mock
+/// declaring one of these paths loads fine, is reported by `/admin/mocks`, and
+/// then never serves a request. Naming the reservations makes that sayable —
+/// at load time, and on the dashboard — and makes them movable, for anyone
+/// whose API genuinely owns `/health` or `/admin/...`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedRoutes {
+    /// Where the health check is served, or `None` when it is switched off.
+    pub health: Option<String>,
+    /// The prefix the admin API is mounted under, or `None` when it is
+    /// switched off. Never has a trailing slash.
+    pub admin_prefix: Option<String>,
+}
+
+impl Default for ReservedRoutes {
+    fn default() -> Self {
+        Self {
+            health: Some(DEFAULT_HEALTH_PATH.to_string()),
+            admin_prefix: Some(DEFAULT_ADMIN_PREFIX.to_string()),
+        }
+    }
+}
+
+impl ReservedRoutes {
+    /// Read the configuration from the environment.
+    ///
+    /// Both knobs default to today's behavior, so an existing deployment that
+    /// sets neither is routed exactly as it was.
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var(HEALTH_PATH_ENV).ok(),
+            std::env::var(ADMIN_PREFIX_ENV).ok(),
+            std::env::var(DISABLE_ADMIN_ENV).ok(),
+        )
+    }
+
+    /// [`ReservedRoutes::from_env`] with the environment injected, so the
+    /// rules are testable without mutating variables other tests share.
+    pub fn from_values(
+        health_path: Option<String>,
+        admin_prefix: Option<String>,
+        disable_admin: Option<String>,
+    ) -> Self {
+        let health = match health_path {
+            // An explicitly empty value is the way to say "don't serve it".
+            Some(raw) => normalize_route(&raw, HEALTH_PATH_ENV),
+            None => Some(DEFAULT_HEALTH_PATH.to_string()),
+        };
+
+        let admin = if disable_admin.as_deref().is_some_and(is_truthy) {
+            None
+        } else {
+            match admin_prefix {
+                Some(raw) => normalize_route(&raw, ADMIN_PREFIX_ENV),
+                None => Some(DEFAULT_ADMIN_PREFIX.to_string()),
+            }
+        };
+
+        Self {
+            health,
+            admin_prefix: admin,
+        }
+    }
+
+    /// Why a mock for `method path` would never be served, or `None` if it
+    /// would.
+    ///
+    /// Deliberately narrow: only the exact method+path pairs Mimic answers are
+    /// reserved. `POST /health` and `GET /admin/users` reach the fallback and
+    /// are perfectly good mocks.
+    pub fn reservation_for(&self, method: &str, path: &str) -> Option<&'static str> {
+        if self
+            .health
+            .as_deref()
+            .is_some_and(|health| health == path && method.eq_ignore_ascii_case("GET"))
+        {
+            return Some("Mimic's health check");
+        }
+
+        let prefix = self.admin_prefix.as_deref()?;
+        let suffix = path.strip_prefix(prefix)?;
+        ADMIN_ROUTES
+            .iter()
+            .find(|(route, methods)| {
+                *route == suffix
+                    && methods
+                        .iter()
+                        .any(|allowed| method.eq_ignore_ascii_case(allowed))
+            })
+            .map(|_| "Mimic's admin API")
+    }
+}
+
+/// Normalize a configured route path: trimmed, with a leading slash and no
+/// trailing one. An empty value means "switched off"; anything unusable falls
+/// back to off rather than panicking `Router::route`.
+fn normalize_route(raw: &str, var: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with('/') {
+        warn!(
+            "Invalid {}='{}': a route must start with '/'. Using '/{}'.",
+            var, raw, trimmed
+        );
+        return Some(format!("/{}", trimmed));
+    }
+    Some(trimmed.to_string())
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub mocks: MockStore,
@@ -41,6 +188,10 @@ pub struct AppState {
     /// Which scenario tags are active, or `None` for "no filter" — the
     /// default. Read on every request, rewritten by `POST /admin/scenario`.
     pub active_tags: ActiveTags,
+    /// The method+path pairs Mimic answers itself. Shared with the router that
+    /// registered them so `/admin/mocks` can mark a shadowed mock unreachable
+    /// instead of leaving it at an unexplained `hits: 0`.
+    pub reserved: Arc<ReservedRoutes>,
 }
 
 impl AppState {
@@ -63,7 +214,16 @@ impl AppState {
             mock_hits: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             started_at: std::time::Instant::now(),
             active_tags: Arc::new(tokio::sync::RwLock::new(active_tags)),
+            reserved: Arc::new(ReservedRoutes::default()),
         }
+    }
+
+    /// Replace the reserved-route configuration, as `main` does once it has
+    /// read the environment. Defaults to `/health` + `/admin`, which is what
+    /// every test — and every deployment that configures neither — wants.
+    pub fn with_reserved(mut self, reserved: ReservedRoutes) -> Self {
+        self.reserved = Arc::new(reserved);
+        self
     }
 }
 
@@ -696,7 +856,13 @@ fn describe_mock_entry(
     mock: &MockConfig,
     hits: u64,
     active_tags: Option<&HashSet<String>>,
+    reserved: &ReservedRoutes,
 ) -> serde_json::Value {
+    // A mock on a reserved path is loaded, listed, and never served — the one
+    // miss the dashboard couldn't previously see, because the request never
+    // reaches `handle_request` and so is never recorded.
+    let shadowed_by = reserved.reservation_for(&mock.method, &mock.path);
+
     json!({
         "key": key,
         "index": index,
@@ -720,6 +886,16 @@ fn describe_mock_entry(
         // which is otherwise indistinguishable from a broken matcher.
         "tags": mock.tags,
         "active": mock.is_active(active_tags),
+        // Whether a request can reach this mock at all, and why not when it
+        // can't. `hits: 0` on a reachable mock means "nothing asked for it";
+        // on an unreachable one it means "nothing ever can".
+        "reachable": shadowed_by.is_none(),
+        "unreachable_reason": shadowed_by.map(|owner| {
+            format!(
+                "{} {} is reserved by {} and will never be served from a mock",
+                mock.method, mock.path, owner
+            )
+        }),
         // The whole config, so the dashboard's expand-a-row can show what the
         // file says without a second round trip
         "config": mock,
@@ -752,6 +928,7 @@ pub async fn list_mocks(State(state): State<AppState>) -> Json<serde_json::Value
                 mock,
                 hit_count,
                 active_tags.as_ref(),
+                &state.reserved,
             ));
         }
     }
@@ -4512,5 +4689,152 @@ mod scenario_tests {
         if let Some(value) = restore {
             std::env::set_var(ACTIVE_TAGS_ENV, value);
         }
+    }
+
+    // ── Reserved routes (#87) ───────────────────────────────────────────
+
+    fn reserved(
+        health: Option<&str>,
+        admin: Option<&str>,
+        disable: Option<&str>,
+    ) -> ReservedRoutes {
+        ReservedRoutes::from_values(
+            health.map(str::to_string),
+            admin.map(str::to_string),
+            disable.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn unset_variables_reserve_exactly_what_mimic_has_always_reserved() {
+        assert_eq!(reserved(None, None, None), ReservedRoutes::default());
+        assert_eq!(
+            ReservedRoutes::default().health.as_deref(),
+            Some(DEFAULT_HEALTH_PATH)
+        );
+        assert_eq!(
+            ReservedRoutes::default().admin_prefix.as_deref(),
+            Some(DEFAULT_ADMIN_PREFIX)
+        );
+    }
+
+    #[test]
+    fn only_the_exact_pairs_mimic_answers_are_reserved() {
+        let routes = ReservedRoutes::default();
+
+        assert!(routes.reservation_for("GET", "/health").is_some());
+        assert!(routes.reservation_for("GET", "/admin/mocks").is_some());
+        assert!(routes.reservation_for("POST", "/admin/scenario").is_some());
+        assert!(routes
+            .reservation_for("DELETE", "/admin/requests")
+            .is_some());
+
+        // These reach the fallback and are perfectly good mocks; warning about
+        // them would be noise, and marking them unreachable would be a lie.
+        assert_eq!(routes.reservation_for("POST", "/health"), None);
+        assert_eq!(routes.reservation_for("POST", "/admin/mocks"), None);
+        assert_eq!(routes.reservation_for("GET", "/admin/users"), None);
+        assert_eq!(routes.reservation_for("GET", "/healthz"), None);
+    }
+
+    #[test]
+    fn method_comparison_is_case_insensitive() {
+        let routes = ReservedRoutes::default();
+        assert!(routes.reservation_for("get", "/health").is_some());
+    }
+
+    #[test]
+    fn an_empty_value_switches_a_route_off() {
+        let routes = reserved(Some(""), None, None);
+        assert_eq!(routes.health, None);
+        assert_eq!(
+            routes.reservation_for("GET", "/health"),
+            None,
+            "with the health check gone, the path is a mock's to claim"
+        );
+    }
+
+    #[test]
+    fn the_admin_api_can_be_moved_or_switched_off() {
+        let moved = reserved(None, Some("/_mimic"), None);
+        assert!(moved.reservation_for("GET", "/_mimic/mocks").is_some());
+        assert_eq!(moved.reservation_for("GET", "/admin/mocks"), None);
+
+        for truthy in ["true", "1", "yes", "on", " TRUE "] {
+            let off = reserved(None, None, Some(truthy));
+            assert_eq!(off.admin_prefix, None, "MIMIC_DISABLE_ADMIN={}", truthy);
+            assert_eq!(off.reservation_for("GET", "/admin/mocks"), None);
+        }
+
+        // A non-affirmative value leaves the admin API where it is, rather
+        // than treating "any value at all" as "off".
+        assert_eq!(
+            reserved(None, None, Some("false")).admin_prefix.as_deref(),
+            Some(DEFAULT_ADMIN_PREFIX)
+        );
+    }
+
+    #[test]
+    fn a_prefix_is_normalized_so_it_can_never_panic_the_router() {
+        // `Router::route` panics on a path without a leading slash, and a
+        // trailing slash would produce "/ops//mocks".
+        assert_eq!(
+            reserved(None, Some("  /ops/  "), None)
+                .admin_prefix
+                .as_deref(),
+            Some("/ops")
+        );
+        assert_eq!(
+            reserved(None, Some("ops"), None).admin_prefix.as_deref(),
+            Some("/ops")
+        );
+        assert_eq!(reserved(None, Some("/"), None).admin_prefix, None);
+    }
+
+    #[test]
+    fn disable_wins_over_a_configured_prefix() {
+        assert_eq!(
+            reserved(None, Some("/ops"), Some("true")).admin_prefix,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_mocks_marks_a_shadowed_mock_unreachable() {
+        // The reported case: a mock for GET /health loads, is listed, and can
+        // never serve. `hits: 0` alone doesn't say which of those it is.
+        let state = state_with(
+            vec![
+                mock("GET", "/health", "health-down", &[]),
+                mock("GET", "/users", "users", &[]),
+            ],
+            None,
+        );
+
+        let Json(body) = list_mocks(State(state)).await;
+        let entries = body["mocks"].as_array().unwrap();
+
+        let health = entries
+            .iter()
+            .find(|e| e["path"] == "/health")
+            .expect("the shadowed mock is still listed");
+        assert_eq!(health["reachable"], false);
+        assert!(health["unreachable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("reserved by"));
+
+        let users = entries.iter().find(|e| e["path"] == "/users").unwrap();
+        assert_eq!(users["reachable"], true);
+        assert_eq!(users["unreachable_reason"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_mock_is_reachable_once_the_route_it_collided_with_is_freed() {
+        let state = state_with(vec![mock("GET", "/health", "health-down", &[])], None)
+            .with_reserved(reserved(Some(""), None, None));
+
+        let Json(body) = list_mocks(State(state)).await;
+        assert_eq!(body["mocks"][0]["reachable"], true);
     }
 }

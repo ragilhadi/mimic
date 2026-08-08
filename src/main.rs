@@ -117,6 +117,10 @@ async fn run_server() {
     // Scenario selection: which tagged mock groups start out matchable
     let active_tags = configured_active_tags();
 
+    // Which method+path pairs Mimic answers itself, and therefore can't serve
+    // from a mock.
+    let reserved = handler::ReservedRoutes::from_env();
+
     info!("Configuration:");
     info!(
         "  Mocks directory: {} ({})",
@@ -137,19 +141,33 @@ async fn run_server() {
         0 => info!("  Request log: unbounded"),
         n => info!("  Request log: last {} request(s)", n),
     }
+    info!(
+        "  Health check: {}",
+        reserved.health.as_deref().unwrap_or("(disabled)")
+    );
+    info!(
+        "  Admin API: {}",
+        reserved
+            .admin_prefix
+            .as_deref()
+            .map_or("(disabled)".to_string(), |prefix| format!("{}/*", prefix))
+    );
 
     // Load mock configurations
     let mocks = load_mocks(&mocks_dir.path);
-    {
+    let mut shadowed = {
         let m = mocks.read().await;
         info!("Loaded {} mock(s)", m.len());
         if m.is_empty() {
             warn_empty_mock_set(&mocks_dir);
         }
-    }
+        let shadowed = shadowed_mocks(&m, &reserved);
+        warn_about_shadowed_mocks(&shadowed);
+        shadowed
+    };
 
     // Create application state
-    let state = AppState::with_active_tags(mocks.clone(), active_tags);
+    let state = AppState::with_active_tags(mocks.clone(), active_tags).with_reserved(reserved);
 
     // Spawn background task for hot-reloading mock files
     const RELOAD_INTERVAL_SECS: u64 = 2;
@@ -160,6 +178,7 @@ async fn run_server() {
     // Per-mock state the reloader has to reconcile against the new mock set.
     let reload_counters = state.sequence_counters.clone();
     let reload_hits = state.mock_hits.clone();
+    let reload_reserved = state.reserved.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
@@ -198,6 +217,14 @@ async fn run_server() {
                         new_len
                     );
                 }
+                // Warn only when the set changes: this loop runs every two
+                // seconds, and a collision that has already been reported does
+                // not need reporting 30 times a minute.
+                let current = shadowed_mocks(&store, &reload_reserved);
+                if current != shadowed {
+                    warn_about_shadowed_mocks(&current);
+                    shadowed = current;
+                }
                 live_identities(&store)
             };
 
@@ -224,6 +251,62 @@ async fn run_server() {
     axum::serve(listener, app).await.unwrap_or_else(|e| {
         panic!("Server error: {}", e);
     });
+}
+
+/// One mock that will never serve a request because Mimic answers its
+/// method+path itself: the file it came from, and what claims the route.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ShadowedMock {
+    method: String,
+    path: String,
+    source: String,
+    owner: &'static str,
+}
+
+/// Every loaded mock a reserved route shadows, sorted so the set can be
+/// compared between reloads.
+fn shadowed_mocks(
+    store: &HashMap<String, Vec<types::MockConfig>>,
+    reserved: &handler::ReservedRoutes,
+) -> Vec<ShadowedMock> {
+    let mut found: Vec<ShadowedMock> = store
+        .values()
+        .flatten()
+        .filter_map(|mock| {
+            reserved
+                .reservation_for(&mock.method, &mock.path)
+                .map(|owner| ShadowedMock {
+                    method: mock.method.clone(),
+                    path: mock.path.clone(),
+                    source: mock
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "(built in-process)".to_string()),
+                    owner,
+                })
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Say out loud that a mock is loaded and unreachable.
+///
+/// Explicit routes are matched ahead of the fallback by design, so such a mock
+/// parses, registers, is listed by `/admin/mocks`, and then sits at `hits: 0`
+/// forever. Nothing else in the system can report it: the request never
+/// reaches `handle_request`, so it is never recorded, and the dashboard —
+/// whose whole premise is reading *why* a request didn't match — is blind to
+/// precisely this one.
+fn warn_about_shadowed_mocks(shadowed: &[ShadowedMock]) {
+    for mock in shadowed {
+        warn!(
+            "{} declares {} {}, which is reserved by {} and will never be served. \
+             Move it, or free the route (see MIMIC_HEALTH_PATH / MIMIC_ADMIN_PREFIX / \
+             MIMIC_DISABLE_ADMIN).",
+            mock.source, mock.method, mock.path, mock.owner
+        );
+    }
 }
 
 /// Every mock identity a mock map currently registers.
@@ -339,18 +422,59 @@ fn apply_reload(
     merged
 }
 
+/// Build the HTTP router.
+///
+/// Every built-in route carries `.fallback(handle_request)`: a method the
+/// route doesn't declare — `POST /health`, `PUT /admin/requests` — used to get
+/// a bare `405 Method Not Allowed` from axum's method router, a response shape
+/// Mimic doesn't document and never records in the request log. Those requests
+/// now reach the normal pipeline, so they can be mocked, and are answered with
+/// the documented `mock not found` body when they aren't.
+///
+/// Which routes exist at all comes from `state.reserved`, so `MIMIC_HEALTH_PATH`
+/// and `MIMIC_ADMIN_PREFIX` / `MIMIC_DISABLE_ADMIN` can hand these paths back
+/// to an API that genuinely owns them.
 fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Health check endpoint
-        .route("/health", get(health_check))
-        // Admin dashboard and request history API
-        .route("/admin/dashboard", get(admin_dashboard))
-        .route("/admin/requests", get(list_requests).delete(clear_requests))
-        .route("/admin/mocks", get(list_mocks))
-        .route("/admin/sequences", get(list_sequences))
-        .route("/admin/sequences/reset", post(reset_sequences))
-        // Scenario switching: which tagged mock groups are currently matchable
-        .route("/admin/scenario", get(get_scenario).post(set_scenario))
+    let reserved = state.reserved.clone();
+    let mut router = Router::new();
+
+    if let Some(health_path) = reserved.health.as_deref() {
+        router = router.route(health_path, get(health_check).fallback(handle_request));
+    }
+
+    if let Some(prefix) = reserved.admin_prefix.as_deref() {
+        let at = |suffix: &str| format!("{}{}", prefix, suffix);
+        router = router
+            // Admin dashboard and request history API
+            .route(
+                &at("/dashboard"),
+                get(admin_dashboard).fallback(handle_request),
+            )
+            .route(
+                &at("/requests"),
+                get(list_requests)
+                    .delete(clear_requests)
+                    .fallback(handle_request),
+            )
+            .route(&at("/mocks"), get(list_mocks).fallback(handle_request))
+            .route(
+                &at("/sequences"),
+                get(list_sequences).fallback(handle_request),
+            )
+            .route(
+                &at("/sequences/reset"),
+                post(reset_sequences).fallback(handle_request),
+            )
+            // Scenario switching: which tagged mock groups are currently matchable
+            .route(
+                &at("/scenario"),
+                get(get_scenario)
+                    .post(set_scenario)
+                    .fallback(handle_request),
+            );
+    }
+
+    router
         // Catch-all route for mock requests
         .fallback(any(handle_request))
         // Add state
@@ -586,6 +710,143 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["reset"], 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Reserved routes (#87)
+    // ------------------------------------------------------------------
+
+    fn state_serving(mocks: Vec<MockConfig>) -> AppState {
+        AppState::new(Arc::new(tokio::sync::RwLock::new(map(mocks))))
+    }
+
+    async fn call(app: Router, method: &str, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_method_on_a_reserved_path_is_not_a_bare_405() {
+        // axum's method router answered `POST /health` with an empty 405 —
+        // a shape Mimic doesn't document and never records.
+        let app = create_router(test_state());
+        let (status, body) = call(app, "POST", "/health").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "mock not found");
+        assert_eq!(json["path"], "/health");
+    }
+
+    #[tokio::test]
+    async fn test_a_method_the_admin_api_does_not_declare_reaches_the_mock_handler() {
+        let app = create_router(state_serving(vec![mock("PUT", "/admin/requests", "mine")]));
+        let (status, body) = call(app, "PUT", "/admin/requests").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "mine");
+    }
+
+    #[tokio::test]
+    async fn test_a_mock_cannot_shadow_the_health_check_by_default() {
+        // The behavior this issue documents rather than changes: /health stays
+        // Mimic's until someone frees it. The loader warning and the
+        // `reachable: false` flag on /admin/mocks are what make it visible.
+        let app = create_router(state_serving(vec![mock("GET", "/health", "mine")]));
+        let (status, body) = call(app, "GET", "/health").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_freeing_the_health_path_lets_a_mock_serve_it() {
+        let state = state_serving(vec![mock("GET", "/health", "mine")]).with_reserved(
+            handler::ReservedRoutes {
+                health: None,
+                admin_prefix: Some("/admin".to_string()),
+            },
+        );
+        let (status, body) = call(create_router(state), "GET", "/health").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "mine", "the mock should win now");
+    }
+
+    #[tokio::test]
+    async fn test_moving_the_admin_prefix_moves_every_admin_route() {
+        let state = state_serving(vec![mock("GET", "/admin/mocks", "mine")]).with_reserved(
+            handler::ReservedRoutes {
+                health: Some("/health".to_string()),
+                admin_prefix: Some("/_mimic".to_string()),
+            },
+        );
+        let app = create_router(state.clone());
+
+        let (status, body) = call(app, "GET", "/_mimic/mocks").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["mocks"].is_array(), "the admin API moved here");
+
+        // …and the old prefix is now the mock set's to use.
+        let (status, body) = call(create_router(state), "GET", "/admin/mocks").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "mine");
+    }
+
+    #[tokio::test]
+    async fn test_disabling_the_admin_api_removes_all_of_its_routes() {
+        let state = state_serving(vec![]).with_reserved(handler::ReservedRoutes {
+            health: Some("/health".to_string()),
+            admin_prefix: None,
+        });
+        let (status, body) = call(create_router(state), "GET", "/admin/requests").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "mock not found");
+    }
+
+    #[test]
+    fn test_shadowed_mocks_names_the_file_and_what_claims_the_route() {
+        let mut health = mock("GET", "/health", "down");
+        health.source = Some("mocks/health_down.json".to_string());
+        let store = map(vec![health, mock("GET", "/users", "users")]);
+
+        let found = shadowed_mocks(&store, &handler::ReservedRoutes::default());
+
+        assert_eq!(found.len(), 1, "only the reserved path collides");
+        assert_eq!(found[0].path, "/health");
+        assert_eq!(found[0].source, "mocks/health_down.json");
+    }
+
+    #[test]
+    fn test_nothing_is_shadowed_once_the_routes_are_freed() {
+        let store = map(vec![
+            mock("GET", "/health", "down"),
+            mock("GET", "/admin/mocks", "mine"),
+        ]);
+        let freed = handler::ReservedRoutes {
+            health: None,
+            admin_prefix: None,
+        };
+
+        assert!(shadowed_mocks(&store, &freed).is_empty());
     }
 
     // ------------------------------------------------------------------

@@ -22,7 +22,8 @@
 - **Purpose:** Route HTTP requests to handlers
 - **Inputs:** HTTP requests on port 8080, `PORT` and `RUST_LOG` env vars
 - **Outputs:** HTTP responses, access logs, health checks
-- **Responsibilities:** Setup routes (`/health`, catch-all), middleware, lifecycle management
+- **Responsibilities:** Setup routes (`/health`, `/admin/*`, catch-all), middleware, lifecycle management
+- **Reserved routes:** `/health` and the admin endpoints are matched ahead of the fallback, so a mock declaring one is loaded but unreachable. `ReservedRoutes` is the single list of those method+path pairs — the router registers from it and `/admin/mocks` flags collisions against it, so the two can't disagree. `MIMIC_HEALTH_PATH`, `MIMIC_ADMIN_PREFIX`, and `MIMIC_DISABLE_ADMIN` move or remove them. Every built-in route carries `.fallback(handle_request)`, so an undeclared method reaches the mock pipeline instead of producing a bare 405.
 
 ### 3. **Matcher Agent** (`src/matcher.rs`)
 - **Purpose:** Find best matching mock using pattern matching, and explain the outcome
