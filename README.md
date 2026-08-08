@@ -139,6 +139,17 @@ MIMIC_ADMIN_PREFIX=/admin
 
 # Switch the admin API off entirely (default: false)
 MIMIC_DISABLE_ADMIN=false
+
+# Bearer token the admin API requires (default: unset = no authentication)
+MIMIC_ADMIN_TOKEN=
+
+# Body field names whose values are replaced with [REDACTED] in the request
+# log, comma-separated. Empty stores bodies verbatim. See "What the request
+# log keeps" below for the default list.
+MIMIC_REDACT_BODY_FIELDS=password,token,secret,api_key
+
+# Store no request/response bodies in the log at all (default: false)
+MIMIC_DISABLE_BODY_LOG=false
 ```
 
 **Log Levels**:
@@ -1356,14 +1367,71 @@ All of them are query parameters on `/admin/requests`, so they work from
   "*N* new requests" banner instead of shifting the row you're reading.
 - **Copy as curl** per row, and **Export log** for the whole filtered view.
 - **Theme** follows `prefers-color-scheme`, with a manual toggle that sticks.
-- **Redaction**: `authorization`, `cookie` and `set-cookie` values are replaced
-  with `[REDACTED]` in request headers, response headers, and explanations. A
-  mock returning `Set-Cookie` still sends the real value to the client; only
-  the log and the UI see the placeholder.
+- **Redaction**: see [What the request log keeps](#what-the-request-log-keeps)
+  — headers *and* body fields are scrubbed by default.
 - **Bounded by default**: the log keeps the last `MIMIC_MAX_LOG_ENTRIES`
   requests (1000), and stored bodies are truncated past
   `MIMIC_MAX_RECORDED_BODY` (64 KB) with a `…[truncated]` marker — so a
   long-running server doesn't degrade the very UI meant to observe it.
+
+### What the request log keeps
+
+The log lives in memory and is served, unfiltered, by `GET /admin/requests` on
+a server that binds `0.0.0.0`. Two of this README's own use cases — a shared
+team mock server, and CI — put that port somewhere more than one person can
+reach it. So credentials that pass through Mimic are scrubbed on the way *in*
+to the log.
+
+**Redacted by default:**
+
+| Where | What | Configured by |
+|---|---|---|
+| Request headers, response headers, match explanations | `authorization`, `cookie`, `set-cookie` | — (fixed list) |
+| Request bodies **and** response bodies | fields named `password`, `passwd`, `token`, `access_token`, `refresh_token`, `id_token`, `secret`, `client_secret`, `api_key`, `apikey`, `private_key`, `authorization` | `MIMIC_REDACT_BODY_FIELDS` |
+
+Body redaction walks JSON — through nested objects and arrays — and
+`application/x-www-form-urlencoded` fields. Field names match
+**case-insensitively and exactly**: `token` scrubs `token`, not `tokenizer`,
+which is why the default list spells out the common variants. A matching key
+loses its whole value, object or array included. Anything with no field
+structure (plain text, XML, binary) is stored as it came in.
+
+**Not redacted:** query strings, paths, and the values of fields you haven't
+named. `?api_key=...` in a URL is stored verbatim — put secrets in headers or
+bodies.
+
+**Redaction is a property of the log only.** The body sent to the client, the
+body matching runs against, and the values `{{body.*}}` interpolates are all
+untouched.
+
+```bash
+MIMIC_REDACT_BODY_FIELDS=password,cvv,pin mimic   # replace the default list
+MIMIC_REDACT_BODY_FIELDS= mimic                   # store bodies verbatim
+MIMIC_DISABLE_BODY_LOG=true mimic                 # store no bodies at all
+```
+
+### Protecting the admin API
+
+`MIMIC_ADMIN_TOKEN` puts the admin endpoints behind a bearer token. Unset —
+the default — leaves them open exactly as they have always been.
+
+```bash
+MIMIC_ADMIN_TOKEN=s3cret mimic
+```
+
+```bash
+curl -H 'Authorization: Bearer s3cret' http://localhost:8080/admin/requests
+```
+
+Without the header, those endpoints answer `401 {"error": "unauthorized"}`.
+Two things stay open on purpose: `/health`, because liveness probes call it
+and carry no credentials, and any path under the admin prefix that Mimic
+doesn't itself answer (`GET /admin/users`), because that's an ordinary mock.
+
+Note that `/admin/dashboard` is guarded too, so a browser won't load it while a
+token is set — use the token with `curl`, move the admin API somewhere private
+with `MIMIC_ADMIN_PREFIX`, or leave the token unset on a machine only you can
+reach.
 
 ---
 

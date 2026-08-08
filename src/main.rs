@@ -121,6 +121,11 @@ async fn run_server() {
     // from a mock.
     let reserved = handler::ReservedRoutes::from_env();
 
+    // What is scrubbed from the bodies the request log keeps, and whether the
+    // admin API that serves them is behind a token.
+    let redaction = handler::BodyRedaction::from_env();
+    let admin_token = handler::configured_admin_token();
+
     info!("Configuration:");
     info!(
         "  Mocks directory: {} ({})",
@@ -146,12 +151,32 @@ async fn run_server() {
         reserved.health.as_deref().unwrap_or("(disabled)")
     );
     info!(
-        "  Admin API: {}",
+        "  Admin API: {}{}",
         reserved
             .admin_prefix
             .as_deref()
-            .map_or("(disabled)".to_string(), |prefix| format!("{}/*", prefix))
+            .map_or("(disabled)".to_string(), |prefix| format!("{}/*", prefix)),
+        if admin_token.is_some() {
+            " (bearer token required)"
+        } else {
+            " (unauthenticated)"
+        }
     );
+    if redaction.disabled {
+        info!(
+            "  Stored bodies: none ({}=true)",
+            handler::DISABLE_BODY_LOG_ENV
+        );
+    } else if redaction.fields.is_empty() {
+        info!(
+            "  Stored bodies: verbatim, no field redaction ({}= is empty)",
+            handler::REDACT_BODY_FIELDS_ENV
+        );
+    } else {
+        let mut fields: Vec<&str> = redaction.fields.iter().map(String::as_str).collect();
+        fields.sort();
+        info!("  Redacted body fields: {}", fields.join(", "));
+    }
 
     // Load mock configurations
     let mocks = load_mocks(&mocks_dir.path);
@@ -167,7 +192,10 @@ async fn run_server() {
     };
 
     // Create application state
-    let state = AppState::with_active_tags(mocks.clone(), active_tags).with_reserved(reserved);
+    let state = AppState::with_active_tags(mocks.clone(), active_tags)
+        .with_reserved(reserved)
+        .with_redaction(redaction)
+        .with_admin_token(admin_token);
 
     // Spawn background task for hot-reloading mock files
     const RELOAD_INTERVAL_SECS: u64 = 2;
@@ -474,11 +502,11 @@ fn create_router(state: AppState) -> Router {
             );
     }
 
-    router
+    let app = router
         // Catch-all route for mock requests
         .fallback(any(handle_request))
         // Add state
-        .with_state(state)
+        .with_state(state.clone())
         // Add tracing middleware
         //
         // The request-body cap is enforced in `handle_request` rather than by
@@ -487,7 +515,20 @@ fn create_router(state: AppState) -> Router {
         // different ways depending on whether the client declared a
         // Content-Length. `Limited` in the handler caps the stream just as
         // hard and always returns the documented JSON shape.
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http());
+
+    // The admin token guard is attached only when a token is configured, so a
+    // default run doesn't pay a per-request check for a feature it isn't
+    // using. The middleware itself decides which requests it applies to, from
+    // the same `ReservedRoutes` the routes above were registered from.
+    if state.admin_token.is_some() {
+        app.layer(axum::middleware::from_fn_with_state(
+            state,
+            handler::require_admin_token,
+        ))
+    } else {
+        app
+    }
 }
 
 fn init_logging() {
@@ -820,6 +861,100 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "mock not found");
+    }
+
+    // ------------------------------------------------------------------
+    // Admin API authentication (#88)
+    // ------------------------------------------------------------------
+
+    async fn call_with_auth(
+        app: Router,
+        method: &str,
+        uri: &str,
+        auth: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(value) = auth {
+            builder = builder.header("authorization", value);
+        }
+        let response = app
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, bytes.to_vec())
+    }
+
+    fn token_state(mocks: Vec<MockConfig>) -> AppState {
+        state_serving(mocks).with_admin_token(Some("s3cret".to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_admin_api_is_open_when_no_token_is_configured() {
+        // The default has to stay exactly as it was, or every existing user's
+        // dashboard stops working on upgrade.
+        let (status, _) = call(create_router(test_state()), "GET", "/admin/requests").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_a_configured_token_is_required_on_the_admin_api() {
+        let app = create_router(token_state(vec![]));
+        let (status, body) = call_with_auth(app, "GET", "/admin/requests", None).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn test_the_right_token_gets_through_and_a_wrong_one_does_not() {
+        let (status, _) = call_with_auth(
+            create_router(token_state(vec![])),
+            "GET",
+            "/admin/requests",
+            Some("Bearer s3cret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        for wrong in ["Bearer nope", "s3cret", "Basic s3cret", "Bearer "] {
+            let (status, _) = call_with_auth(
+                create_router(token_state(vec![])),
+                "GET",
+                "/admin/requests",
+                Some(wrong),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "'{}' must not be accepted",
+                wrong
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_token_does_not_guard_the_health_check() {
+        // Liveness probes call /health and carry no credentials; requiring a
+        // token there would fail every deployment that turned auth on.
+        let (status, _) =
+            call_with_auth(create_router(token_state(vec![])), "GET", "/health", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_the_token_does_not_guard_ordinary_mocks_under_the_admin_prefix() {
+        // `GET /admin/users` is a mock path, not an admin endpoint — the same
+        // distinction #87 drew for reserved routes.
+        let app = create_router(token_state(vec![mock("GET", "/admin/users", "mine")]));
+        let (status, body) = call_with_auth(app, "GET", "/admin/users", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "mine");
     }
 
     #[test]

@@ -143,17 +143,296 @@ impl ReservedRoutes {
             return Some("Mimic's health check");
         }
 
-        let prefix = self.admin_prefix.as_deref()?;
-        let suffix = path.strip_prefix(prefix)?;
-        ADMIN_ROUTES
-            .iter()
-            .find(|(route, methods)| {
-                *route == suffix
-                    && methods
-                        .iter()
-                        .any(|allowed| method.eq_ignore_ascii_case(allowed))
-            })
-            .map(|_| "Mimic's admin API")
+        self.is_admin_endpoint(method, path)
+            .then_some("Mimic's admin API")
+    }
+
+    /// Whether `method path` is one of the admin API's own endpoints.
+    ///
+    /// This is the set `MIMIC_ADMIN_TOKEN` guards. The health check is
+    /// deliberately outside it: liveness probes call it and carry no
+    /// credentials.
+    pub fn is_admin_endpoint(&self, method: &str, path: &str) -> bool {
+        let Some(prefix) = self.admin_prefix.as_deref() else {
+            return false;
+        };
+        let Some(suffix) = path.strip_prefix(prefix) else {
+            return false;
+        };
+        ADMIN_ROUTES.iter().any(|(route, methods)| {
+            *route == suffix
+                && methods
+                    .iter()
+                    .any(|allowed| method.eq_ignore_ascii_case(allowed))
+        })
+    }
+}
+
+// ============================================================================
+// Body Redaction and Admin Authentication
+// ============================================================================
+
+/// The placeholder a redacted value is stored as. Shared with header
+/// redaction so the log reads consistently.
+pub const REDACTED: &str = "[REDACTED]";
+
+/// Environment variable listing the body field names to redact.
+pub const REDACT_BODY_FIELDS_ENV: &str = "MIMIC_REDACT_BODY_FIELDS";
+
+/// Environment variable switching body storage off entirely.
+pub const DISABLE_BODY_LOG_ENV: &str = "MIMIC_DISABLE_BODY_LOG";
+
+/// Environment variable setting the bearer token the admin API requires.
+pub const ADMIN_TOKEN_ENV: &str = "MIMIC_ADMIN_TOKEN";
+
+/// Field names redacted from stored bodies when nothing is configured.
+///
+/// A default rather than an empty list, because the failure mode is silent:
+/// nobody discovers that the log kept a password until someone reads the log.
+/// `MIMIC_REDACT_BODY_FIELDS=` (empty) restores verbatim storage for anyone
+/// who wants it.
+pub const DEFAULT_REDACT_BODY_FIELDS: &[&str] = &[
+    "password",
+    "passwd",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "secret",
+    "client_secret",
+    "api_key",
+    "apikey",
+    "private_key",
+    "authorization",
+];
+
+/// What is kept, and what is scrubbed, from the bodies stored on a log entry.
+///
+/// Only the *stored* copy is affected. The body sent to the client, the body
+/// matching runs against, and the values templating interpolates are all
+/// untouched — redaction is a property of the log, not of the mock server's
+/// behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyRedaction {
+    /// Lowercased field names whose values are replaced. Empty means bodies
+    /// are stored verbatim.
+    pub fields: HashSet<String>,
+    /// Store no bodies at all — request or response.
+    pub disabled: bool,
+}
+
+impl Default for BodyRedaction {
+    fn default() -> Self {
+        Self {
+            fields: DEFAULT_REDACT_BODY_FIELDS
+                .iter()
+                .map(|field| field.to_string())
+                .collect(),
+            disabled: false,
+        }
+    }
+}
+
+impl BodyRedaction {
+    /// Read the policy from the environment.
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var(REDACT_BODY_FIELDS_ENV).ok(),
+            std::env::var(DISABLE_BODY_LOG_ENV).ok(),
+        )
+    }
+
+    /// [`BodyRedaction::from_env`] with the environment injected, so the rules
+    /// are testable without mutating variables other tests share.
+    pub fn from_values(fields: Option<String>, disable: Option<String>) -> Self {
+        let fields = match fields {
+            // Set-but-empty is the documented way to say "store verbatim",
+            // which is why this doesn't collapse into `unwrap_or_default`.
+            Some(raw) => raw
+                .split(',')
+                .map(|field| field.trim().to_ascii_lowercase())
+                .filter(|field| !field.is_empty())
+                .collect(),
+            None => Self::default().fields,
+        };
+
+        Self {
+            fields,
+            disabled: disable.as_deref().is_some_and(is_truthy),
+        }
+    }
+
+    /// The stored form of a body, or `None` when bodies aren't stored.
+    pub fn apply(&self, body: String, content_type: Option<&str>) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        if self.fields.is_empty() {
+            return Some(body);
+        }
+        Some(redact_body(&body, content_type, &self.fields))
+    }
+}
+
+/// Replace the values of `fields` in `body`, leaving everything else alone.
+///
+/// Best-effort by structure, not by pattern: a body that parses as JSON is
+/// walked and rewritten field-wise, including through nested objects and
+/// arrays; a urlencoded form body is rewritten field-wise; anything else has
+/// no field structure to redact and is returned as it came in. Matching a
+/// field name is case-insensitive and exact — `token` does not scrub
+/// `tokenizer` — which is why the default list spells out the common variants.
+///
+/// The original string is returned unchanged when nothing matched, so a body
+/// with no secrets in it is never reserialized into different whitespace.
+pub fn redact_body(body: &str, content_type: Option<&str>, fields: &HashSet<String>) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) {
+        if redact_json(&mut value, fields) {
+            return serde_json::to_string(&value).unwrap_or_else(|_| body.to_string());
+        }
+        return body.to_string();
+    }
+
+    let is_form = content_type
+        .map(|ct| ct.to_ascii_lowercase())
+        .is_some_and(|ct| ct.contains("application/x-www-form-urlencoded"));
+    if is_form {
+        if let Some(redacted) = redact_form(body, fields) {
+            return redacted;
+        }
+    }
+
+    body.to_string()
+}
+
+/// Redact matching fields anywhere in a JSON value. Returns whether anything
+/// changed.
+///
+/// A matching key has its **whole** value replaced, object or array included:
+/// `{"token": {"value": "..."}}` must not leak just because the secret is one
+/// level further in.
+fn redact_json(value: &mut serde_json::Value, fields: &HashSet<String>) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for (key, entry) in map.iter_mut() {
+                if fields.contains(&key.to_ascii_lowercase()) {
+                    *entry = serde_json::Value::String(REDACTED.to_string());
+                    changed = true;
+                } else {
+                    changed |= redact_json(entry, fields);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            // A plain loop rather than `any`: every element has to be visited,
+            // and `any` short-circuits on the first hit — which would leave
+            // every later element of the array unredacted.
+            let mut changed = false;
+            for item in items.iter_mut() {
+                changed |= redact_json(item, fields);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Redact matching fields in a urlencoded body, or `None` if nothing matched.
+///
+/// Everything not redacted is passed through byte for byte — this rewrites the
+/// log entry, and a body that came back subtly re-encoded would be a worse
+/// record of what the client sent than the original.
+fn redact_form(body: &str, fields: &HashSet<String>) -> Option<String> {
+    let mut changed = false;
+    let rewritten: Vec<String> = body
+        .split('&')
+        .map(|pair| {
+            let Some((key, _)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            // Compared decoded, the same form the matcher and the templater
+            // see the field name in.
+            if fields.contains(&crate::matcher::decode_component(key).to_ascii_lowercase()) {
+                changed = true;
+                format!("{}={}", key, REDACTED)
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+
+    changed.then(|| rewritten.join("&"))
+}
+
+/// The bearer token the admin API requires, read from `MIMIC_ADMIN_TOKEN`.
+///
+/// Unset — the default — leaves the admin API open exactly as it has always
+/// been, so nothing breaks for an existing user who hasn't asked for auth.
+pub fn configured_admin_token() -> Option<String> {
+    std::env::var(ADMIN_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+/// 401 returned when the admin API is protected and the caller didn't present
+/// the token. Same shape as the other error bodies Mimic returns.
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "unauthorized",
+            "detail": format!(
+                "the admin API requires an 'Authorization: Bearer <token>' header \
+                 matching {}",
+                ADMIN_TOKEN_ENV
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// Middleware guarding the admin API when a token is configured.
+///
+/// Deliberately scoped to the method+path pairs the admin API answers, taken
+/// from the same [`ReservedRoutes`] the router registered from. Two things
+/// stay unguarded on purpose: the health check, which is what liveness probes
+/// call and they carry no credentials, and any admin-prefixed path Mimic
+/// doesn't itself answer, which is an ordinary mock request.
+pub async fn require_admin_token(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = state.admin_token.as_deref() else {
+        return next.run(request).await;
+    };
+    if !state
+        .reserved
+        .is_admin_endpoint(request.method().as_str(), request.uri().path())
+    {
+        return next.run(request).await;
+    }
+
+    let authorized = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .is_some_and(|token| token == expected.as_str());
+
+    if authorized {
+        next.run(request).await
+    } else {
+        warn!(
+            "Rejecting {} {}: admin API token missing or incorrect",
+            request.method(),
+            request.uri().path()
+        );
+        unauthorized()
     }
 }
 
@@ -192,6 +471,11 @@ pub struct AppState {
     /// registered them so `/admin/mocks` can mark a shadowed mock unreachable
     /// instead of leaving it at an unexplained `hits: 0`.
     pub reserved: Arc<ReservedRoutes>,
+    /// What is scrubbed from the bodies stored on a log entry.
+    pub redaction: Arc<BodyRedaction>,
+    /// Bearer token the admin API requires, or `None` to leave it open — the
+    /// default, and what every Mimic before this did.
+    pub admin_token: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -215,6 +499,8 @@ impl AppState {
             started_at: std::time::Instant::now(),
             active_tags: Arc::new(tokio::sync::RwLock::new(active_tags)),
             reserved: Arc::new(ReservedRoutes::default()),
+            redaction: Arc::new(BodyRedaction::default()),
+            admin_token: None,
         }
     }
 
@@ -223,6 +509,20 @@ impl AppState {
     /// every test — and every deployment that configures neither — wants.
     pub fn with_reserved(mut self, reserved: ReservedRoutes) -> Self {
         self.reserved = Arc::new(reserved);
+        self
+    }
+
+    /// Replace the body-redaction policy. Defaults to
+    /// [`DEFAULT_REDACT_BODY_FIELDS`], so a test exercises the same policy a
+    /// default deployment runs.
+    pub fn with_redaction(mut self, redaction: BodyRedaction) -> Self {
+        self.redaction = Arc::new(redaction);
+        self
+    }
+
+    /// Require a bearer token on the admin API. `None` leaves it open.
+    pub fn with_admin_token(mut self, token: Option<String>) -> Self {
+        self.admin_token = token.map(Arc::new);
         self
     }
 }
@@ -614,7 +914,7 @@ fn recorded_response_headers(headers: &HeaderMap) -> HashMap<String, String> {
         .map(|(name, value)| {
             let name = name.as_str().to_string();
             let value = if is_sensitive_header(&name) {
-                "[REDACTED]".to_string()
+                REDACTED.to_string()
             } else {
                 value.to_str().unwrap_or("[non-UTF-8]").to_string()
             };
@@ -698,7 +998,7 @@ async fn record_request(state: &AppState, context: RequestContext, outcome: Requ
         .into_iter()
         .map(|(k, v)| {
             if is_sensitive_header(&k) {
-                (k, "[REDACTED]".to_string())
+                (k, REDACTED.to_string())
             } else {
                 (k, v)
             }
@@ -706,6 +1006,16 @@ async fn record_request(state: &AppState, context: RequestContext, outcome: Requ
         .collect();
 
     let body_limit = max_recorded_body_size();
+    let redaction = &state.redaction;
+    let request_content_type = context.content_type.clone();
+    // A mock returning a token has the same problem the request that carried
+    // one does, so the response body goes through the same policy — read
+    // against the content type actually being sent.
+    let response_content_type = outcome.response_headers.get("content-type").cloned();
+
+    // Redaction runs before truncation, not after: a body cut at 64 KB can
+    // stop mid-object, and JSON that no longer parses is JSON whose fields
+    // can't be found and scrubbed.
     let mut record = RequestRecord {
         id: 0,
         timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -716,10 +1026,14 @@ async fn record_request(state: &AppState, context: RequestContext, outcome: Requ
         body: context
             .body
             .and_then(|b| String::from_utf8(b.to_vec()).ok())
+            .and_then(|b| redaction.apply(b, request_content_type.as_deref()))
             .map(|b| truncate_body(b, body_limit)),
         matched_mock: outcome.matched_mock,
         response_status: outcome.response_status,
-        response_body: outcome.response_body.map(|b| truncate_body(b, body_limit)),
+        response_body: outcome
+            .response_body
+            .and_then(|b| redaction.apply(b, response_content_type.as_deref()))
+            .map(|b| truncate_body(b, body_limit)),
         response_headers: outcome.response_headers,
         match_score: outcome.match_score,
         path_params: outcome.path_params,
@@ -4827,6 +5141,277 @@ mod scenario_tests {
         let users = entries.iter().find(|e| e["path"] == "/users").unwrap();
         assert_eq!(users["reachable"], true);
         assert_eq!(users["unreachable_reason"], serde_json::Value::Null);
+    }
+
+    // ── Body redaction (#88) ────────────────────────────────────────────
+
+    fn policy(fields: &[&str]) -> BodyRedaction {
+        BodyRedaction {
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+            disabled: false,
+        }
+    }
+
+    fn redact(body: &str, content_type: Option<&str>) -> String {
+        redact_body(body, content_type, &BodyRedaction::default().fields)
+    }
+
+    #[test]
+    fn the_default_policy_scrubs_a_password_out_of_a_json_body() {
+        // The reported case: the credential sitting next to a header that was
+        // already redacted.
+        let stored = redact(
+            r#"{"username":"alice","password":"hunter2"}"#,
+            Some("application/json"),
+        );
+        let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+
+        assert_eq!(json["password"], REDACTED);
+        assert_eq!(json["username"], "alice", "only the secret is touched");
+    }
+
+    #[test]
+    fn redaction_reaches_nested_objects_and_arrays() {
+        let stored = redact(
+            r#"{"users":[{"name":"a","token":"t1"},{"name":"b","token":"t2"}],
+                "auth":{"nested":{"api_key":"k"}}}"#,
+            Some("application/json"),
+        );
+        let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+
+        assert_eq!(json["users"][0]["token"], REDACTED);
+        assert_eq!(json["users"][1]["token"], REDACTED);
+        assert_eq!(json["auth"]["nested"]["api_key"], REDACTED);
+        assert_eq!(json["users"][0]["name"], "a");
+    }
+
+    #[test]
+    fn a_matching_key_loses_its_whole_subtree() {
+        // `{"token": {"value": "..."}}` must not leak because the secret is
+        // one level further in than the name that identified it.
+        let stored = redact(
+            r#"{"token":{"value":"secret","expires":1}}"#,
+            Some("application/json"),
+        );
+        let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(json["token"], REDACTED);
+    }
+
+    #[test]
+    fn field_names_are_matched_case_insensitively_and_exactly() {
+        let stored = redact(
+            r#"{"Password":"x","PASSWORD":"y","tokenizer":"keep me"}"#,
+            Some("application/json"),
+        );
+        let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+
+        assert_eq!(json["Password"], REDACTED);
+        assert_eq!(json["PASSWORD"], REDACTED);
+        assert_eq!(
+            json["tokenizer"], "keep me",
+            "exact matching: `token` must not swallow `tokenizer`"
+        );
+    }
+
+    #[test]
+    fn form_bodies_are_redacted_field_wise() {
+        let stored = redact(
+            "username=alice&password=hunter2&remember=1",
+            Some("application/x-www-form-urlencoded"),
+        );
+        assert_eq!(
+            stored,
+            format!("username=alice&password={}&remember=1", REDACTED)
+        );
+    }
+
+    #[test]
+    fn a_body_with_nothing_to_redact_is_stored_byte_for_byte() {
+        // Reserializing a clean body would rewrite its whitespace, making the
+        // log a worse record of what was actually sent.
+        let original = "{\n  \"username\": \"alice\"\n}";
+        assert_eq!(redact(original, Some("application/json")), original);
+
+        let text = "just some plain text with the word password in it";
+        assert_eq!(redact(text, Some("text/plain")), text);
+    }
+
+    #[test]
+    fn an_empty_field_list_stores_bodies_verbatim() {
+        // The documented escape hatch: MIMIC_REDACT_BODY_FIELDS= restores the
+        // old behavior for anyone who wants it.
+        let verbatim = BodyRedaction::from_values(Some(String::new()), None);
+        assert!(verbatim.fields.is_empty());
+        assert_eq!(
+            verbatim.apply(r#"{"password":"hunter2"}"#.to_string(), None),
+            Some(r#"{"password":"hunter2"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn an_unset_variable_uses_the_default_list_rather_than_nothing() {
+        let default = BodyRedaction::from_values(None, None);
+        assert_eq!(default, BodyRedaction::default());
+        assert!(default.fields.contains("password"));
+    }
+
+    #[test]
+    fn a_configured_list_replaces_the_default_and_is_trimmed() {
+        let configured = BodyRedaction::from_values(Some(" PIN , cvv ,, ".to_string()), None);
+        let expected: HashSet<String> = ["pin", "cvv"].iter().map(|f| f.to_string()).collect();
+        assert_eq!(configured.fields, expected);
+        assert!(
+            !configured.fields.contains("password"),
+            "an explicit list is the whole list, not an addition to the default"
+        );
+    }
+
+    #[test]
+    fn disabling_the_body_log_stores_nothing() {
+        let off = BodyRedaction::from_values(None, Some("true".to_string()));
+        assert!(off.disabled);
+        assert_eq!(off.apply("anything at all".to_string(), None), None);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_request_and_response_are_both_redacted() {
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        let mut login = mock("POST", "/login", "login", &[]);
+        login.response = json!({"access_token": "very-secret", "user": "alice"});
+        login.consume_body = true;
+        mocks.insert("POST:/login".to_string(), vec![login]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("authorization", "Bearer super-secret".parse().unwrap());
+        handle_request(
+            Method::POST,
+            "/login".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::from(r#"{"username":"alice","password":"hunter2"}"#),
+        )
+        .await;
+
+        let log = state.request_log.read().await;
+        let record = &log[0];
+
+        let body: serde_json::Value = serde_json::from_str(record.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["password"], REDACTED);
+        assert_eq!(body["username"], "alice");
+
+        // A mock returning a token has the same problem the request did.
+        let response: serde_json::Value =
+            serde_json::from_str(record.response_body.as_ref().unwrap()).unwrap();
+        assert_eq!(response["access_token"], REDACTED);
+        assert_eq!(response["user"], "alice");
+
+        assert_eq!(record.headers["authorization"], REDACTED);
+    }
+
+    #[tokio::test]
+    async fn redaction_does_not_change_what_the_client_receives() {
+        // Redaction is a property of the log, not of the mock server: the
+        // client must still get the token the mock promised.
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        let mut login = mock("POST", "/login", "login", &[]);
+        login.response = json!({"access_token": "very-secret"});
+        mocks.insert("POST:/login".to_string(), vec![login]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let response = handle_request(
+            Method::POST,
+            "/login".parse().unwrap(),
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["access_token"], "very-secret");
+    }
+
+    #[tokio::test]
+    async fn a_matcher_still_sees_the_real_body() {
+        // Matching runs before recording and against the unredacted body, so
+        // a mock keyed on a password field keeps working.
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        let mut login = mock("POST", "/login", "matched", &[]);
+        login.consume_body = true;
+        login.body = Some(crate::types::BodyMatcher::Json(
+            crate::types::JsonBodyMatcher {
+                exact: None,
+                partial: Some(json!({"password": "hunter2"})),
+                strict: false,
+            },
+        ));
+        mocks.insert("POST:/login".to_string(), vec![login]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let response = handle_request(
+            Method::POST,
+            "/login".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::from(r#"{"password":"hunter2"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // …and the log still doesn't keep it.
+        let log = state.request_log.read().await;
+        assert!(!log[0].body.as_ref().unwrap().contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn a_custom_policy_is_honored_end_to_end() {
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        let mut pay = mock("POST", "/pay", "pay", &[]);
+        pay.consume_body = true;
+        mocks.insert("POST:/pay".to_string(), vec![pay]);
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)))
+            .with_redaction(policy(&["cvv"]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        handle_request(
+            Method::POST,
+            "/pay".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::from(r#"{"cvv":"123","password":"hunter2"}"#),
+        )
+        .await;
+
+        let log = state.request_log.read().await;
+        let body: serde_json::Value = serde_json::from_str(log[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["cvv"], REDACTED);
+        assert_eq!(
+            body["password"], "hunter2",
+            "a configured list replaces the default entirely"
+        );
+    }
+
+    // ── Admin API authentication (#88) ──────────────────────────────────
+
+    #[test]
+    fn the_token_guards_the_admin_endpoints_and_not_the_health_check() {
+        let routes = ReservedRoutes::default();
+
+        assert!(routes.is_admin_endpoint("GET", "/admin/requests"));
+        assert!(routes.is_admin_endpoint("DELETE", "/admin/requests"));
+        assert!(routes.is_admin_endpoint("GET", "/admin/dashboard"));
+
+        // Liveness probes call this and carry no credentials.
+        assert!(!routes.is_admin_endpoint("GET", "/health"));
+        // Not an endpoint Mimic answers — an ordinary mock request.
+        assert!(!routes.is_admin_endpoint("GET", "/admin/users"));
+        assert!(!routes.is_admin_endpoint("PUT", "/admin/requests"));
     }
 
     #[tokio::test]

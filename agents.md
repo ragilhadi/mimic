@@ -107,6 +107,15 @@ HTTP Request → Router Agent → Handler Agent → Matcher Agent
 - Every new output surface — response headers, match explanations — must run
   values through `is_sensitive_header` before they can reach the request log or
   the dashboard
+- Bodies are the other half of that surface: request *and* response bodies go
+  through `BodyRedaction` on the way into the log (`MIMIC_REDACT_BODY_FIELDS`,
+  defaulting to a non-empty list; `MIMIC_DISABLE_BODY_LOG` to store none).
+  Redaction happens before truncation — a body cut mid-object no longer parses
+  as JSON, and fields that can't be found can't be scrubbed — and never affects
+  what the client receives, what matching runs against, or what templating
+  interpolates
+- `MIMIC_ADMIN_TOKEN` puts `/admin/*` behind a bearer token; `/health` stays
+  open because liveness probes carry no credentials
 - Regular `cargo audit`
 
 ### Performance Targets
