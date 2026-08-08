@@ -17,7 +17,7 @@ use handler::{
     max_log_entries, reset_sequences, set_scenario, AppState,
 };
 use loader::{load_mocks, load_mocks_map};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
@@ -157,6 +157,9 @@ async fn run_server() {
     // The reloader watches the directory that was actually resolved, not a
     // second copy of the resolution rule that could disagree with it.
     let reload_dir = mocks_dir.path.clone();
+    // Per-mock state the reloader has to reconcile against the new mock set.
+    let reload_counters = state.sequence_counters.clone();
+    let reload_hits = state.mock_hits.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
@@ -176,21 +179,29 @@ async fn run_server() {
                         errors: 1,
                     }
                 });
-            let mut store = reload_mocks.write().await;
-            let old_len = store.len();
-            *store = apply_reload(&store, result);
-            let new_len = store.len();
-            if old_len != new_len {
-                info!(
-                    "🔄 Hot reload: mocks updated ({} -> {} endpoint(s))",
-                    old_len, new_len
-                );
-            } else {
-                debug!(
-                    "🔄 Hot reload: mocks reloaded ({} endpoint(s), no changes)",
-                    new_len
-                );
-            }
+            // The mock lock is released before the counter locks are taken:
+            // `list_sequences` reads counters and then mocks, so holding both
+            // in the opposite order here would be a deadlock waiting to happen.
+            let live = {
+                let mut store = reload_mocks.write().await;
+                let old_len = store.len();
+                *store = apply_reload(&store, result);
+                let new_len = store.len();
+                if old_len != new_len {
+                    info!(
+                        "🔄 Hot reload: mocks updated ({} -> {} endpoint(s))",
+                        old_len, new_len
+                    );
+                } else {
+                    debug!(
+                        "🔄 Hot reload: mocks reloaded ({} endpoint(s), no changes)",
+                        new_len
+                    );
+                }
+                live_identities(&store)
+            };
+
+            prune_stale_state(&reload_counters, &reload_hits, &live).await;
         }
     });
 
@@ -213,6 +224,56 @@ async fn run_server() {
     axum::serve(listener, app).await.unwrap_or_else(|e| {
         panic!("Server error: {}", e);
     });
+}
+
+/// Every mock identity a mock map currently registers.
+fn live_identities(
+    store: &HashMap<String, Vec<types::MockConfig>>,
+) -> HashSet<types::MockIdentity> {
+    store
+        .iter()
+        .flat_map(|(key, list)| {
+            list.iter()
+                .enumerate()
+                .map(move |(index, mock)| types::MockIdentity::of(mock, key, index))
+        })
+        .collect()
+}
+
+/// Drop per-mock state belonging to mocks the latest reload no longer loads.
+///
+/// A counter for a deleted mock used to be left behind indefinitely: harmless
+/// on its own, except that its key was a *position*, so the next mock to land
+/// in that slot inherited a half-consumed sequence and someone else's hit
+/// count. Identities are stable now, which stops the misattribution — but an
+/// orphan still has to go, or `/admin/sequences` accumulates rows for files
+/// that no longer exist and `/admin/mocks` reports totals nothing can explain.
+///
+/// A mock that merely stops parsing keeps its state: `apply_reload` carries
+/// its last-known-good route forward, so it's still registered and still live.
+async fn prune_stale_state(
+    counters: &types::SequenceCounters,
+    hits: &handler::MockHits,
+    live: &HashSet<types::MockIdentity>,
+) {
+    let dropped = {
+        let mut counters = counters.write().await;
+        let before = counters.len();
+        counters.retain(|identity, _| live.contains(identity));
+        before - counters.len()
+    };
+
+    {
+        let mut hits = hits.write().await;
+        hits.retain(|identity, _| live.contains(identity));
+    }
+
+    if dropped > 0 {
+        info!(
+            "🔄 Hot reload: dropped {} sequence counter(s) for mocks that are no longer loaded",
+            dropped
+        );
+    }
 }
 
 /// Explain a startup that registered no mocks at all.
@@ -685,6 +746,175 @@ mod tests {
 
         assert_eq!(next["GET:/broken"][0].response["source"], "last-good");
         assert_eq!(next["GET:/ok"][0].response["source"], "ok-updated");
+    }
+
+    // ------------------------------------------------------------------
+    // Per-mock state survives a reload that reorders the bucket (#86)
+    // ------------------------------------------------------------------
+
+    /// A mock for `POST /orders` whose three steps announce which file they
+    /// came from, so a step served by the wrong mock is visible in the body.
+    fn sequenced_orders_mock(who: &str) -> String {
+        let step = |n: u8| {
+            format!(
+                r#"{{"status":200,"response":{{"who":"{}","step":{}}}}}"#,
+                who, n
+            )
+        };
+        format!(
+            r#"{{"method":"POST","path":"/orders","status":200,"response":{{}},
+                 "sequence":[{},{},{}]}}"#,
+            step(1),
+            step(2),
+            step(3)
+        )
+    }
+
+    async fn post_orders(state: &AppState) -> serde_json::Value {
+        let response = handle_request(
+            axum::http::Method::POST,
+            "/orders".parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            axum::extract::State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Run one hot-reload cycle against a directory, exactly as the background
+    /// task does: reload, install, then reconcile per-mock state.
+    async fn reload_cycle(state: &AppState, store: &types::MockStore, dir: &std::path::Path) {
+        let result = load_mocks_map(dir.to_str().unwrap());
+        let live = {
+            let mut current = store.write().await;
+            *current = apply_reload(&current, result);
+            live_identities(&current)
+        };
+        prune_stale_state(&state.sequence_counters, &state.mock_hits, &live).await;
+    }
+
+    #[tokio::test]
+    async fn test_adding_a_sibling_mock_does_not_move_an_existing_sequence() {
+        // The issue's repro: a sequence half-consumed by one mock must not be
+        // adopted by a file that lands ahead of it in the bucket.
+        let dir = tempfile::tempdir().unwrap();
+        write_mock(dir.path(), "b_orders.json", &sequenced_orders_mock("b"));
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+
+        assert_eq!(post_orders(&state).await["step"], 1);
+        assert_eq!(post_orders(&state).await["step"], 2);
+
+        // A teammate adds a second scenario for the same endpoint. Its name
+        // sorts first, so it takes bucket position 0 — the position the
+        // half-consumed counter used to be keyed by.
+        write_mock(dir.path(), "a_orders.json", &sequenced_orders_mock("a"));
+        reload_cycle(&state, &store, dir.path()).await;
+
+        // The new mock wins the tie-break and serves. It must start at its own
+        // first step; keyed by position it would have inherited the other
+        // mock's two calls and served step 3 on its first-ever request.
+        let served = post_orders(&state).await;
+        assert_eq!(served["who"], "a");
+        assert_eq!(
+            served["step"], 1,
+            "a fresh mock must start its own sequence"
+        );
+
+        // And the original mock's position is untouched, not restarted.
+        let counters = state.sequence_counters.read().await;
+        let step_of = |file: &str| {
+            counters
+                .iter()
+                .find(|(identity, _)| {
+                    identity
+                        .source()
+                        .is_some_and(|source| source.ends_with(file))
+                })
+                .map(|(_, step)| *step)
+        };
+        assert_eq!(step_of("b_orders.json"), Some(2));
+        assert_eq!(step_of("a_orders.json"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_hit_counts_stay_with_their_mock_across_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mock(
+            dir.path(),
+            "b_orders.json",
+            r#"{"method":"POST","path":"/orders","status":200,"response":{"who":"b"}}"#,
+        );
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+        post_orders(&state).await;
+        post_orders(&state).await;
+
+        write_mock(
+            dir.path(),
+            "a_orders.json",
+            r#"{"method":"POST","path":"/orders","status":200,"response":{"who":"a"}}"#,
+        );
+        reload_cycle(&state, &store, dir.path()).await;
+
+        let hits = state.mock_hits.read().await;
+        let hits_for = |file: &str| {
+            hits.iter()
+                .find(|(identity, _)| identity.source().is_some_and(|s| s.ends_with(file)))
+                .map(|(_, count)| *count)
+        };
+        assert_eq!(hits_for("b_orders.json"), Some(2));
+        assert_eq!(
+            hits_for("a_orders.json"),
+            None,
+            "a mock that has served nothing must not inherit another's count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reload_drops_counters_for_a_deleted_mock() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mock(dir.path(), "orders.json", &sequenced_orders_mock("b"));
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+        post_orders(&state).await;
+        assert_eq!(state.sequence_counters.read().await.len(), 1);
+
+        std::fs::remove_file(dir.path().join("orders.json")).unwrap();
+        reload_cycle(&state, &store, dir.path()).await;
+
+        assert!(
+            state.sequence_counters.read().await.is_empty(),
+            "an orphaned counter must be dropped, not left for the next mock to adopt"
+        );
+        assert!(state.mock_hits.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_file_that_stops_parsing_keeps_its_counter() {
+        // `apply_reload` carries a broken file's last-known-good route
+        // forward, so the mock is still loaded and still serving — pruning
+        // must not treat "failed to parse this cycle" as "deleted".
+        let dir = tempfile::tempdir().unwrap();
+        write_mock(dir.path(), "orders.json", &sequenced_orders_mock("b"));
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+        assert_eq!(post_orders(&state).await["step"], 1);
+
+        write_mock(dir.path(), "orders.json", "{ mid-save");
+        reload_cycle(&state, &store, dir.path()).await;
+
+        assert_eq!(
+            post_orders(&state).await["step"],
+            2,
+            "the sequence should resume, not restart, while the file is being fixed"
+        );
     }
 
     #[test]

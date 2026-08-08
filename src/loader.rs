@@ -176,47 +176,60 @@ pub fn load_mocks(path: &str) -> MockStore {
 }
 
 /// Recursively collects and loads all JSON mock files from a directory tree.
+///
+/// Entries are **sorted by path before anything is loaded**. `fs::read_dir`
+/// guarantees no ordering — it differs between ext4 and NTFS, and can change
+/// on the same machine when unrelated files are added or removed — and two
+/// things downstream read the resulting order as if it meant something: which
+/// of several mocks sharing a `METHOD:path` wins a tie in `find_matching_mock`,
+/// and (before mocks were given a stable identity) which mock owned which
+/// counter. Sorting makes bucket order a pure function of the file names:
+/// depth-first, alphabetical by full path, with a subdirectory visited at the
+/// point its own name sorts in.
 fn collect_json_files(
     dir: &Path,
     mocks: &mut HashMap<String, Vec<MockConfig>>,
     errors: &mut usize,
 ) {
-    match fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let entry_path = entry.path();
-                if entry_path.is_dir() {
-                    collect_json_files(&entry_path, mocks, errors);
-                } else if entry_path.is_file()
-                    && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
-                {
-                    match load_single_mock(&entry_path) {
-                        Ok(mock) => {
-                            let key = create_mock_key(&mock.method, &mock.path);
-                            debug!("Loaded mock: {} -> {}", key, entry_path.display());
-                            let entry = mocks.entry(key).or_default();
-                            if !entry.is_empty() {
-                                warn!(
-                                    "Multiple mocks registered for {} {}: {} total (file: {})",
-                                    mock.method,
-                                    mock.path,
-                                    entry.len() + 1,
-                                    entry_path.display()
-                                );
-                            }
-                            entry.push(mock);
-                        }
-                        Err(e) => {
-                            warn!("Failed to load mock file {}: {}", entry_path.display(), e);
-                            *errors += 1;
-                        }
-                    }
-                }
-            }
-        }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
         Err(e) => {
             error!("Failed to read directory {}: {}", dir.display(), e);
             *errors += 1;
+            return;
+        }
+    };
+
+    let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+
+    for entry_path in paths {
+        if entry_path.is_dir() {
+            collect_json_files(&entry_path, mocks, errors);
+        } else if entry_path.is_file()
+            && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
+        {
+            match load_single_mock(&entry_path) {
+                Ok(mock) => {
+                    let key = create_mock_key(&mock.method, &mock.path);
+                    debug!("Loaded mock: {} -> {}", key, entry_path.display());
+                    let entry = mocks.entry(key).or_default();
+                    if !entry.is_empty() {
+                        warn!(
+                            "Multiple mocks registered for {} {}: {} total (file: {})",
+                            mock.method,
+                            mock.path,
+                            entry.len() + 1,
+                            entry_path.display()
+                        );
+                    }
+                    entry.push(mock);
+                }
+                Err(e) => {
+                    warn!("Failed to load mock file {}: {}", entry_path.display(), e);
+                    *errors += 1;
+                }
+            }
         }
     }
 }
@@ -696,6 +709,81 @@ mod tests {
             result.mocks["POST:/login"][0].source.as_deref(),
             Some(file.to_str().unwrap())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Deterministic load order (#86)
+    // ------------------------------------------------------------------
+
+    /// Write files in the given order and return the bucket for `GET:/dup`,
+    /// as the markers its mocks carry.
+    fn load_dup_bucket_written_in(order: &[&str]) -> Vec<String> {
+        let dir = TempDir::new().unwrap();
+        for name in order {
+            fs::write(
+                dir.path().join(format!("{}.json", name)),
+                format!(
+                    r#"{{"method":"GET","path":"/dup","status":200,"response":{{"from":"{}"}}}}"#,
+                    name
+                ),
+            )
+            .unwrap();
+        }
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        result.mocks["GET:/dup"]
+            .iter()
+            .map(|mock| mock.response["from"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_bucket_order_does_not_depend_on_the_order_files_were_created() {
+        // `fs::read_dir` guarantees no ordering, and `find_matching_mock`'s
+        // final tie-break is bucket position — so without sorting, which of
+        // two identical mocks wins is decided by the filesystem, and can flip
+        // on a fresh clone or a rebuilt image with no diff to point at.
+        let forwards = load_dup_bucket_written_in(&["a", "m", "z"]);
+        let backwards = load_dup_bucket_written_in(&["z", "m", "a"]);
+        let shuffled = load_dup_bucket_written_in(&["m", "z", "a"]);
+
+        assert_eq!(forwards, vec!["a", "m", "z"]);
+        assert_eq!(forwards, backwards);
+        assert_eq!(forwards, shuffled);
+    }
+
+    #[test]
+    fn test_nested_directories_load_in_a_fixed_alphabetical_order() {
+        // The rule covers the interleaving of a directory's own files with its
+        // subdirectories', not just the files at one level.
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("advanced");
+        fs::create_dir(&sub).unwrap();
+
+        for (path, marker) in [
+            (dir.path().join("b_top.json"), "b_top"),
+            (dir.path().join("z_top.json"), "z_top"),
+            (sub.join("nested.json"), "advanced/nested"),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"method":"GET","path":"/dup","status":200,"response":{{"from":"{}"}}}}"#,
+                    marker
+                ),
+            )
+            .unwrap();
+        }
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        let order: Vec<&str> = result.mocks["GET:/dup"]
+            .iter()
+            .map(|mock| mock.response["from"].as_str().unwrap())
+            .collect();
+
+        // "advanced" sorts before "b_top.json" and "z_top.json", and is
+        // recursed into at the point its own name sorts in.
+        assert_eq!(order, vec!["advanced/nested", "b_top", "z_top"]);
     }
 
     // ------------------------------------------------------------------

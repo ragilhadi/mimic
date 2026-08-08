@@ -4,8 +4,8 @@ use crate::matcher::{
 };
 use crate::template::{render_response, TemplateContext};
 use crate::types::{
-    is_sensitive_header, parse_active_tags, ActiveTags, MockConfig, MockStore, RequestLog,
-    RequestRecord, SequenceCounters, SequenceStep,
+    is_sensitive_header, parse_active_tags, ActiveTags, MockConfig, MockIdentity, MockStore,
+    RequestLog, RequestRecord, SequenceCounters, SequenceStep,
 };
 use axum::{
     body::Body,
@@ -23,9 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Per-mock hit counts, keyed like the sequence counters ("METHOD:/path#idx")
-/// so one mock among several registered for a path can be told from the rest.
-pub type MockHits = Arc<tokio::sync::RwLock<HashMap<String, u64>>>;
+/// Per-mock hit counts, keyed like the sequence counters — by the mock's
+/// stable [`MockIdentity`] — so one mock among several registered for a path
+/// can be told from the rest, and keeps its count across a hot reload.
+pub type MockHits = Arc<tokio::sync::RwLock<HashMap<MockIdentity, u64>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -310,15 +311,23 @@ pub async fn handle_request(
             // `/users/:id`), if any, become available to templating below.
             context.path_params = path_params;
 
+            // The identity this mock's cross-request state hangs off: its
+            // declared key plus the file it came from, not its position in a
+            // vector that hot reload rebuilds every two seconds. Computed once
+            // and used for both the sequence counter and the hit count, which
+            // must agree on which mock they're talking about.
+            //
+            // Keying by the *declared* path (`mock_key`) rather than the
+            // concrete request path is what makes a pattern mock like
+            // `/users/:id` advance a single shared sequence regardless of which
+            // id was requested.
+            let identity = MockIdentity::of(&mock, &mock_key, index);
+
             // Resolve the response: sequence step if configured, top-level otherwise.
             // An empty sequence array falls back to the top-level status/response.
-            // The counter is keyed by the mock's declared path (`mock_key`), not the
-            // concrete request path, so a pattern mock like `/users/:id` advances a
-            // single shared sequence regardless of which id was requested.
             let (status_u16, response, delay_ms) = match mock.sequence.as_deref() {
                 Some(steps) if !steps.is_empty() => {
-                    let counter_key = format!("{}#{}", mock_key, index);
-                    advance_sequence(&state.sequence_counters, &counter_key, steps).await
+                    advance_sequence(&state.sequence_counters, &identity, steps).await
                 }
                 _ => (mock.status, mock.response.clone(), None),
             };
@@ -347,9 +356,8 @@ pub async fn handle_request(
             // same way as its sequence counter so several mocks sharing a path
             // stay distinguishable.
             {
-                let hit_key = format!("{}#{}", mock_key, index);
                 let mut hits = state.mock_hits.write().await;
-                *hits.entry(hit_key).or_insert(0) += 1;
+                *hits.entry(identity).or_insert(0) += 1;
             }
 
             // Serialize the response once: the same bytes are both sent to the
@@ -735,7 +743,7 @@ pub async fn list_mocks(State(state): State<AppState>) -> Json<serde_json::Value
     for key in keys {
         for (index, mock) in mocks[key].iter().enumerate() {
             let hit_count = hits
-                .get(&format!("{}#{}", key, index))
+                .get(&MockIdentity::of(mock, key, index))
                 .copied()
                 .unwrap_or(0);
             entries.push(describe_mock_entry(
@@ -763,33 +771,37 @@ pub async fn list_sequences(State(state): State<AppState>) -> Json<serde_json::V
     let counters = state.sequence_counters.read().await;
     let mocks = state.mocks.read().await;
 
-    let mut keys: Vec<&String> = counters.keys().collect();
-    keys.sort();
+    let mut identities: Vec<&MockIdentity> = counters.keys().collect();
+    identities.sort();
 
-    let sequences: Vec<serde_json::Value> = keys
+    let sequences: Vec<serde_json::Value> = identities
         .into_iter()
-        .map(|counter_key| {
-            // Counter keys look like "METHOD:/path#idx"
-            let (mock_key, index) = counter_key
-                .rsplit_once('#')
-                .map_or((counter_key.as_str(), None), |(k, i)| {
-                    (k, i.parse::<usize>().ok())
-                });
-            let (method, path) = mock_key
-                .split_once(':')
-                .map_or(("", mock_key), |(m, p)| (m, p));
-
-            let mock = index
-                .and_then(|i| mocks.get(mock_key).and_then(|list| list.get(i)))
+        .map(|identity| {
+            // The mock the counter belongs to, found by identity rather than
+            // by position — a counter outlives a reload, a position doesn't.
+            // A counter whose mock is gone still renders, with a null `total`.
+            let mock = mocks
+                .get(&identity.key)
+                .and_then(|list| {
+                    list.iter().enumerate().find(|(index, mock)| {
+                        MockIdentity::of(mock, &identity.key, *index) == *identity
+                    })
+                })
+                .map(|(_, mock)| mock)
                 .filter(|mock| mock.sequence.is_some());
 
             json!({
-                "key": counter_key,
-                "method": method,
-                "path": path,
-                "step": counters[counter_key],
+                "key": identity.label(),
+                "method": identity.method(),
+                "path": identity.path(),
+                "step": counters[identity],
                 "total": mock.and_then(|m| m.sequence.as_ref().map(|s| s.len())),
-                "source": mock.and_then(|m| m.source.clone()),
+                // The mock's own `source` where it's still loaded, falling back
+                // to the file the identity was minted from so a counter left
+                // over from a deleted mock still names the file it came from.
+                "source": mock
+                    .and_then(|m| m.source.clone())
+                    .or_else(|| identity.source().map(str::to_string)),
             })
         })
         .collect();
@@ -964,11 +976,11 @@ fn assemble_response(status: StatusCode, header_map: HeaderMap, body: String) ->
 /// The write lock is held only for the map lookup + clone, never across an await.
 async fn advance_sequence(
     counters: &SequenceCounters,
-    key: &str,
+    identity: &MockIdentity,
     steps: &[SequenceStep],
 ) -> (u16, serde_json::Value, Option<u64>) {
     let mut map = counters.write().await;
-    let count = map.entry(key.to_string()).or_insert(0);
+    let count = map.entry(identity.clone()).or_insert(0);
     // Clamp so the last step keeps repeating once the sequence is exhausted
     let idx = (*count).min(steps.len() - 1);
     let step = &steps[idx];
@@ -991,14 +1003,7 @@ pub async fn reset_sequences(
     let removed = match filter.path {
         Some(ref p) => {
             let before = counters.len();
-            // Counter keys look like "METHOD:/path#idx" — compare the path part only
-            counters.retain(|key, _| {
-                let after_method = key.split_once(':').map_or("", |(_, rest)| rest);
-                let path_part = after_method
-                    .rsplit_once('#')
-                    .map_or(after_method, |(path_part, _)| path_part);
-                path_part != p
-            });
+            counters.retain(|identity, _| identity.path() != p);
             before - counters.len()
         }
         None => {
@@ -3616,7 +3621,9 @@ mod tests {
         let body = list_sequences(State(state)).await.0;
         assert_eq!(body["count"], 1);
         let seq = &body["sequences"][0];
-        assert_eq!(seq["key"], "POST:/submit#0");
+        // The counter is named after the file it belongs to, not its position
+        // in a bucket hot reload rebuilds every two seconds.
+        assert_eq!(seq["key"], "POST:/submit @ mocks/post_submit.json");
         assert_eq!(seq["method"], "POST");
         assert_eq!(seq["path"], "/submit");
         assert_eq!(seq["step"], 2);
@@ -3646,7 +3653,13 @@ mod tests {
         let state = dash_state(vec![]);
         {
             let mut counters = state.sequence_counters.write().await;
-            counters.insert("POST:/gone#0".to_string(), 4);
+            counters.insert(
+                MockIdentity {
+                    key: "POST:/gone".to_string(),
+                    origin: crate::types::MockOrigin::Source("mocks/gone.json".to_string()),
+                },
+                4,
+            );
         }
 
         let body = list_sequences(State(state)).await.0;
@@ -4447,10 +4460,15 @@ mod scenario_tests {
         request(&state, Method::POST, "/checkout").await;
 
         let hits = state.mock_hits.read().await;
-        // Index 1 is the error-scenario mock's real position in its bucket;
-        // filtering must not renumber the mocks around it.
-        assert_eq!(hits.get("POST:/checkout#1").copied(), Some(1));
-        assert_eq!(hits.get("POST:/checkout#0").copied(), None);
+        // These mocks are built in-process with no `source`, so their identity
+        // falls back to bucket position. Index 1 is the error-scenario mock's
+        // real position; filtering must not renumber the mocks around it.
+        let at = |index: usize| MockIdentity {
+            key: "POST:/checkout".to_string(),
+            origin: crate::types::MockOrigin::Position(index),
+        };
+        assert_eq!(hits.get(&at(1)).copied(), Some(1));
+        assert_eq!(hits.get(&at(0)).copied(), None);
     }
 
     #[tokio::test]

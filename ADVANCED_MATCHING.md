@@ -353,11 +353,16 @@ order:
 1. **More literal path segments.** `/users/:id` (one literal segment) beats
    `/{resource}/:id` (none) for `GET /users/42`.
 2. **Lower registered `METHOD:path` key**, compared lexicographically.
-3. **Earlier position** among mocks sharing that key.
+3. **Earlier position** among mocks sharing that key — which, since mock files
+   load depth-first in alphabetical order by full path, means the mock whose
+   file name sorts first. `mocks/a_dup.json` beats `mocks/z_dup.json`, and
+   `mocks/advanced/x.json` beats `mocks/b.json` because `advanced` sorts before
+   `b`.
 
 The result is a pure function of the loaded mock set: the same request always
 resolves to the same mock across repeated calls, server restarts, and hot
-reloads.
+reloads — and across filesystems, which is why load order is sorted rather than
+left to `readdir`.
 
 ---
 

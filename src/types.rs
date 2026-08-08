@@ -333,8 +333,89 @@ where
     (!parsed.is_empty()).then_some(parsed)
 }
 
-/// Per-mock sequence call counters, keyed by "METHOD:/path#<index>"
-pub type SequenceCounters = Arc<RwLock<HashMap<String, usize>>>;
+// ============================================================================
+// Stable Mock Identity
+// ============================================================================
+
+/// What tells one mock apart from the others registered under the same
+/// `METHOD:/path`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MockOrigin {
+    /// The file the mock was loaded from. Stable for as long as the file is,
+    /// which is exactly the lifetime the state keyed by it should have.
+    Source(String),
+    /// Position in the bucket, for a mock built in-process — tests, generated
+    /// fixtures — with no file behind it. Carries the old semantics for the
+    /// only case that can't do better.
+    Position(usize),
+}
+
+/// A stable identity for one loaded mock.
+///
+/// State that has to outlive a hot reload — sequence positions, hit counts —
+/// is keyed by this rather than by a mock's position in its bucket. The mock
+/// map is rebuilt from scratch every reload cycle, so a position is a
+/// statement about *this* cycle's vector: add a file that sorts earlier under
+/// the same `METHOD:/path` and position 0 silently starts naming a different
+/// mock, handing it a half-consumed sequence and another mock's hit count.
+///
+/// The file path is the stable half. A mock keeps its identity when a sibling
+/// appears or disappears, and loses it — correctly — when its own file is
+/// renamed or deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MockIdentity {
+    /// The registration key, `METHOD:/declared/path`. For a pattern mock this
+    /// is the declared template (`GET:/users/:id`), not the concrete request
+    /// path, so one sequence is shared across every id — as it always was.
+    pub key: String,
+    pub origin: MockOrigin,
+}
+
+impl MockIdentity {
+    /// The identity of `mock`, registered under `key` at position `index`.
+    pub fn of(mock: &MockConfig, key: &str, index: usize) -> Self {
+        Self {
+            key: key.to_string(),
+            origin: match mock.source.as_deref() {
+                Some(source) => MockOrigin::Source(source.to_string()),
+                None => MockOrigin::Position(index),
+            },
+        }
+    }
+
+    /// The method half of the registration key.
+    pub fn method(&self) -> &str {
+        self.key.split_once(':').map_or("", |(method, _)| method)
+    }
+
+    /// The declared path half of the registration key.
+    pub fn path(&self) -> &str {
+        self.key
+            .split_once(':')
+            .map_or(self.key.as_str(), |(_, path)| path)
+    }
+
+    /// The file this mock came from, if it came from one.
+    pub fn source(&self) -> Option<&str> {
+        match &self.origin {
+            MockOrigin::Source(source) => Some(source),
+            MockOrigin::Position(_) => None,
+        }
+    }
+
+    /// A human-readable rendering for the admin API, e.g.
+    /// `POST:/orders @ mocks/orders_flow.json`.
+    pub fn label(&self) -> String {
+        match &self.origin {
+            MockOrigin::Source(source) => format!("{} @ {}", self.key, source),
+            MockOrigin::Position(index) => format!("{}#{}", self.key, index),
+        }
+    }
+}
+
+/// Per-mock sequence call counters, keyed by a mock's stable identity so a
+/// hot reload can't hand one mock's position to another.
+pub type SequenceCounters = Arc<RwLock<HashMap<MockIdentity, usize>>>;
 
 // ============================================================================
 // Request History Types

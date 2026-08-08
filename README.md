@@ -208,6 +208,27 @@ applied and how many were carried forward.
 Deletions still take effect normally: on a clean cycle (no parse errors) the
 mock set is replaced outright, so removing a file removes its route.
 
+#### What happens to sequence state across a reload
+
+Sequence positions and hit counts belong to **the mock's file**, not to its
+position in the list of mocks sharing a `METHOD:path`. Across a reload:
+
+- **Editing a file** — including editing its `sequence` — leaves that mock's
+  position and hit count where they were. Reset explicitly with
+  `POST /admin/sequences/reset` when you want a clean run.
+- **Adding a mock** under a `METHOD:path` that already has one does not disturb
+  the existing mock's counters, whichever order the two files sort in.
+- **Deleting a file** drops its counters. They are not carried over to whatever
+  is loaded next.
+- **A file that stops parsing** keeps both its route and its counters, since
+  its last-known-good response is still being served.
+
+Mock files load in a fixed order — depth-first, alphabetical by full path — so
+which of several mocks registered for the same `METHOD:path` wins a tie is a
+function of their file names and nothing else. It does not vary between
+filesystems, between a fresh clone and a rebuilt image, or after an unrelated
+file is added to the directory.
+
 ---
 
 ## 📁 Mock Examples
