@@ -3,8 +3,11 @@ name: Unit Tests
 on:
   push:
     branches: [ main ]
+  # Every pull request, not just those targeting `main`. A stacked PR is based
+  # on the branch below it in the stack, so a `branches: [main]` filter would
+  # leave every PR in a stack except the bottom one untested until it is
+  # merged and auto-retargeted.
   pull_request:
-    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
