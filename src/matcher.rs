@@ -323,7 +323,7 @@ impl RequestContext {
 /// lines at four call sites: `+` is replaced **first**, percent escapes
 /// **second**. The reverse order would decode `%2B` — the encoding of a
 /// literal plus — into `+` and then corrupt it into a space.
-fn decode_component(raw: &str) -> String {
+pub(crate) fn decode_component(raw: &str) -> String {
     // `replace` allocates unconditionally, so the common plus-free component
     // keeps borrowing the slice it came in on.
     let plus_decoded: Cow<'_, str> = if raw.contains('+') {
