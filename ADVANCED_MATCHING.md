@@ -99,6 +99,32 @@ Match requests based on request body content:
 
 ## Detailed Configuration
 
+### Matcher values are written decoded
+
+Query parameters and `application/x-www-form-urlencoded` bodies are decoded
+before matching, so **matcher values are written the way a human reads them,
+never the way they travel on the wire**:
+
+```json
+{ "query_params": { "params": { "q": "hello world" } } }
+```
+
+That mock matches `?q=hello+world` and `?q=hello%20world` alike — `+` is a
+space in form encoding, which is how browsers, `URLSearchParams`,
+`curl --data-urlencode`, and axios all send one. The same goes for form
+bodies: `"password": "secret pass"` matches `password=secret+pass` and
+`password=secret%20pass`.
+
+A **literal** plus is written as a plus (`"formula": "1+1"`); a client sends it
+percent-encoded as `%2B`. Writing the encoded form into a matcher —
+`"secret+pass"` — matches nothing, because the request is decoded before the
+comparison.
+
+The same decoded values are what `{{query.*}}` and `{{body.*}}` interpolate
+into a response, and what the request log records.
+
+---
+
 ### Query Parameters
 
 #### Structure
