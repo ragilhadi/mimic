@@ -23,6 +23,7 @@
 - **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
 - **OpenAPI Import** - Generate a whole mocks directory from an OpenAPI 3.x spec with `mimic import-openapi ./spec.yaml`
 - **Scenario Tags** - Keep happy-path and error mocks side by side and switch between them with `MIMIC_ACTIVE_TAGS` or `POST /admin/scenario`
+- **Built-in CORS** - `MIMIC_CORS=true` answers `OPTIONS` preflights automatically and adds the allow-origin header to every mock — no per-endpoint CORS files
 - **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
 
 ---
@@ -150,6 +151,15 @@ MIMIC_REDACT_BODY_FIELDS=password,token,secret,api_key
 
 # Store no request/response bodies in the log at all (default: false)
 MIMIC_DISABLE_BODY_LOG=false
+
+# Built-in CORS (default: off — no response gains a header, OPTIONS still 404s).
+# See "Built-in CORS" below.
+MIMIC_CORS=false
+MIMIC_CORS_ORIGINS=*
+MIMIC_CORS_METHODS=GET,POST,PUT,PATCH,DELETE,OPTIONS
+MIMIC_CORS_HEADERS=*
+MIMIC_CORS_CREDENTIALS=false
+MIMIC_CORS_MAX_AGE=600
 ```
 
 **Log Levels**:
@@ -809,6 +819,11 @@ Set arbitrary response headers per mock with `response_headers` — for CORS, re
 }
 ```
 
+> **Or just set `MIMIC_CORS=true`** and skip this entirely — see
+> [Built-in CORS](#-built-in-cors) below. Per-mock headers are still the way to
+> mock a *specific* CORS response (including a broken one); the env var is the
+> way to stop repeating them on every endpoint.
+
 ### Non-JSON response (XML)
 
 ```json
@@ -846,6 +861,89 @@ Set arbitrary response headers per mock with `response_headers` — for CORS, re
 - When a **non-JSON** content type is set and `response` is a JSON string, the raw string is sent as the body — so XML/CSV/plain-text responses aren't JSON-quoted.
 - Invalid header names or values are skipped with a warning; the response is still served.
 - Headers apply to every response of the mock, including all [sequence](#-stateful-response-sequences) steps.
+
+---
+
+## 🌐 Built-in CORS
+
+A browser calling a Mimic-backed API from `http://localhost:3000` normally fails
+twice: it sends `OPTIONS /users` first (which no mock answers), and every real
+mock has to repeat `Access-Control-Allow-Origin` in its `response_headers`. For
+an API with N endpoints that's up to 2N files maintained by hand.
+
+One variable replaces all of them:
+
+```bash
+MIMIC_CORS=true
+```
+
+That's it — preflights are answered automatically and every mock response
+carries the allow-origin header.
+
+### Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MIMIC_CORS` | `false` | Master switch. Everything below is ignored while it's off. |
+| `MIMIC_CORS_ORIGINS` | `*` | `*`, or a comma-separated allowlist like `http://localhost:3000,http://localhost:5173`. |
+| `MIMIC_CORS_METHODS` | `GET,POST,PUT,PATCH,DELETE,OPTIONS` | Advertised as `Access-Control-Allow-Methods` on a preflight. |
+| `MIMIC_CORS_HEADERS` | `*` | `*` reflects the request's `Access-Control-Request-Headers`; a list is sent verbatim. |
+| `MIMIC_CORS_CREDENTIALS` | `false` | Sends `Access-Control-Allow-Credentials: true`. |
+| `MIMIC_CORS_MAX_AGE` | `600` | `Access-Control-Max-Age`, in seconds. |
+
+```bash
+docker run -d -p 8080:8080 \
+  -e MIMIC_CORS=true \
+  -e MIMIC_CORS_ORIGINS=http://localhost:3000,http://localhost:5173 \
+  -v ./mocks:/app/mocks:ro \
+  ragilhadi/mimic:latest
+```
+
+### What it does
+
+```bash
+# No OPTIONS mock anywhere — Mimic answers the preflight itself
+curl -i -X OPTIONS http://localhost:8080/users \
+  -H 'Origin: http://localhost:3000' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type'
+
+HTTP/1.1 204 No Content
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: content-type
+access-control-max-age: 600
+```
+
+### Semantics
+
+- **Off by default.** With `MIMIC_CORS` unset, responses are byte-identical to
+  what they were before this existed — no new headers, and `OPTIONS` still 404s.
+- **A mock's own header always wins.** If a mock sets `Access-Control-Allow-Origin`
+  in its `response_headers`, the global config leaves it alone — so mocking a CORS
+  *failure* stays possible.
+- **Preflights are gap-filled, not hijacked.** An `OPTIONS` request that no mock
+  matches, but whose path has a mock registered for the method in
+  `Access-Control-Request-Method`, is answered `204`. An explicit `OPTIONS` mock
+  matches first and wins. A preflight for a path with nothing behind it still
+  `404`s.
+- **Only real endpoints, in the current scenario.** A mock hidden by the active
+  [scenario](#-tagged-mock-groups-scenarios) has no endpoint to preflight, and its
+  preflight `404`s too.
+- **A bare `OPTIONS` isn't a preflight.** Without `Access-Control-Request-Method`
+  — curl, a health probe — the request behaves exactly as it always has.
+- **Preflights are logged.** They appear in `/admin/requests` and the dashboard
+  with `matched_mock: null` and the explanation *"answered as a CORS preflight"*,
+  so nothing looks dropped.
+- **The allowlist is honored.** A request from an origin outside
+  `MIMIC_CORS_ORIGINS` gets *no* `Access-Control-Allow-Origin` header rather than
+  a wrong one, which is what makes the browser's own error message correct.
+  Responses that depend on the origin also carry `Vary: Origin`.
+- **`*` with credentials.** `MIMIC_CORS_ORIGINS=*` plus
+  `MIMIC_CORS_CREDENTIALS=true` is invalid per the CORS spec; Mimic reflects the
+  request origin instead and warns once at startup.
+- Matching is untouched: CORS headers are added to the response, never to the
+  request the matcher sees.
 
 ---
 
@@ -1441,10 +1539,13 @@ reach.
 Mock backend APIs while building your frontend:
 
 ```bash
-# Start Mimic with your API mocks
-docker run -d -p 8080:8080 -v ./mocks:/app/mocks:ro ragilhadi/mimic:latest
+# Start Mimic with your API mocks, with CORS on for your dev server
+docker run -d -p 8080:8080 \
+  -e MIMIC_CORS=true \
+  -e MIMIC_CORS_ORIGINS=http://localhost:3000 \
+  -v ./mocks:/app/mocks:ro ragilhadi/mimic:latest
 
-# Point your frontend to http://localhost:8080
+# Point your frontend to http://localhost:8080 — preflights are handled for you
 ```
 
 ### 2. **API Prototyping**
@@ -2017,6 +2118,7 @@ Built with:
 - [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`, `{{path.x}}`)
 - [x] Path parameter matching (`:id`, `{id}` syntax)
 - [x] Faker-style random data generators (`{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int}}`, …)
+- [x] Built-in CORS with automatic `OPTIONS` preflight handling (`MIMIC_CORS=true`)
 
 ---
 
