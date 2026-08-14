@@ -1,11 +1,12 @@
+use crate::cors::{self, CorsConfig};
 use crate::matcher::{
     explain_match, explain_no_match, find_matching_mock, is_pattern_path, parse_body,
-    parse_headers, parse_query_string, requires_body, MatchResult, RequestContext,
+    parse_headers, parse_query_string, requires_body, route_exists, MatchResult, RequestContext,
 };
 use crate::template::{render_response, TemplateContext};
 use crate::types::{
-    is_sensitive_header, parse_active_tags, ActiveTags, MockConfig, MockIdentity, MockStore,
-    RequestLog, RequestRecord, SequenceCounters, SequenceStep,
+    is_sensitive_header, is_truthy, parse_active_tags, ActiveTags, MockConfig, MockIdentity,
+    MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
 };
 use axum::{
     body::Body,
@@ -476,6 +477,13 @@ pub struct AppState {
     /// Bearer token the admin API requires, or `None` to leave it open — the
     /// default, and what every Mimic before this did.
     pub admin_token: Option<Arc<String>>,
+    /// The CORS settings, or `None` when `MIMIC_CORS` is off — which is the
+    /// default, and the state in which nothing in [`crate::cors`] runs.
+    ///
+    /// Held on the state rather than read from [`cors::configured`] at each use
+    /// so a test can exercise a configuration without writing to the process
+    /// environment the rest of the suite shares.
+    pub cors: Option<Arc<CorsConfig>>,
 }
 
 impl AppState {
@@ -501,6 +509,7 @@ impl AppState {
             reserved: Arc::new(ReservedRoutes::default()),
             redaction: Arc::new(BodyRedaction::default()),
             admin_token: None,
+            cors: cors::configured().cloned().map(Arc::new),
         }
     }
 
@@ -523,6 +532,14 @@ impl AppState {
     /// Require a bearer token on the admin API. `None` leaves it open.
     pub fn with_admin_token(mut self, token: Option<String>) -> Self {
         self.admin_token = token.map(Arc::new);
+        self
+    }
+
+    /// This state with an explicit CORS configuration in place of whatever the
+    /// environment said.
+    #[cfg(test)]
+    pub fn with_cors(mut self, cors: CorsConfig) -> Self {
+        self.cors = Some(Arc::new(cors));
         self
     }
 }
@@ -823,8 +840,12 @@ pub async fn handle_request(
             // Serialize the response once: the same bytes are both sent to the
             // client and recorded, so the drawer can't show something the
             // client didn't get.
-            let (header_map, body) =
-                build_response_parts(&response, mock.response_headers.as_ref());
+            let (header_map, body) = build_response_parts(
+                &response,
+                mock.response_headers.as_ref(),
+                state.cors.as_deref(),
+                cors::request_origin(&context),
+            );
 
             // Record the request with the status and response actually served
             let path_params = context.path_params.clone();
@@ -858,6 +879,15 @@ pub async fn handle_request(
             assemble_response(status, header_map, body)
         }
         None => {
+            // Gap-fill a CORS preflight before writing this off as a miss: the
+            // browser sends `OPTIONS` on its own initiative, and nobody writes
+            // a mock for a request they didn't make. An explicit `OPTIONS` mock
+            // still wins, because it would have matched above and never reached
+            // here.
+            if let Some(response) = answer_preflight(&state, &context, active_tags.as_ref()).await {
+                return response;
+            }
+
             info!("No mock found for: {} {}", method_str, path);
 
             // Diagnose the miss. Only reached on the 404 path — it walks the
@@ -900,6 +930,67 @@ pub async fn handle_request(
             (StatusCode::NOT_FOUND, Json(error_body)).into_response()
         }
     }
+}
+
+/// Answer `context` as a CORS preflight, or `None` to let it fall through to
+/// the ordinary 404.
+///
+/// Only reached once no mock has matched, so this fills a gap rather than
+/// hijacking anything: a hand-written `OPTIONS` mock — the way a test
+/// reproduces a *broken* preflight — matches first and never gets here.
+///
+/// A preflight is answered only when the path has a real endpoint behind it for
+/// the method the browser is asking about. [`route_exists`] rather than
+/// [`find_matching_mock`] decides that, because a preflight carries none of the
+/// body or headers the eventual request will, and would be rejected by the very
+/// matchers that make the endpoint worth calling.
+async fn answer_preflight(
+    state: &AppState,
+    context: &RequestContext,
+    active_tags: Option<&HashSet<String>>,
+) -> Option<Response> {
+    let config = state.cors.as_deref()?;
+    let requested_method = cors::preflight_method(context)?.to_string();
+
+    let has_route = {
+        let mocks = state.mocks.read().await;
+        route_exists(&requested_method, &context.path, &mocks, active_tags)
+    };
+    if !has_route {
+        // A preflight for a path nobody mocked is still a miss, and the
+        // dashboard should say so rather than answering 204 for an endpoint
+        // that will 404 a moment later.
+        return None;
+    }
+
+    info!(
+        "CORS preflight answered: OPTIONS {} for {}",
+        context.path, requested_method
+    );
+
+    let header_map = cors::preflight_headers(config, context);
+    // Cloned so the caller keeps its context for the 404 path; preflights are
+    // one per endpoint per cache window, not a hot path.
+    record_request(
+        state,
+        context.clone(),
+        RequestOutcome {
+            matched_mock: None,
+            response_status: StatusCode::NO_CONTENT.as_u16(),
+            response_body: None,
+            response_headers: recorded_response_headers(&header_map),
+            match_score: None,
+            path_params: HashMap::new(),
+            match_explanation: Some(cors::PREFLIGHT_EXPLANATION.to_string()),
+        },
+    )
+    .await;
+
+    Some(assemble_response(
+        StatusCode::NO_CONTENT,
+        header_map,
+        String::new(),
+    ))
 }
 
 /// The response headers to store on a log entry, with sensitive values
@@ -1058,16 +1149,6 @@ pub struct RequestFilter {
     /// Case-insensitive free-text search over the body, headers, and query
     /// parameters of each recorded request.
     pub search: Option<String>,
-}
-
-/// True if `value` reads as an affirmative in a query string. An absent or
-/// empty value is false, so `?unmatched_only=` behaves like "off" rather than
-/// failing the whole request.
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 /// True if `status` satisfies a `status` filter of either an exact code
@@ -1418,9 +1499,15 @@ pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 /// Returns the parts rather than a finished [`Response`] so the handler can
 /// record exactly what it is about to send, instead of serializing a second
 /// copy for the log and trusting the two to agree.
+///
+/// When `cors` is configured, its headers are added *after* the mock's own, and
+/// only for names the mock didn't set — so a mock that returns a deliberately
+/// wrong `Access-Control-Allow-Origin` still returns it.
 fn build_response_parts(
     response: &serde_json::Value,
     custom_headers: Option<&HashMap<String, String>>,
+    cors: Option<&CorsConfig>,
+    origin: Option<&str>,
 ) -> (HeaderMap, String) {
     let mut header_map = HeaderMap::new();
     if let Some(custom) = custom_headers {
@@ -1434,6 +1521,9 @@ fn build_response_parts(
                 _ => warn!("Skipping invalid response header: {}", name),
             }
         }
+    }
+    if let Some(config) = cors {
+        cors::apply_headers(config, origin, &mut header_map);
     }
     if !header_map.contains_key(CONTENT_TYPE) {
         header_map.insert(
@@ -5421,5 +5511,373 @@ mod scenario_tests {
 
         let Json(body) = list_mocks(State(state)).await;
         assert_eq!(body["mocks"][0]["reachable"], true);
+    }
+}
+
+// ============================================================================
+// Built-in CORS (#89)
+// ============================================================================
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use crate::types::{BodyMatcher, JsonBodyMatcher, MockConfig};
+    use axum::http::Method;
+
+    fn mock(method: &str, path: &str) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            response: json!({"ok": true}),
+            consume_body: false,
+            query_params: None,
+            headers: None,
+            body: None,
+            delay_ms: None,
+            response_headers: None,
+            source: None,
+            sequence: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn state_with(mocks: Vec<MockConfig>) -> AppState {
+        let mut map: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for m in mocks {
+            let key = crate::types::create_mock_key(&m.method, &m.path);
+            map.entry(key).or_default().push(m);
+        }
+        AppState::new(Arc::new(tokio::sync::RwLock::new(map)))
+    }
+
+    /// A configuration built from the given `MIMIC_CORS_*` values, without
+    /// touching the process environment the rest of the suite shares.
+    fn config(pairs: &[(&str, &str)]) -> CorsConfig {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        CorsConfig::from_env(|key| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        })
+        .expect("these settings should enable CORS")
+    }
+
+    /// The default configuration: `MIMIC_CORS=true` and nothing else.
+    fn enabled() -> CorsConfig {
+        config(&[("MIMIC_CORS", "true")])
+    }
+
+    async fn send(
+        state: &AppState,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut header_map = HeaderMap::new();
+        for (name, value) in headers {
+            header_map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        handle_request(
+            method,
+            path.parse().unwrap(),
+            header_map,
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await
+    }
+
+    fn header(response: &Response, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    const ORIGIN: (&str, &str) = ("origin", "http://localhost:3000");
+    const PREFLIGHT_POST: (&str, &str) = ("access-control-request-method", "POST");
+
+    // ── Off by default ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cors_off_leaves_responses_exactly_as_they_were() {
+        let state = state_with(vec![mock("GET", "/users")]);
+
+        let response = send(&state, Method::GET, "/users", &[ORIGIN]).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, "access-control-allow-origin"), None);
+        assert_eq!(header(&response, "vary"), None);
+    }
+
+    #[tokio::test]
+    async fn cors_off_still_404s_a_preflight() {
+        let state = state_with(vec![mock("POST", "/users")]);
+
+        let response = send(&state, Method::OPTIONS, "/users", &[ORIGIN, PREFLIGHT_POST]).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Simple responses ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_simple_response_carries_the_cors_headers() {
+        let state = state_with(vec![mock("GET", "/users")]).with_cors(enabled());
+
+        let response = send(&state, Method::GET, "/users", &[ORIGIN]).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, "access-control-allow-origin"),
+            Some("*".to_string())
+        );
+        assert_eq!(
+            header(&response, "content-type"),
+            Some("application/json".to_string()),
+            "the CORS headers must not displace the content type"
+        );
+    }
+
+    /// Mocking a CORS *failure* has to stay possible, so the mock's own header
+    /// is never replaced by the global config.
+    #[tokio::test]
+    async fn a_mocks_own_header_wins() {
+        let mut deliberate = mock("GET", "/users");
+        deliberate.response_headers = Some(HashMap::from([(
+            "Access-Control-Allow-Origin".to_string(),
+            "http://somewhere-else".to_string(),
+        )]));
+        let state = state_with(vec![deliberate]).with_cors(enabled());
+
+        let response = send(&state, Method::GET, "/users", &[ORIGIN]).await;
+
+        assert_eq!(
+            header(&response, "access-control-allow-origin"),
+            Some("http://somewhere-else".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_origin_outside_the_allowlist_gets_no_allow_origin_header() {
+        let state = state_with(vec![mock("GET", "/users")]).with_cors(config(&[
+            ("MIMIC_CORS", "true"),
+            ("MIMIC_CORS_ORIGINS", "http://localhost:3000"),
+        ]));
+
+        let allowed = send(&state, Method::GET, "/users", &[ORIGIN]).await;
+        assert_eq!(
+            header(&allowed, "access-control-allow-origin"),
+            Some("http://localhost:3000".to_string())
+        );
+
+        let refused = send(
+            &state,
+            Method::GET,
+            "/users",
+            &[("origin", "http://evil.example")],
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::OK);
+        assert_eq!(header(&refused, "access-control-allow-origin"), None);
+        assert_eq!(header(&refused, "vary"), Some("Origin".to_string()));
+    }
+
+    // ── Preflights ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_preflight_for_a_mocked_path_is_answered_without_a_mock_file() {
+        let state = state_with(vec![mock("POST", "/users")]).with_cors(enabled());
+
+        let response = send(
+            &state,
+            Method::OPTIONS,
+            "/users",
+            &[
+                ORIGIN,
+                PREFLIGHT_POST,
+                ("access-control-request-headers", "content-type"),
+            ],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            header(&response, "access-control-allow-origin"),
+            Some("*".to_string())
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-methods"),
+            Some("GET, POST, PUT, PATCH, DELETE, OPTIONS".to_string())
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-headers"),
+            Some("content-type".to_string())
+        );
+        assert_eq!(
+            header(&response, "access-control-max-age"),
+            Some("600".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preflight_for_an_unmocked_path_still_404s() {
+        let state = state_with(vec![mock("POST", "/users")]).with_cors(enabled());
+
+        let response = send(
+            &state,
+            Method::OPTIONS,
+            "/nowhere",
+            &[ORIGIN, PREFLIGHT_POST],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The preflight asks about POST; only GET is mocked. Answering 204 here
+    /// would promise an endpoint that 404s a moment later.
+    #[tokio::test]
+    async fn a_preflight_for_an_unmocked_method_still_404s() {
+        let state = state_with(vec![mock("GET", "/users")]).with_cors(enabled());
+
+        let response = send(&state, Method::OPTIONS, "/users", &[ORIGIN, PREFLIGHT_POST]).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A preflight carries no body, so running the endpoint's own matchers
+    /// against it would reject every preflight for a mock worth calling.
+    #[tokio::test]
+    async fn a_preflight_is_answered_for_an_endpoint_behind_a_body_matcher() {
+        let mut guarded = mock("POST", "/login");
+        guarded.consume_body = true;
+        guarded.body = Some(BodyMatcher::Json(JsonBodyMatcher {
+            exact: None,
+            partial: Some(json!({"user": "admin"})),
+            strict: false,
+        }));
+        let state = state_with(vec![guarded]).with_cors(enabled());
+
+        let response = send(&state, Method::OPTIONS, "/login", &[ORIGIN, PREFLIGHT_POST]).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_preflight_is_answered_for_a_pattern_route() {
+        let state = state_with(vec![mock("DELETE", "/users/:id")]).with_cors(enabled());
+
+        let response = send(
+            &state,
+            Method::OPTIONS,
+            "/users/42",
+            &[ORIGIN, ("access-control-request-method", "DELETE")],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Gap-filling, not hijacking: a hand-written `OPTIONS` mock matches first
+    /// and never reaches the preflight path.
+    #[tokio::test]
+    async fn an_explicit_options_mock_wins() {
+        let mut explicit = mock("OPTIONS", "/users");
+        explicit.status = 418;
+        let state = state_with(vec![mock("POST", "/users"), explicit]).with_cors(enabled());
+
+        let response = send(&state, Method::OPTIONS, "/users", &[ORIGIN, PREFLIGHT_POST]).await;
+
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    }
+
+    /// An `OPTIONS` without `Access-Control-Request-Method` isn't a preflight —
+    /// it's curl, or a probe — and keeps the behavior it has always had.
+    #[tokio::test]
+    async fn a_bare_options_is_not_treated_as_a_preflight() {
+        let state = state_with(vec![mock("POST", "/users")]).with_cors(enabled());
+
+        let response = send(&state, Method::OPTIONS, "/users", &[ORIGIN]).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_preflight_from_a_disallowed_origin_gets_no_allow_origin_header() {
+        let state = state_with(vec![mock("POST", "/users")]).with_cors(config(&[
+            ("MIMIC_CORS", "true"),
+            ("MIMIC_CORS_ORIGINS", "http://localhost:3000"),
+        ]));
+
+        let response = send(
+            &state,
+            Method::OPTIONS,
+            "/users",
+            &[("origin", "http://evil.example"), PREFLIGHT_POST],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(header(&response, "access-control-allow-origin"), None);
+    }
+
+    #[tokio::test]
+    async fn a_preflight_honours_a_scenario_filter() {
+        let mut tagged = mock("POST", "/checkout");
+        tagged.tags = vec!["error-scenario".to_string()];
+        let map = HashMap::from([("POST:/checkout".to_string(), vec![tagged])]);
+        let state = AppState::with_active_tags(
+            Arc::new(tokio::sync::RwLock::new(map)),
+            Some(HashSet::from(["happy-path".to_string()])),
+        )
+        .with_cors(enabled());
+
+        let response = send(
+            &state,
+            Method::OPTIONS,
+            "/checkout",
+            &[ORIGIN, PREFLIGHT_POST],
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a mock the active scenario hides has no endpoint to preflight"
+        );
+    }
+
+    // ── Observability ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_preflight_is_recorded_with_an_explanation() {
+        let state = state_with(vec![mock("POST", "/users")]).with_cors(enabled());
+
+        send(&state, Method::OPTIONS, "/users", &[ORIGIN, PREFLIGHT_POST]).await;
+
+        let log = state.request_log.read().await;
+        assert_eq!(log.len(), 1, "a preflight must not vanish from the log");
+        let record = &log[0];
+        assert_eq!(record.method, "OPTIONS");
+        assert_eq!(record.path, "/users");
+        assert_eq!(record.response_status, 204);
+        assert_eq!(record.matched_mock, None);
+        assert_eq!(
+            record.match_explanation.as_deref(),
+            Some(crate::cors::PREFLIGHT_EXPLANATION)
+        );
+        assert_eq!(
+            record.response_headers.get("access-control-allow-origin"),
+            Some(&"*".to_string())
+        );
     }
 }

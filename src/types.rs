@@ -466,6 +466,18 @@ pub struct RequestRecord {
 
 pub type RequestLog = Arc<tokio::sync::RwLock<Vec<RequestRecord>>>;
 
+/// True if `value` reads as an affirmative — in a query string
+/// (`?unmatched_only=1`) or an environment variable (`MIMIC_CORS=true`).
+///
+/// An absent or empty value is false, so `?unmatched_only=` behaves like "off"
+/// rather than failing the whole request.
+pub fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Create a lookup key from method and path (without query string)
 pub fn create_mock_key(method: &str, path: &str) -> String {
     // Strip query string if present for the key

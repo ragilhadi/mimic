@@ -1113,8 +1113,6 @@ pub fn requires_body(
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> bool {
-    let mut any_candidate = false;
-
     /// A single mock's own answer to "do I need the request body?"
     fn mock_needs_body(mock: &MockConfig) -> bool {
         mock.consume_body
@@ -1127,16 +1125,61 @@ pub fn requires_body(
             })
     }
 
+    let scan = scan_candidates(method, path, mocks, active_tags, mock_needs_body);
+    scan.probe_hit || !scan.any_candidate
+}
+
+/// True if any *active* mock is registered for `method` + `path`, whether under
+/// an exact key or a pattern route.
+///
+/// Deliberately weaker than [`find_matching_mock`]: it asks whether an endpoint
+/// exists, not whether a given request would match one. That's the question a
+/// CORS preflight poses — it carries none of the real request's body or
+/// headers, so running the full matchers against it would 404 every preflight
+/// for an endpoint that happens to declare a `body` or `headers` matcher.
+pub fn route_exists(
+    method: &str,
+    path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
+) -> bool {
+    scan_candidates(method, path, mocks, active_tags, |_| true).any_candidate
+}
+
+/// What [`scan_candidates`] found.
+struct CandidateScan {
+    /// Some active mock is registered for the method + path.
+    any_candidate: bool,
+    /// `probe` accepted one of them, and the scan stopped there.
+    probe_hit: bool,
+}
+
+/// Visit every active mock registered for `method` that could serve `path`,
+/// stopping as soon as `probe` accepts one.
+///
+/// "Does the body need reading?" and "is there an endpoint behind this
+/// preflight?" are two questions about the same candidate set, both asked
+/// before any matcher has run — so they share one exact-key-then-pattern-scan
+/// rather than two copies of it that could drift apart.
+fn scan_candidates(
+    method: &str,
+    path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
+    mut probe: impl FnMut(&MockConfig) -> bool,
+) -> CandidateScan {
+    let mut scan = CandidateScan {
+        any_candidate: false,
+        probe_hit: false,
+    };
+
     let base_key = crate::types::create_mock_key(method, path);
     if let Some(mock_list) = mocks.get(&base_key) {
-        let mut active = mock_list
-            .iter()
-            .filter(|m| m.is_active(active_tags))
-            .peekable();
-        if active.peek().is_some() {
-            any_candidate = true;
-            if active.any(mock_needs_body) {
-                return true;
+        for mock in mock_list.iter().filter(|m| m.is_active(active_tags)) {
+            scan.any_candidate = true;
+            if probe(mock) {
+                scan.probe_hit = true;
+                return scan;
             }
         }
     }
@@ -1161,20 +1204,16 @@ pub fn requires_body(
             continue;
         }
 
-        let mut active = mock_list
-            .iter()
-            .filter(|m| m.is_active(active_tags))
-            .peekable();
-        if active.peek().is_none() {
-            continue;
-        }
-        any_candidate = true;
-        if active.any(mock_needs_body) {
-            return true;
+        for mock in mock_list.iter().filter(|m| m.is_active(active_tags)) {
+            scan.any_candidate = true;
+            if probe(mock) {
+                scan.probe_hit = true;
+                return scan;
+            }
         }
     }
 
-    !any_candidate
+    scan
 }
 
 /// Find the best matching mock for a request.

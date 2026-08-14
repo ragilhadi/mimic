@@ -1,3 +1,4 @@
+mod cors;
 mod faker;
 mod handler;
 mod loader;
@@ -176,6 +177,25 @@ async fn run_server() {
         let mut fields: Vec<&str> = redaction.fields.iter().map(String::as_str).collect();
         fields.sort();
         info!("  Redacted body fields: {}", fields.join(", "));
+    }
+    // Logged at startup because a CORS setup that isn't taking effect is
+    // otherwise diagnosed from the browser console, which only ever says the
+    // header was missing.
+    match cors::configured() {
+        Some(config) => {
+            let origins = match &config.origins {
+                cors::OriginRule::Any => "*".to_string(),
+                cors::OriginRule::List(list) => list.join(", "),
+            };
+            info!(
+                "  CORS: enabled (origins: {}; methods: {}; credentials: {}; max-age: {}s)",
+                origins,
+                config.methods.join(", "),
+                config.credentials,
+                config.max_age
+            );
+        }
+        None => info!("  CORS: disabled (set MIMIC_CORS=true to enable)"),
     }
 
     // Load mock configurations
