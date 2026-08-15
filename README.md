@@ -20,6 +20,7 @@
 - **Advanced Matching** - Match on path parameters, query params, headers, and request body
 - **Path Parameters** - `/users/:id` and `/users/{id}` syntax, one mock covers every value
 - **Dynamic Response Templating** - Echo path, query, header, and body fields back into responses with `{{path.x}}` syntax
+- **File-Backed Responses** - Serve a PDF, PNG, CSV, or XML fixture from disk with `response_file`, bytes intact
 - **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
 - **OpenAPI Import** - Generate a whole mocks directory from an OpenAPI 3.x spec with `mimic import-openapi ./spec.yaml`
 - **Scenario Tags** - Keep happy-path and error mocks side by side and switch between them with `MIMIC_ACTIVE_TAGS` or `POST /admin/scenario`
@@ -152,6 +153,10 @@ MIMIC_REDACT_BODY_FIELDS=password,token,secret,api_key
 # Store no request/response bodies in the log at all (default: false)
 MIMIC_DISABLE_BODY_LOG=false
 
+# Largest file a mock may serve with `response_file`, in bytes
+# (default: 10485760 = 10 MB, 0 = no limit). See "File-Backed Responses" below.
+MIMIC_MAX_RESPONSE_FILE=10485760
+
 # Built-in CORS (default: off — no response gains a header, OPTIONS still 404s).
 # See "Built-in CORS" below.
 MIMIC_CORS=false
@@ -218,6 +223,8 @@ INFO mimic: Loaded 31 mock(s)
 - `path` - URL path (e.g., `/users`, `/api/v1/products`)
 - `status` - HTTP status code (200, 201, 404, 500, etc.)
 - `response` - JSON response body (can be object, array, or null)
+- `response_file` - (Optional) Serve the body from a file next to the mock instead of `response`; see [File-Backed Responses](#-file-backed-responses-response_file)
+- `template` - (Optional) Boolean enabling `{{...}}` templating inside a `response_file` body (default: `false`)
 - `consume_body` - (Optional) Boolean to control request body consumption (default: `false`)
   - `true` - Consume request body (required for file uploads, multipart/form-data)
   - `false` - Skip body consumption (faster, default behavior)
@@ -864,6 +871,143 @@ Set arbitrary response headers per mock with `response_headers` — for CORS, re
 
 ---
 
+## 📎 File-Backed Responses (`response_file`)
+
+Some bodies don't want to live inside a JSON file. A PDF export can't be
+written as JSON at all; a 200 KB captured payload turns a mock into something
+nobody can read; a SOAP envelope hand-escaped into a JSON string is impossible
+to diff. `response_file` points a mock at a file next to it and serves that
+file's exact bytes.
+
+```json
+{
+  "method": "GET",
+  "path": "/reports/:id/export",
+  "status": 200,
+  "response_file": "fixtures/report.csv",
+  "response_headers": {
+    "Content-Disposition": "attachment; filename=\"report.csv\""
+  }
+}
+```
+
+```bash
+curl -i http://localhost:8080/reports/9/export
+# HTTP/1.1 200 OK
+# content-type: text/csv; charset=utf-8
+# content-disposition: attachment; filename="report.csv"
+#
+# id,name,plan,seats,mrr
+# 1,Acme Corp,enterprise,250,12500
+```
+
+Binary works the same way, byte for byte:
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id/avatar",
+  "status": 200,
+  "response_file": "fixtures/avatar.png"
+}
+```
+
+### Where the file is looked up
+
+The path is resolved **relative to the mock file's own directory**, not to the
+working directory — so a mocks tree stays relocatable and a Docker volume mount
+works unchanged:
+
+```
+mocks/
+└── advanced/
+    ├── get_report_export.json   → "response_file": "fixtures/report.csv"
+    └── fixtures/
+        ├── report.csv
+        ├── invoice.xml
+        └── avatar.png
+```
+
+A path that resolves outside the mocks root — `../../etc/passwd`, an absolute
+path, or a symlink pointing out of the tree — is **refused at load time** with
+an error naming the mock file, and that mock is not registered.
+
+### Content type
+
+The first of these wins:
+
+1. `Content-Type` in the mock's own `response_headers`;
+2. the file extension: `.json`, `.xml`, `.csv`, `.html`, `.txt`, `.png`,
+   `.jpg`/`.jpeg`, `.pdf`, `.zip`;
+3. `application/octet-stream`.
+
+A `.json` fixture is served as a JSON body, not as a JSON-quoted string.
+
+### Templating (opt-in)
+
+Set `"template": true` to interpolate `{{path.*}}`, `{{query.*}}`,
+`{{header.*}}`, `{{body.*}}`, and `{{faker.*}}` inside the file — the same
+expressions a `response` supports:
+
+```json
+{
+  "method": "POST",
+  "path": "/soap/invoices/:id",
+  "status": 200,
+  "template": true,
+  "response_file": "fixtures/invoice.xml"
+}
+```
+
+```xml
+<InvoiceId>{{path.id}}</InvoiceId>
+<Currency>{{query.currency}}</Currency>
+<CustomerRef>{{body.customer_ref}}</CustomerRef>
+```
+
+Templating is **off by default** and never runs on a binary content type, so a
+PNG that happens to contain the bytes `{{` is still a PNG.
+
+### Sequences
+
+A [sequence](#-stateful-response-sequences) step takes the same two fields, so
+a retry flow can end in a real file:
+
+```json
+{
+  "method": "GET",
+  "path": "/flaky-export",
+  "status": 200,
+  "sequence": [
+    { "status": 503, "response": { "error": "unavailable" } },
+    { "status": 200, "response_file": "fixtures/report.csv", "repeat": true }
+  ]
+}
+```
+
+### Semantics
+
+- **`response` and `response_file` are mutually exclusive.** A mock setting both
+  is a load error naming the file. Setting neither is unchanged behavior
+  (`response: null`).
+- **Files are read at load time** and re-read on every [hot reload](#hot-reload)
+  cycle, so editing a fixture takes effect within ~2 s without touching the mock
+  file. Request handling never touches the disk.
+- **`MIMIC_MAX_RESPONSE_FILE`** (default 10 MB) caps one fixture. A file over the
+  cap is reported and its mock is skipped rather than half-loaded; `0` removes
+  the cap.
+- **A `.json` fixture is not loaded as a mock.** The loader reads every `.json`
+  file under the mocks directory, but a file some mock claims as its
+  `response_file` is served, never registered.
+- **The request log** stores a text body verbatim (truncated at
+  `MIMIC_MAX_RECORDED_BODY`) and a binary body as a one-line descriptor —
+  `<70 bytes of image/png from fixtures/avatar.png>` — so the dashboard stays
+  readable.
+- Everything else composes as usual: path parameters, matchers, `delay_ms`,
+  tags, and CORS all work with a file-backed body.
+
+---
+
 ## 🌐 Built-in CORS
 
 A browser calling a Mimic-backed API from `http://localhost:3000` normally fails
@@ -1498,6 +1642,12 @@ structure (plain text, XML, binary) is stored as it came in.
 named. `?api_key=...` in a URL is stored verbatim — put secrets in headers or
 bodies.
 
+**Binary response bodies** — a [`response_file`](#-file-backed-responses-response_file)
+with a non-text content type — are stored as a descriptor
+(`<70 bytes of image/png from fixtures/avatar.png>`) rather than as bytes, so
+they never blow past `MIMIC_MAX_RECORDED_BODY` or arrive in the dashboard as a
+wall of replacement characters.
+
 **Redaction is a property of the log only.** The body sent to the client, the
 body matching runs against, and the values `{{body.*}}` interpolates are all
 untouched.
@@ -1723,7 +1873,7 @@ curl http://localhost:8080/health
   "mocks_loaded": 5,
   "mock_count": 7,
   "service": "mimic",
-  "version": "1.12.0",
+  "version": "1.14.0",
   "uptime_seconds": 4021,
   "port": 8080,
   "max_body_size": 10485760,

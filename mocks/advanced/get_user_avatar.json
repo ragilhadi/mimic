@@ -1,0 +1,6 @@
+{
+  "method": "GET",
+  "path": "/users/:id/avatar",
+  "status": 200,
+  "response_file": "fixtures/avatar.png"
+}

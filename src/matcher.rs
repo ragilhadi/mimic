@@ -1123,6 +1123,10 @@ pub fn requires_body(
                     .iter()
                     .any(|step| crate::template::references_body(&step.response))
             })
+            // A templated `response_file` reads `{{body.…}}` out of a file
+            // rather than out of the mock JSON, and needs the body just the
+            // same.
+            || mock.file_body_references_request_body()
     }
 
     let scan = scan_candidates(method, path, mocks, active_tags, mock_needs_body);
@@ -2076,6 +2080,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
 
         let mocks = HashMap::from([(
@@ -2200,6 +2207,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -2338,6 +2348,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -2646,6 +2659,9 @@ mod benches {
                     source: None,
                     sequence: None,
                     tags: Vec::new(),
+                    response_file: None,
+                    template: None,
+                    response_bytes: None,
                 }],
             );
         }
@@ -2665,6 +2681,9 @@ mod benches {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2729,6 +2748,9 @@ mod explanation_tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -3384,6 +3406,9 @@ mod scenario_tests {
             source: None,
             sequence: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 

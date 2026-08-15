@@ -44,16 +44,31 @@ pub fn render_response(value: &Value, ctx: &TemplateContext) -> Value {
 /// needs it — a response that never mentions `{{body.…}}` doesn't.
 pub fn references_body(value: &Value) -> bool {
     match value {
-        Value::String(s) => {
-            s.contains("{{")
-                && template_regex()
-                    .captures_iter(s)
-                    .any(|caps| &caps[1] == "body")
-        }
+        Value::String(s) => text_references_body(s),
         Value::Object(map) => map.values().any(references_body),
         Value::Array(arr) => arr.iter().any(references_body),
         _ => false,
     }
+}
+
+/// Render `{{ }}` templates in a plain string — the text of a `response_file`
+/// body rather than a JSON `response`.
+///
+/// Same expressions, same resolution rules, same "unknown source resolves to
+/// empty" behavior as [`render_response`]; a string with no `{{` is returned
+/// untouched without the regex engine seeing it.
+pub fn render_text(text: &str, ctx: &TemplateContext) -> String {
+    interpolate(text, ctx)
+}
+
+/// True if `text` uses a `{{body.…}}` expression — the string-level counterpart
+/// of [`references_body`], used to decide whether a templated file body needs
+/// the request body read for it.
+pub fn text_references_body(text: &str) -> bool {
+    text.contains("{{")
+        && template_regex()
+            .captures_iter(text)
+            .any(|caps| &caps[1] == "body")
 }
 
 fn contains_template(value: &Value) -> bool {
