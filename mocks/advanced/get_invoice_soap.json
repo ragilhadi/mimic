@@ -1,0 +1,7 @@
+{
+  "method": "POST",
+  "path": "/soap/invoices/:id",
+  "status": 200,
+  "template": true,
+  "response_file": "fixtures/invoice.xml"
+}

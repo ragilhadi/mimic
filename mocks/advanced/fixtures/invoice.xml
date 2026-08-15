@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetInvoiceResponse>
+      <InvoiceId>{{path.id}}</InvoiceId>
+      <Currency>{{query.currency}}</Currency>
+      <CustomerRef>{{body.customer_ref}}</CustomerRef>
+      <Total>1249.00</Total>
+    </GetInvoiceResponse>
+  </soap:Body>
+</soap:Envelope>

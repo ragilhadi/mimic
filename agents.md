@@ -17,6 +17,7 @@
 - **Inputs:** the resolved mocks directory with JSON mock files — `MIMIC_MOCKS_DIR`, else `/app/mocks` when it exists, else `./mocks`
 - **Outputs:** `HashMap<String, MockConfig>` for O(1) lookup
 - **Responsibilities:** Scan, parse, validate mock files; build method:path index
+- **File-backed bodies:** a mock's `response_file` is resolved against that mock file's own directory, canonicalized, refused if it escapes the mocks root, capped by `MIMIC_MAX_RESPONSE_FILE` (default 10 MB), and read into `MockConfig::response_bytes` here — so request handling never does file I/O, and a hot-reload cycle picks up a changed fixture. A file some mock claims is served, never registered as a mock of its own
 
 ### 2. **Router Agent** (`src/main.rs`)
 - **Purpose:** Route HTTP requests to handlers
@@ -39,7 +40,8 @@
 - **Outputs:** HTTP response (status, JSON body, headers), logs, admin JSON
 - **Responsibilities:** Parse request → build context → call Matcher → return response/404; record each request with the response served, its match score, captured path params, and the match explanation; apply the CORS Agent's headers and let it answer a preflight before a miss becomes a 404
 - **Admin endpoints:** `/admin/requests` (filters: `path` substring, `method`, `status` code or class, `unmatched_only`, `search`), `/admin/mocks`, `/admin/sequences`, `/admin/sequences/reset`, `/admin/dashboard`
-- **Bounded by construction:** the request log keeps `MIMIC_MAX_LOG_ENTRIES` entries (default 1000) and stored bodies are cut at `MIMIC_MAX_RECORDED_BODY` (default 64 KB)
+- **Bounded by construction:** the request log keeps `MIMIC_MAX_LOG_ENTRIES` entries (default 1000) and stored bodies are cut at `MIMIC_MAX_RECORDED_BODY` (default 64 KB); a binary `response_file` body is logged as a descriptor rather than as bytes
+- **One body rule, stated once:** `build_response_parts` resolves the content type (mock headers → `response_file` extension → `application/json`) and then serves either the fixture's exact bytes or the JSON value, with the existing "non-JSON content type + JSON string ⇒ raw string" rule sitting next to it. Templating runs over a fixture only when the mock sets `"template": true` *and* the content type is textual
 
 ### 5. **CORS Agent** (`src/cors.rs`)
 - **Purpose:** Apply a configured origin allowlist to mock responses and answer `OPTIONS` preflights that no mock covers

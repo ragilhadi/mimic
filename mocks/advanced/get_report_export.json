@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "path": "/reports/:id/export",
+  "status": 200,
+  "response_file": "fixtures/report.csv",
+  "response_headers": {
+    "Content-Disposition": "attachment; filename=\"report.csv\""
+  }
+}

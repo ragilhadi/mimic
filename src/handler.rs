@@ -20,6 +20,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -802,12 +803,27 @@ pub async fn handle_request(
 
             // Resolve the response: sequence step if configured, top-level otherwise.
             // An empty sequence array falls back to the top-level status/response.
-            let (status_u16, response, delay_ms) = match mock.sequence.as_deref() {
+            let resolved = match mock.sequence.as_deref() {
                 Some(steps) if !steps.is_empty() => {
                     advance_sequence(&state.sequence_counters, &identity, steps).await
                 }
-                _ => (mock.status, mock.response.clone(), None),
+                _ => ResolvedResponse {
+                    status: mock.status,
+                    response: mock.response.clone(),
+                    file: mock.response_file.clone(),
+                    bytes: mock.response_bytes.clone(),
+                    template: mock.template.unwrap_or(false),
+                    delay_ms: None,
+                },
             };
+            let ResolvedResponse {
+                status: status_u16,
+                response,
+                file: response_file,
+                bytes: response_bytes,
+                template,
+                delay_ms,
+            } = resolved;
 
             info!("Mock matched: {} {} -> {}", method_str, path, status_u16);
 
@@ -840,11 +856,23 @@ pub async fn handle_request(
             // Serialize the response once: the same bytes are both sent to the
             // client and recorded, so the drawer can't show something the
             // client didn't get.
+            let file_body = response_bytes.as_ref().map(|bytes| FileBody {
+                declared: response_file.as_deref().unwrap_or("(response_file)"),
+                bytes,
+                template,
+            });
             let (header_map, body) = build_response_parts(
                 &response,
+                file_body.as_ref(),
+                &template_ctx,
                 mock.response_headers.as_ref(),
                 state.cors.as_deref(),
                 cors::request_origin(&context),
+            );
+            let recorded_body = recorded_response_body(
+                &body,
+                declared_content_type(&header_map),
+                file_body.as_ref(),
             );
 
             // Record the request with the status and response actually served
@@ -855,7 +883,7 @@ pub async fn handle_request(
                 RequestOutcome {
                     matched_mock: Some(matched_key),
                     response_status: status_u16,
-                    response_body: Some(body.clone()),
+                    response_body: Some(recorded_body),
                     response_headers: recorded_response_headers(&header_map),
                     match_score: Some(match_score),
                     path_params,
@@ -989,7 +1017,7 @@ async fn answer_preflight(
     Some(assemble_response(
         StatusCode::NO_CONTENT,
         header_map,
-        String::new(),
+        Bytes::new(),
     ))
 }
 
@@ -1488,13 +1516,96 @@ pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// A response body being served from a `response_file` rather than from
+/// `response`: the bytes the loader read, plus what's needed to describe them.
+struct FileBody<'a> {
+    /// The path as written in the mock file. Used to infer a content type and
+    /// to name the fixture in the request log.
+    declared: &'a str,
+    bytes: &'a Bytes,
+    /// Whether `{{...}}` inside the file should be rendered.
+    template: bool,
+}
+
+/// Content types inferred from a `response_file` extension, lowercased.
+///
+/// Deliberately short: these are the extensions a mock fixture actually turns
+/// out to be, and anything else is `application/octet-stream` — a wrong guess
+/// on a binary body is worse than no guess. `response_headers` overrides all of
+/// it, so an unlisted type is one line away.
+const CONTENT_TYPE_BY_EXTENSION: &[(&str, &str)] = &[
+    ("json", "application/json"),
+    ("xml", "application/xml"),
+    ("csv", "text/csv; charset=utf-8"),
+    ("html", "text/html; charset=utf-8"),
+    ("htm", "text/html; charset=utf-8"),
+    ("txt", "text/plain; charset=utf-8"),
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("pdf", "application/pdf"),
+    ("zip", "application/zip"),
+];
+
+/// The fallback for a `response_file` whose extension says nothing.
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// The content type a `response_file` is served with when `response_headers`
+/// doesn't set one.
+fn content_type_for_file(declared: &str) -> &'static str {
+    let extension = Path::new(declared)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+
+    extension
+        .and_then(|ext| {
+            CONTENT_TYPE_BY_EXTENSION
+                .iter()
+                .find(|(name, _)| *name == ext)
+                .map(|(_, value)| *value)
+        })
+        .unwrap_or(OCTET_STREAM)
+}
+
+/// True if a body of this content type is text a human would read — and so is
+/// safe to run templating over and worth storing verbatim in the request log.
+///
+/// Anything else is treated as opaque bytes: never scanned for `{{`, never
+/// copied into the log.
+fn is_textual_content_type(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    ct.starts_with("text/")
+        || [
+            "json",
+            "xml",
+            "yaml",
+            "csv",
+            "html",
+            "javascript",
+            "graphql",
+        ]
+        .iter()
+        .any(|marker| ct.contains(marker))
+        || ct.contains("x-www-form-urlencoded")
+}
+
 /// Resolve the headers and serialize the body of a mock response.
 ///
 /// Custom header names are case-insensitive; invalid names/values are skipped
-/// with a warning. `Content-Type: application/json` is added only when the
-/// custom headers don't already set a content type. When a non-JSON content
-/// type is configured and the response value is a JSON string, the raw string
-/// is sent as the body (so XML/CSV/plain-text mocks aren't JSON-quoted).
+/// with a warning. The content type is the first of: one set by the mock's own
+/// `response_headers`; one inferred from a `response_file`'s extension;
+/// `application/json`. Two rules follow from it, stated here together because
+/// they are the same rule seen from two sides:
+///
+/// - a `response_file` body is sent as the file's exact bytes, so a PNG stays a
+///   PNG and a `.json` fixture is a JSON body rather than a JSON-quoted string;
+/// - a `response` body that is a JSON string is sent raw when the content type
+///   is not JSON, so XML/CSV/plain-text mocks aren't JSON-quoted either.
+///
+/// Templating runs over a file body only when the mock opted in with
+/// `"template": true` *and* the content type is textual — a binary fixture is
+/// never scanned for `{{`.
 ///
 /// Returns the parts rather than a finished [`Response`] so the handler can
 /// record exactly what it is about to send, instead of serializing a second
@@ -1505,10 +1616,12 @@ pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
 /// wrong `Access-Control-Allow-Origin` still returns it.
 fn build_response_parts(
     response: &serde_json::Value,
+    file: Option<&FileBody>,
+    template_ctx: &TemplateContext,
     custom_headers: Option<&HashMap<String, String>>,
     cors: Option<&CorsConfig>,
     origin: Option<&str>,
-) -> (HeaderMap, String) {
+) -> (HeaderMap, Bytes) {
     let mut header_map = HeaderMap::new();
     if let Some(custom) = custom_headers {
         for (name, value) in custom {
@@ -1526,31 +1639,98 @@ fn build_response_parts(
         cors::apply_headers(config, origin, &mut header_map);
     }
     if !header_map.contains_key(CONTENT_TYPE) {
-        header_map.insert(
-            CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
+        let inferred = file.map_or("application/json", |f| content_type_for_file(f.declared));
+        match axum::http::HeaderValue::from_str(inferred) {
+            Ok(value) => {
+                header_map.insert(CONTENT_TYPE, value);
+            }
+            // Unreachable for the table above; a fallback beats an unwrap.
+            Err(_) => {
+                header_map.insert(
+                    CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static(OCTET_STREAM),
+                );
+            }
+        }
     }
 
-    let is_json_content_type = header_map
+    let content_type = header_map
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.to_ascii_lowercase().contains("json"));
+        .unwrap_or("")
+        .to_string();
 
+    if let Some(file) = file {
+        let textual = is_textual_content_type(&content_type);
+        let bytes = match (file.template && textual, std::str::from_utf8(file.bytes)) {
+            (true, Ok(text)) => Bytes::from(crate::template::render_text(text, template_ctx)),
+            // Not templated, not text, or not valid UTF-8: the bytes as read.
+            _ => file.bytes.clone(),
+        };
+        return (header_map, bytes);
+    }
+
+    let is_json_content_type = content_type.to_ascii_lowercase().contains("json");
     let body = match response {
         serde_json::Value::String(s) if !is_json_content_type => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     };
 
-    (header_map, body)
+    (header_map, Bytes::from(body))
+}
+
+/// What the request log stores for a body that is about to be sent.
+///
+/// Text is stored as-is — the dashboard's response drawer is most of the reason
+/// the log exists. A binary body is stored as a one-line descriptor instead: a
+/// 4 MB PDF rendered as replacement characters helps nobody, and would blow
+/// past `MIMIC_MAX_RECORDED_BODY` on every single request that hit the mock.
+fn recorded_response_body(body: &Bytes, content_type: &str, file: Option<&FileBody>) -> String {
+    if is_textual_content_type(content_type) {
+        if let Ok(text) = std::str::from_utf8(body) {
+            return text.to_string();
+        }
+    }
+
+    match file {
+        Some(file) => format!(
+            "<{} bytes of {} from {}>",
+            body.len(),
+            content_type,
+            file.declared
+        ),
+        None => format!("<{} bytes of {}>", body.len(), content_type),
+    }
+}
+
+/// The content type a set of resolved response headers declares.
+fn declared_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 /// Put an already-resolved status, header set, and body on the wire.
-fn assemble_response(status: StatusCode, header_map: HeaderMap, body: String) -> Response {
+fn assemble_response(status: StatusCode, header_map: HeaderMap, body: Bytes) -> Response {
     let mut res = Response::new(Body::from(body));
     *res.status_mut() = status;
     *res.headers_mut() = header_map;
     res
+}
+
+/// The response a matched mock will serve, once a sequence step (if any) has
+/// been picked: everything that differs between "the mock's own response" and
+/// "this step's response", in one value so the two paths can't drift.
+struct ResolvedResponse {
+    status: u16,
+    response: serde_json::Value,
+    /// `response_file` as written in the mock, for content-type inference.
+    file: Option<String>,
+    /// Its bytes, read at load time. `None` for an ordinary JSON response.
+    bytes: Option<Bytes>,
+    template: bool,
+    delay_ms: Option<u64>,
 }
 
 /// Pick the current sequence step and advance the counter.
@@ -1559,7 +1739,7 @@ async fn advance_sequence(
     counters: &SequenceCounters,
     identity: &MockIdentity,
     steps: &[SequenceStep],
-) -> (u16, serde_json::Value, Option<u64>) {
+) -> ResolvedResponse {
     let mut map = counters.write().await;
     let count = map.entry(identity.clone()).or_insert(0);
     // Clamp so the last step keeps repeating once the sequence is exhausted
@@ -1568,7 +1748,14 @@ async fn advance_sequence(
     if !step.repeat {
         *count += 1;
     }
-    (step.status, step.response.clone(), step.delay_ms)
+    ResolvedResponse {
+        status: step.status,
+        response: step.response.clone(),
+        file: step.response_file.clone(),
+        bytes: step.response_bytes.clone(),
+        template: step.template.unwrap_or(false),
+        delay_ms: step.delay_ms,
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1632,6 +1819,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -1651,6 +1841,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -1670,6 +1863,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -1838,6 +2034,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -1883,6 +2082,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -1938,6 +2140,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -1991,6 +2196,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2045,6 +2253,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2090,6 +2301,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2152,6 +2366,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2205,6 +2422,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2249,6 +2469,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2300,6 +2523,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2354,6 +2580,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2390,6 +2619,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2445,9 +2677,15 @@ mod tests {
                     status: 200,
                     response: json!({"echoed": "{{body.message}}"}),
                     delay_ms: None,
+                    response_file: None,
+                    template: None,
+                    response_bytes: None,
                     repeat: true,
                 }]),
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2489,6 +2727,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2544,9 +2785,15 @@ mod tests {
                     status: 202,
                     response: json!({"job_id": "{{faker.uuid}}"}),
                     delay_ms: None,
+                    response_file: None,
+                    template: None,
+                    response_bytes: None,
                     repeat: true,
                 }]),
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2596,6 +2843,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2649,6 +2899,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2689,6 +2942,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2725,6 +2981,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
         mocks.insert(
@@ -2743,6 +3002,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2799,16 +3061,25 @@ mod tests {
                         status: 503,
                         response: json!({"error": "unavailable"}),
                         delay_ms: None,
+                        response_file: None,
+                        template: None,
+                        response_bytes: None,
                         repeat: false,
                     },
                     SequenceStep {
                         status: 200,
                         response: json!({"ok": true}),
                         delay_ms: None,
+                        response_file: None,
+                        template: None,
+                        response_bytes: None,
                         repeat: true,
                     },
                 ]),
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2860,6 +3131,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -2907,6 +3181,9 @@ mod tests {
                     source: None,
                     sequence: None,
                     tags: Vec::new(),
+                    response_file: None,
+                    template: None,
+                    response_bytes: None,
                 },
                 MockConfig {
                     method: "POST".to_string(),
@@ -2926,6 +3203,9 @@ mod tests {
                     source: None,
                     sequence: None,
                     tags: Vec::new(),
+                    response_file: None,
+                    template: None,
+                    response_bytes: None,
                 },
             ],
         );
@@ -3205,6 +3485,9 @@ mod tests {
             source: None,
             sequence: Some(steps),
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -3213,6 +3496,9 @@ mod tests {
             status,
             response: body,
             delay_ms: None,
+            response_file: None,
+            template: None,
+            response_bytes: None,
             repeat: false,
         }
     }
@@ -3362,6 +3648,9 @@ mod tests {
             source: None,
             sequence: Some(steps),
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
         let mocks = HashMap::from([(
             "POST:/login".to_string(),
@@ -3870,6 +4159,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -3988,6 +4280,9 @@ mod tests {
             source: source.map(|s| s.to_string()),
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -4171,18 +4466,27 @@ mod tests {
                 status: 202,
                 response: json!({"state": "pending"}),
                 delay_ms: None,
+                response_file: None,
+                template: None,
+                response_bytes: None,
                 repeat: false,
             },
             SequenceStep {
                 status: 200,
                 response: json!({"state": "done"}),
                 delay_ms: None,
+                response_file: None,
+                template: None,
+                response_bytes: None,
                 repeat: false,
             },
             SequenceStep {
                 status: 200,
                 response: json!({"state": "done"}),
                 delay_ms: None,
+                response_file: None,
+                template: None,
+                response_bytes: None,
                 repeat: true,
             },
         ]);
@@ -4813,6 +5117,9 @@ mod scenario_tests {
             source: None,
             sequence: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -5001,18 +5308,27 @@ mod scenario_tests {
                 status: 200,
                 response: json!({"n": 1}),
                 delay_ms: None,
+                response_file: None,
+                template: None,
+                response_bytes: None,
                 repeat: false,
             },
             SequenceStep {
                 status: 200,
                 response: json!({"n": 2}),
                 delay_ms: None,
+                response_file: None,
+                template: None,
+                response_bytes: None,
                 repeat: false,
             },
             SequenceStep {
                 status: 200,
                 response: json!({"n": 3}),
                 delay_ms: None,
+                response_file: None,
+                template: None,
+                response_bytes: None,
                 repeat: true,
             },
         ]);
@@ -5539,6 +5855,9 @@ mod cors_tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
@@ -5879,5 +6198,406 @@ mod cors_tests {
             record.response_headers.get("access-control-allow-origin"),
             Some(&"*".to_string())
         );
+    }
+}
+
+// ============================================================================
+// response_file: file-backed response bodies (#90)
+// ============================================================================
+
+#[cfg(test)]
+mod response_file_tests {
+    use super::*;
+    use axum::http::Method;
+    use std::fs;
+    use std::path::Path as FsPath;
+    use tempfile::TempDir;
+
+    /// A fixture that is unmistakably not text: every byte value, including a
+    /// NUL, a lone `0x80` continuation byte, and a `{{path.id}}` that must
+    /// never be treated as a template.
+    fn binary_fixture() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend(b"{{path.id}}");
+        bytes.extend((0u8..=255).rev());
+        bytes
+    }
+
+    /// FNV-1a, so "byte-identical" is asserted on a digest of the whole body
+    /// rather than on its length.
+    fn checksum(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    /// Write `mock` and its fixtures into a fresh mocks directory.
+    fn mocks_dir(files: &[(&str, &[u8])]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
+        }
+        dir
+    }
+
+    /// Load a mocks directory exactly as the server does and serve from it.
+    fn state_from(dir: &FsPath) -> AppState {
+        let result = crate::loader::load_mocks_map(dir.to_str().unwrap());
+        assert_eq!(result.errors, 0, "fixture set should load cleanly");
+        AppState::new(Arc::new(tokio::sync::RwLock::new(result.mocks)))
+    }
+
+    async fn get(state: &AppState, path: &str) -> (StatusCode, HeaderMap, Bytes) {
+        let response = handle_request(
+            Method::GET,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (parts.status, parts.headers, bytes)
+    }
+
+    fn content_type(headers: &HeaderMap) -> &str {
+        headers.get("content-type").unwrap().to_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_a_text_fixture_with_a_content_type_inferred_from_its_extension() {
+        let csv = "id,name\n1,Alice\n2,Bob\n";
+        let dir = mocks_dir(&[
+            (
+                "export.json",
+                br#"{"method":"GET","path":"/reports/export","status":200,
+                     "response_file":"fixtures/report.csv"}"#,
+            ),
+            ("fixtures/report.csv", csv.as_bytes()),
+        ]);
+
+        let (status, headers, body) = get(&state_from(dir.path()), "/reports/export").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type(&headers), "text/csv; charset=utf-8");
+        assert_eq!(body, Bytes::from(csv));
+    }
+
+    #[tokio::test]
+    async fn a_binary_fixture_round_trips_byte_identically() {
+        let fixture = binary_fixture();
+        let dir = mocks_dir(&[
+            (
+                "logo.json",
+                br#"{"method":"GET","path":"/assets/logo.png","status":200,
+                     "response_file":"fixtures/logo.png"}"#,
+            ),
+            ("fixtures/logo.png", &fixture),
+        ]);
+
+        let (status, headers, body) = get(&state_from(dir.path()), "/assets/logo.png").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type(&headers), "image/png");
+        assert_eq!(
+            checksum(&body),
+            checksum(&fixture),
+            "the served bytes must digest to the same value as the file"
+        );
+        assert_eq!(body.len(), fixture.len());
+    }
+
+    #[tokio::test]
+    async fn a_json_fixture_is_served_as_a_json_body_not_a_quoted_string() {
+        let dir = mocks_dir(&[
+            (
+                "users.json",
+                br#"{"method":"GET","path":"/users","status":200,
+                     "response_file":"fixtures/users.json"}"#,
+            ),
+            ("fixtures/users.json", br#"{"users":[{"id":1}]}"#),
+        ]);
+
+        let (_, headers, body) = get(&state_from(dir.path()), "/users").await;
+
+        assert_eq!(content_type(&headers), "application/json");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["users"][0]["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn response_headers_win_over_the_inferred_content_type() {
+        let dir = mocks_dir(&[
+            (
+                "export.json",
+                br#"{"method":"GET","path":"/export","status":200,
+                     "response_file":"fixtures/report.bin",
+                     "response_headers":{"Content-Type":"text/csv"}}"#,
+            ),
+            ("fixtures/report.bin", b"id,name\n1,Alice\n"),
+        ]);
+
+        let (_, headers, body) = get(&state_from(dir.path()), "/export").await;
+
+        assert_eq!(content_type(&headers), "text/csv");
+        assert_eq!(body, Bytes::from("id,name\n1,Alice\n"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_extension_falls_back_to_octet_stream() {
+        let dir = mocks_dir(&[
+            (
+                "blob.json",
+                br#"{"method":"GET","path":"/blob","status":200,
+                     "response_file":"fixtures/thing.wat"}"#,
+            ),
+            ("fixtures/thing.wat", b"\x00\x01\x02"),
+        ]);
+
+        let (_, headers, _) = get(&state_from(dir.path()), "/blob").await;
+        assert_eq!(content_type(&headers), "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn templating_is_off_by_default_for_a_file_body() {
+        let dir = mocks_dir(&[
+            (
+                "user.json",
+                br#"{"method":"GET","path":"/users/:id/card","status":200,
+                     "response_file":"fixtures/card.html"}"#,
+            ),
+            ("fixtures/card.html", b"<p>user {{path.id}}</p>"),
+        ]);
+
+        let (_, _, body) = get(&state_from(dir.path()), "/users/42/card").await;
+        assert_eq!(
+            body,
+            Bytes::from("<p>user {{path.id}}</p>"),
+            "a fixture must not be interpolated unless the mock asks for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn template_true_interpolates_a_text_fixture() {
+        let dir = mocks_dir(&[
+            (
+                "user.json",
+                br#"{"method":"GET","path":"/users/:id/card","status":200,
+                     "template":true,
+                     "response_file":"fixtures/card.html"}"#,
+            ),
+            (
+                "fixtures/card.html",
+                b"<p>user {{path.id}} sorted by {{query.sort}}</p>",
+            ),
+        ]);
+
+        let (_, _, body) = get(&state_from(dir.path()), "/users/42/card?sort=name").await;
+        assert_eq!(body, Bytes::from("<p>user 42 sorted by name</p>"));
+    }
+
+    #[tokio::test]
+    async fn templating_never_runs_on_a_binary_body() {
+        // The fixture contains a literal `{{path.id}}`; a PNG is bytes, and
+        // opting in must not change that.
+        let fixture = binary_fixture();
+        let dir = mocks_dir(&[
+            (
+                "logo.json",
+                br#"{"method":"GET","path":"/assets/:id/logo.png","status":200,
+                     "template":true,
+                     "response_file":"fixtures/logo.png"}"#,
+            ),
+            ("fixtures/logo.png", &fixture),
+        ]);
+
+        let (_, headers, body) = get(&state_from(dir.path()), "/assets/42/logo.png").await;
+
+        assert_eq!(content_type(&headers), "image/png");
+        assert_eq!(checksum(&body), checksum(&fixture));
+    }
+
+    #[tokio::test]
+    async fn a_templated_file_body_can_read_the_request_body() {
+        // `{{body.…}}` lives in the fixture, not in the mock JSON, so the
+        // decision to read the request body has to look inside the file.
+        let dir = mocks_dir(&[
+            (
+                "echo.json",
+                br#"{"method":"POST","path":"/echo","status":200,
+                     "template":true,
+                     "response_file":"fixtures/echo.txt"}"#,
+            ),
+            ("fixtures/echo.txt", b"you said: {{body.message}}"),
+        ]);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let response = handle_request(
+            Method::POST,
+            "/echo".parse().unwrap(),
+            headers,
+            State(state_from(dir.path())),
+            Body::from(r#"{"message":"hi"}"#),
+        )
+        .await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(body, Bytes::from("you said: hi"));
+    }
+
+    #[tokio::test]
+    async fn a_sequence_step_can_serve_a_file() {
+        let dir = mocks_dir(&[
+            (
+                "flaky.json",
+                br#"{"method":"GET","path":"/flaky","status":200,
+                     "response":{"ok":true},
+                     "sequence":[
+                       {"status":503,"response":{"error":"unavailable"}},
+                       {"status":200,"response_file":"fixtures/ok.csv","repeat":true}
+                     ]}"#,
+            ),
+            ("fixtures/ok.csv", b"id\n1\n"),
+        ]);
+        let state = state_from(dir.path());
+
+        let (status, _, _) = get(&state, "/flaky").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, headers, body) = get(&state, "/flaky").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type(&headers), "text/csv; charset=utf-8");
+        assert_eq!(body, Bytes::from("id\n1\n"));
+    }
+
+    #[tokio::test]
+    async fn the_request_log_records_a_descriptor_for_a_binary_body() {
+        let fixture = binary_fixture();
+        let dir = mocks_dir(&[
+            (
+                "logo.json",
+                br#"{"method":"GET","path":"/logo.png","status":200,
+                     "response_file":"fixtures/logo.png"}"#,
+            ),
+            ("fixtures/logo.png", &fixture),
+        ]);
+        let state = state_from(dir.path());
+
+        let (_, _, body) = get(&state, "/logo.png").await;
+
+        let log = state.request_log.read().await;
+        let recorded = log[0].response_body.as_deref().unwrap();
+        assert!(
+            recorded.contains(&format!("{} bytes", body.len()))
+                && recorded.contains("image/png")
+                && recorded.contains("fixtures/logo.png"),
+            "unhelpful descriptor: {}",
+            recorded
+        );
+        assert!(
+            recorded.len() < 200,
+            "the log must not carry the bytes: {} chars",
+            recorded.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_log_keeps_a_text_body_verbatim() {
+        let dir = mocks_dir(&[
+            (
+                "export.json",
+                br#"{"method":"GET","path":"/export","status":200,
+                     "response_file":"fixtures/report.csv"}"#,
+            ),
+            ("fixtures/report.csv", b"id,name\n1,Alice\n"),
+        ]);
+        let state = state_from(dir.path());
+
+        let _ = get(&state, "/export").await;
+
+        let log = state.request_log.read().await;
+        assert_eq!(
+            log[0].response_body.as_deref(),
+            Some("id,name\n1,Alice\n"),
+            "a CSV body is exactly what the response drawer is for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_picks_up_a_changed_fixture() {
+        // The mock file is untouched; only the fixture changes. Bytes are read
+        // at load time, so this is the case that proves they're re-read.
+        let dir = mocks_dir(&[
+            (
+                "export.json",
+                br#"{"method":"GET","path":"/export","status":200,
+                     "response_file":"fixtures/report.csv"}"#,
+            ),
+            ("fixtures/report.csv", b"id\n1\n"),
+        ]);
+        let state = state_from(dir.path());
+
+        let (_, _, body) = get(&state, "/export").await;
+        assert_eq!(body, Bytes::from("id\n1\n"));
+
+        fs::write(dir.path().join("fixtures/report.csv"), b"id\n1\n2\n").unwrap();
+        let reloaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(reloaded.errors, 0);
+        *state.mocks.write().await = reloaded.mocks;
+
+        let (_, _, body) = get(&state, "/export").await;
+        assert_eq!(body, Bytes::from("id\n1\n2\n"));
+    }
+
+    // ------------------------------------------------------------------
+    // Content-type inference, in isolation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn content_type_inference_covers_the_documented_extensions() {
+        for (file, expected) in [
+            ("a/b/report.json", "application/json"),
+            ("feed.xml", "application/xml"),
+            ("report.csv", "text/csv; charset=utf-8"),
+            ("page.html", "text/html; charset=utf-8"),
+            ("notes.txt", "text/plain; charset=utf-8"),
+            ("logo.PNG", "image/png"),
+            ("photo.jpg", "image/jpeg"),
+            ("photo.jpeg", "image/jpeg"),
+            ("invoice.pdf", "application/pdf"),
+            ("export.zip", "application/zip"),
+            ("mystery.bin", "application/octet-stream"),
+            ("no_extension", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type_for_file(file), expected, "for {}", file);
+        }
+    }
+
+    #[test]
+    fn only_textual_content_types_are_templated_and_logged() {
+        for textual in [
+            "text/plain; charset=utf-8",
+            "text/csv",
+            "application/json",
+            "application/xml",
+            "application/soap+xml",
+            "text/html",
+        ] {
+            assert!(is_textual_content_type(textual), "{} is text", textual);
+        }
+        for binary in [
+            "image/png",
+            "application/pdf",
+            "application/zip",
+            "application/octet-stream",
+        ] {
+            assert!(!is_textual_content_type(binary), "{} is not text", binary);
+        }
     }
 }

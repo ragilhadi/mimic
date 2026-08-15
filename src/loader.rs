@@ -1,7 +1,8 @@
 use crate::types::{create_mock_key, MockConfig, MockStore};
-use std::collections::HashMap;
+use bytes::Bytes;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
@@ -10,6 +11,51 @@ use tracing::{debug, error, warn};
 pub struct LoadResult {
     pub mocks: HashMap<String, Vec<MockConfig>>,
     pub errors: usize,
+}
+
+// ============================================================================
+// response_file limits
+// ============================================================================
+
+/// Default cap on a single `response_file`, in bytes (10 MB).
+pub const DEFAULT_MAX_RESPONSE_FILE: u64 = 10 * 1024 * 1024;
+
+/// Environment variable overriding [`DEFAULT_MAX_RESPONSE_FILE`], in bytes.
+pub const MAX_RESPONSE_FILE_ENV: &str = "MIMIC_MAX_RESPONSE_FILE";
+
+/// The largest `response_file` this process will load.
+///
+/// Every fixture is held in memory for as long as it's registered and copied
+/// into the mock map on every reload cycle, so an unbounded fixture is a
+/// footgun pointed at a server whose whole pitch is a 10 ms response. `0`
+/// disables the cap for a run that genuinely wants a huge fixture.
+pub fn max_response_file_size() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var(MAX_RESPONSE_FILE_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                warn!(
+                    "Invalid {}='{}', falling back to {} bytes",
+                    MAX_RESPONSE_FILE_ENV, raw, DEFAULT_MAX_RESPONSE_FILE
+                );
+                DEFAULT_MAX_RESPONSE_FILE
+            }
+        },
+        Err(_) => DEFAULT_MAX_RESPONSE_FILE,
+    })
+}
+
+/// One mock as it came off disk: the config, plus the fixture files it claims.
+///
+/// The fixture list is what lets the directory walk tell a fixture apart from a
+/// mock. Fixtures live inside the mocks root — the containment check requires
+/// it — so a `.json` fixture would otherwise be picked up by the walk and
+/// reported as a mock file that failed to parse.
+struct LoadedMock {
+    mock: MockConfig,
+    /// Canonical paths of the files this mock serves its bodies from.
+    fixtures: Vec<PathBuf>,
 }
 
 // ============================================================================
@@ -121,6 +167,12 @@ pub fn resolve_mocks_dir_from(
 ///     LoadResult containing mock configurations keyed by "METHOD:PATH" and the
 ///     number of files that failed to load.
 pub fn load_mocks_map(path: &str) -> LoadResult {
+    load_mocks_map_with_limit(path, max_response_file_size())
+}
+
+/// [`load_mocks_map`] with the `response_file` size cap injected, so the cap
+/// can be exercised without a process-wide environment variable.
+pub fn load_mocks_map_with_limit(path: &str, max_response_file: u64) -> LoadResult {
     let path_obj = Path::new(path);
 
     if !path_obj.exists() {
@@ -131,33 +183,79 @@ pub fn load_mocks_map(path: &str) -> LoadResult {
         };
     }
 
-    let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
-    let mut errors: usize = 0;
+    // The root a `response_file` may not escape: the mocks directory itself,
+    // or — for a single-file load — the directory that file lives in.
+    let root = if path_obj.is_dir() {
+        path_obj.to_path_buf()
+    } else {
+        path_obj.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let root = root.canonicalize().unwrap_or(root);
 
+    // Pass one: read every candidate file, in a fixed order.
+    let mut scanned: Vec<(PathBuf, Result<LoadedMock, String>)> = Vec::new();
+    let mut errors: usize = 0;
     if path_obj.is_file() {
-        // Load single file
-        match load_single_mock(path_obj) {
-            Ok(mock) => {
+        scanned.push((
+            path_obj.to_path_buf(),
+            load_single_mock(path_obj, &root, max_response_file),
+        ));
+    } else if path_obj.is_dir() {
+        collect_json_files(
+            path_obj,
+            &root,
+            max_response_file,
+            &mut scanned,
+            &mut errors,
+        );
+    }
+
+    // Every file claimed as a fixture by a mock that loaded. A fixture is
+    // served, never registered — including when it is itself valid JSON.
+    let fixtures: HashSet<&PathBuf> = scanned
+        .iter()
+        .filter_map(|(_, outcome)| outcome.as_ref().ok())
+        .flat_map(|loaded| loaded.fixtures.iter())
+        .collect();
+
+    // Pass two: register what parsed, minus the fixtures.
+    let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+    for (file, outcome) in &scanned {
+        // Only worth a `canonicalize` syscall per file when some mock actually
+        // claims a fixture, which for most mock sets is never.
+        let canonical = (!fixtures.is_empty())
+            .then(|| file.canonicalize().ok())
+            .flatten();
+        if canonical.is_some_and(|path| fixtures.contains(&path)) {
+            debug!(
+                "Skipping {}: it is served as a response_file by another mock",
+                file.display()
+            );
+            continue;
+        }
+
+        match outcome {
+            Ok(loaded) => {
+                let mock = loaded.mock.clone();
                 let key = create_mock_key(&mock.method, &mock.path);
+                debug!("Loaded mock: {} -> {}", key, file.display());
                 let entry = mocks.entry(key).or_default();
                 if !entry.is_empty() {
                     warn!(
-                        "Multiple mocks registered for {} {}: {} total",
+                        "Multiple mocks registered for {} {}: {} total (file: {})",
                         mock.method,
                         mock.path,
-                        entry.len() + 1
+                        entry.len() + 1,
+                        file.display()
                     );
                 }
                 entry.push(mock);
             }
             Err(e) => {
-                warn!("Failed to load mock file {}: {}", path, e);
+                warn!("Failed to load mock file {}: {}", file.display(), e);
                 errors += 1;
             }
         }
-    } else if path_obj.is_dir() {
-        // Load all JSON files from directory tree (recursive)
-        collect_json_files(path_obj, &mut mocks, &mut errors);
     }
 
     LoadResult { mocks, errors }
@@ -188,7 +286,9 @@ pub fn load_mocks(path: &str) -> MockStore {
 /// point its own name sorts in.
 fn collect_json_files(
     dir: &Path,
-    mocks: &mut HashMap<String, Vec<MockConfig>>,
+    root: &Path,
+    max_response_file: u64,
+    scanned: &mut Vec<(PathBuf, Result<LoadedMock, String>)>,
     errors: &mut usize,
 ) {
     let entries = match fs::read_dir(dir) {
@@ -205,43 +305,28 @@ fn collect_json_files(
 
     for entry_path in paths {
         if entry_path.is_dir() {
-            collect_json_files(&entry_path, mocks, errors);
+            collect_json_files(&entry_path, root, max_response_file, scanned, errors);
         } else if entry_path.is_file()
             && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
         {
-            match load_single_mock(&entry_path) {
-                Ok(mock) => {
-                    let key = create_mock_key(&mock.method, &mock.path);
-                    debug!("Loaded mock: {} -> {}", key, entry_path.display());
-                    let entry = mocks.entry(key).or_default();
-                    if !entry.is_empty() {
-                        warn!(
-                            "Multiple mocks registered for {} {}: {} total (file: {})",
-                            mock.method,
-                            mock.path,
-                            entry.len() + 1,
-                            entry_path.display()
-                        );
-                    }
-                    entry.push(mock);
-                }
-                Err(e) => {
-                    warn!("Failed to load mock file {}: {}", entry_path.display(), e);
-                    *errors += 1;
-                }
-            }
+            let outcome = load_single_mock(&entry_path, root, max_response_file);
+            scanned.push((entry_path, outcome));
         }
     }
 }
 
 /// Loads a single mock configuration from a JSON file.
 ///
-/// Args:
-///     path (Path): Path to the JSON file.
+/// `root` is the mocks root a `response_file` may not escape; `max_response_file`
+/// caps how large one of those files may be.
 ///
-/// Returns:
-///     Result<MockConfig, String>: Parsed mock configuration or error message.
-fn load_single_mock(path: &Path) -> Result<MockConfig, String> {
+/// Returns the parsed mock along with the fixture files it claims, or an error
+/// message naming the offending file.
+fn load_single_mock(
+    path: &Path,
+    root: &Path,
+    max_response_file: u64,
+) -> Result<LoadedMock, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
 
@@ -262,7 +347,133 @@ fn load_single_mock(path: &Path) -> Result<MockConfig, String> {
         return Err(format!("Empty path in {}", path.display()));
     }
 
-    Ok(mock)
+    // Response bodies read from disk. Also loader-owned: whatever a mock file
+    // says about `response_bytes` is dropped by serde before we get here.
+    mock.response_bytes = None;
+    let mut fixtures = Vec::new();
+
+    if let Some(file) = mock.response_file.clone() {
+        reject_both_bodies(&mock.response, &file, path)?;
+        let (resolved, bytes) = read_response_file(&file, path, root, max_response_file)?;
+        mock.response_bytes = Some(bytes);
+        fixtures.push(resolved);
+    }
+
+    for (index, step) in mock.sequence.iter_mut().flatten().enumerate() {
+        step.response_bytes = None;
+        let Some(file) = step.response_file.clone() else {
+            continue;
+        };
+        reject_both_bodies(&step.response, &file, path)
+            .map_err(|e| format!("{} (sequence step {})", e, index))?;
+        let (resolved, bytes) = read_response_file(&file, path, root, max_response_file)
+            .map_err(|e| format!("{} (sequence step {})", e, index))?;
+        step.response_bytes = Some(bytes);
+        fixtures.push(resolved);
+    }
+
+    Ok(LoadedMock { mock, fixtures })
+}
+
+/// `response` and `response_file` are two answers to one question, so a mock
+/// that gives both is rejected rather than having one silently win.
+fn reject_both_bodies(
+    response: &serde_json::Value,
+    file: &str,
+    mock_path: &Path,
+) -> Result<(), String> {
+    if response.is_null() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} sets both `response` and `response_file` ({}); use one or the other",
+        mock_path.display(),
+        file
+    ))
+}
+
+/// Resolve `file` against the directory `mock_path` lives in, refuse anything
+/// outside `root`, enforce `max_response_file`, and read the bytes.
+///
+/// Resolution is relative to the mock file rather than to the process working
+/// directory, so a mocks tree stays relocatable and a Docker volume mount works
+/// unchanged. Containment is checked *after* canonicalization, so `..` segments
+/// and symlinks are both covered — this is a server pointed at a directory it
+/// doesn't own, and "the fixture path is user input" is the whole point.
+fn read_response_file(
+    file: &str,
+    mock_path: &Path,
+    root: &Path,
+    max_response_file: u64,
+) -> Result<(PathBuf, Bytes), String> {
+    let base = mock_path.parent().unwrap_or(Path::new("."));
+    let candidate = base.join(file);
+
+    let resolved = candidate.canonicalize().map_err(|e| {
+        format!(
+            "{}: cannot read response_file '{}' ({}): {}",
+            mock_path.display(),
+            file,
+            candidate.display(),
+            e
+        )
+    })?;
+
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "{}: response_file '{}' resolves to {}, which is outside the mocks root {}",
+            mock_path.display(),
+            file,
+            resolved.display(),
+            root.display()
+        ));
+    }
+
+    let metadata = fs::metadata(&resolved).map_err(|e| {
+        format!(
+            "{}: cannot stat response_file '{}': {}",
+            mock_path.display(),
+            file,
+            e
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: response_file '{}' is not a regular file",
+            mock_path.display(),
+            file
+        ));
+    }
+    // Checked against the file's size before reading, so an oversized fixture
+    // costs a stat rather than a 2 GB allocation.
+    if max_response_file > 0 && metadata.len() > max_response_file {
+        return Err(format!(
+            "{}: response_file '{}' is {} bytes, over the {}-byte {} limit; skipping this mock",
+            mock_path.display(),
+            file,
+            metadata.len(),
+            max_response_file,
+            MAX_RESPONSE_FILE_ENV
+        ));
+    }
+
+    let bytes = fs::read(&resolved).map_err(|e| {
+        format!(
+            "{}: failed to read response_file '{}': {}",
+            mock_path.display(),
+            file,
+            e
+        )
+    })?;
+
+    debug!(
+        "Loaded response_file {} ({} bytes) for {}",
+        resolved.display(),
+        bytes.len(),
+        mock_path.display()
+    );
+
+    Ok((resolved, Bytes::from(bytes)))
 }
 
 #[cfg(test)]
@@ -481,10 +692,10 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(mock.as_bytes()).unwrap();
 
-        let result = load_single_mock(&file_path);
+        let result = load_single_mock(&file_path, temp_dir.path(), DEFAULT_MAX_RESPONSE_FILE);
         assert!(result.is_ok());
 
-        let mock_config = result.unwrap();
+        let mock_config = result.unwrap().mock;
         assert_eq!(mock_config.method, "POST");
         assert_eq!(mock_config.path, "/api/test");
         assert_eq!(mock_config.status, 201);
@@ -531,6 +742,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
 
         let key = create_mock_key(&mock.method, &mock.path);
@@ -902,5 +1116,362 @@ mod tests {
             result.mocks["GET:/x"][0].source.as_deref(),
             Some(file.to_str().unwrap())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // response_file (#90)
+    // ------------------------------------------------------------------
+
+    /// A mocks directory containing the given files, parents created as needed.
+    fn mocks_dir(files: &[(&str, &[u8])]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
+        }
+        dir
+    }
+
+    /// Load a directory with the default fixture size cap.
+    fn load(dir: &TempDir) -> LoadResult {
+        load_mocks_map_with_limit(dir.path().to_str().unwrap(), DEFAULT_MAX_RESPONSE_FILE)
+    }
+
+    #[test]
+    fn response_file_bytes_are_read_at_load_time() {
+        let dir = mocks_dir(&[
+            (
+                "export.json",
+                br#"{"method":"GET","path":"/export","status":200,
+                     "response_file":"fixtures/report.csv"}"#,
+            ),
+            ("fixtures/report.csv", b"id,name\n1,Alice\n"),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors, 0);
+        let mock = &result.mocks["GET:/export"][0];
+        assert_eq!(
+            mock.response_bytes.as_deref(),
+            Some(b"id,name\n1,Alice\n".as_slice()),
+            "request handling must never have to touch the disk"
+        );
+        assert_eq!(mock.response_file.as_deref(), Some("fixtures/report.csv"));
+    }
+
+    #[test]
+    fn a_fixture_is_resolved_relative_to_its_own_mock_file() {
+        // The same relative path under two directories has to resolve to two
+        // different files, or a mocks tree stops being relocatable.
+        let dir = mocks_dir(&[
+            (
+                "a/mock.json",
+                br#"{"method":"GET","path":"/a","status":200,"response_file":"body.txt"}"#,
+            ),
+            ("a/body.txt", b"from a"),
+            (
+                "b/mock.json",
+                br#"{"method":"GET","path":"/b","status":200,"response_file":"body.txt"}"#,
+            ),
+            ("b/body.txt", b"from b"),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors, 0);
+        assert_eq!(
+            result.mocks["GET:/a"][0].response_bytes.as_deref(),
+            Some(b"from a".as_slice())
+        );
+        assert_eq!(
+            result.mocks["GET:/b"][0].response_bytes.as_deref(),
+            Some(b"from b".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_fixture_outside_the_mocks_root_is_refused() {
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), b"password").unwrap();
+        let dir = mocks_dir(&[(
+            "leak.json",
+            format!(
+                r#"{{"method":"GET","path":"/leak","status":200,
+                     "response_file":"../{}/secret"}}"#,
+                outside.path().file_name().unwrap().to_str().unwrap()
+            )
+            .as_bytes(),
+        )]);
+
+        let error = load_error(&dir);
+        assert!(
+            error.contains("leak.json") && error.contains("outside the mocks root"),
+            "the error has to name the mock file and the rule: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn an_absolute_fixture_path_outside_the_root_is_refused() {
+        let dir = mocks_dir(&[(
+            "passwd.json",
+            br#"{"method":"GET","path":"/passwd","status":200,
+                 "response_file":"/etc/hostname"}"#,
+        )]);
+
+        let error = load_error(&dir);
+        assert!(error.contains("outside the mocks root"), "{}", error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pointing_out_of_the_root_is_refused() {
+        // Containment is checked after canonicalization precisely so that a
+        // symlink can't be used to walk out of a directory the operator meant
+        // to be the boundary.
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("secret");
+        fs::write(&secret, b"password").unwrap();
+
+        let dir = mocks_dir(&[(
+            "leak.json",
+            br#"{"method":"GET","path":"/leak","status":200,
+                 "response_file":"escape"}"#,
+        )]);
+        std::os::unix::fs::symlink(&secret, dir.path().join("escape")).unwrap();
+
+        let error = load_error(&dir);
+        assert!(error.contains("outside the mocks root"), "{}", error);
+    }
+
+    #[test]
+    fn response_and_response_file_together_are_a_load_error() {
+        let dir = mocks_dir(&[
+            (
+                "both.json",
+                br#"{"method":"GET","path":"/both","status":200,
+                     "response":{"ok":true},
+                     "response_file":"fixtures/report.csv"}"#,
+            ),
+            ("fixtures/report.csv", b"id\n"),
+        ]);
+
+        let error = load_error(&dir);
+        assert!(
+            error.contains("both.json") && error.contains("response_file"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn neither_response_nor_response_file_still_means_a_null_response() {
+        let dir = mocks_dir(&[(
+            "empty.json",
+            br#"{"method":"DELETE","path":"/users/1","status":204}"#,
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors, 0);
+        let mock = &result.mocks["DELETE:/users/1"][0];
+        assert!(mock.response.is_null());
+        assert!(mock.response_bytes.is_none());
+    }
+
+    #[test]
+    fn a_missing_fixture_is_a_load_error_naming_the_mock() {
+        let dir = mocks_dir(&[(
+            "gone.json",
+            br#"{"method":"GET","path":"/gone","status":200,
+                 "response_file":"fixtures/nope.csv"}"#,
+        )]);
+
+        let error = load_error(&dir);
+        assert!(
+            error.contains("gone.json") && error.contains("nope.csv"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn an_oversized_fixture_skips_the_mock_instead_of_loading_it() {
+        let dir = mocks_dir(&[
+            (
+                "big.json",
+                br#"{"method":"GET","path":"/big","status":200,
+                     "response_file":"fixtures/big.bin"}"#,
+            ),
+            ("fixtures/big.bin", &[0u8; 4096]),
+        ]);
+
+        let result = load_mocks_map_with_limit(dir.path().to_str().unwrap(), 1024);
+        assert_eq!(result.errors, 1);
+        assert!(
+            !result.mocks.contains_key("GET:/big"),
+            "half a fixture is not a response"
+        );
+
+        // The same set loads once the cap is raised past the file.
+        let result = load_mocks_map_with_limit(dir.path().to_str().unwrap(), 8192);
+        assert_eq!(result.errors, 0);
+        assert_eq!(
+            result.mocks["GET:/big"][0]
+                .response_bytes
+                .as_ref()
+                .unwrap()
+                .len(),
+            4096
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_disables_the_size_limit() {
+        let dir = mocks_dir(&[
+            (
+                "big.json",
+                br#"{"method":"GET","path":"/big","status":200,
+                     "response_file":"fixtures/big.bin"}"#,
+            ),
+            ("fixtures/big.bin", &[7u8; 4096]),
+        ]);
+
+        let result = load_mocks_map_with_limit(dir.path().to_str().unwrap(), 0);
+        assert_eq!(result.errors, 0);
+        assert!(result.mocks.contains_key("GET:/big"));
+    }
+
+    #[test]
+    fn a_json_fixture_is_served_not_registered_as_a_mock() {
+        // Fixtures have to live inside the mocks root, and the walk loads
+        // every `.json` file it finds there. A fixture claimed by a mock is
+        // neither registered nor counted as a file that failed to parse.
+        let dir = mocks_dir(&[
+            (
+                "users.json",
+                br#"{"method":"GET","path":"/users","status":200,
+                     "response_file":"fixtures/users.json"}"#,
+            ),
+            ("fixtures/users.json", br#"{"users":[{"id":1}]}"#),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors, 0, "a claimed fixture is not a broken mock");
+        assert_eq!(result.mocks.len(), 1);
+        assert!(result.mocks.contains_key("GET:/users"));
+    }
+
+    #[test]
+    fn an_unclaimed_json_file_that_is_not_a_mock_is_still_an_error() {
+        // The fixture exemption is narrow: only files some mock actually
+        // names. A typo'd mock file must not disappear into it.
+        let dir = mocks_dir(&[("stray.json", br#"{"users":[{"id":1}]}"#)]);
+        assert_eq!(load(&dir).errors, 1);
+    }
+
+    #[test]
+    fn a_sequence_step_can_declare_its_own_fixture() {
+        let dir = mocks_dir(&[
+            (
+                "flaky.json",
+                br#"{"method":"GET","path":"/flaky","status":200,"response":{"ok":true},
+                     "sequence":[
+                       {"status":503,"response":{"error":"unavailable"}},
+                       {"status":200,"response_file":"fixtures/ok.csv","repeat":true}
+                     ]}"#,
+            ),
+            ("fixtures/ok.csv", b"id\n1\n"),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors, 0);
+        let steps = result.mocks["GET:/flaky"][0].sequence.as_ref().unwrap();
+        assert!(steps[0].response_bytes.is_none());
+        assert_eq!(
+            steps[1].response_bytes.as_deref(),
+            Some(b"id\n1\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_sequence_step_setting_both_bodies_is_a_load_error() {
+        let dir = mocks_dir(&[
+            (
+                "flaky.json",
+                br#"{"method":"GET","path":"/flaky","status":200,
+                     "sequence":[
+                       {"status":200,"response":{"ok":true},"response_file":"fixtures/ok.csv"}
+                     ]}"#,
+            ),
+            ("fixtures/ok.csv", b"id\n"),
+        ]);
+
+        let error = load_error(&dir);
+        assert!(error.contains("sequence step 0"), "{}", error);
+    }
+
+    #[test]
+    fn response_bytes_written_into_a_mock_file_are_ignored() {
+        // `response_bytes` is loader-owned; a mock file can't smuggle a body in.
+        let dir = mocks_dir(&[(
+            "sneaky.json",
+            br#"{"method":"GET","path":"/x","status":200,"response":{"ok":true},
+                 "response_bytes":[1,2,3]}"#,
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors, 0);
+        assert!(result.mocks["GET:/x"][0].response_bytes.is_none());
+    }
+
+    #[test]
+    fn a_single_file_load_resolves_fixtures_beside_that_file() {
+        let dir = mocks_dir(&[
+            (
+                "one.json",
+                br#"{"method":"GET","path":"/one","status":200,"response_file":"body.txt"}"#,
+            ),
+            ("body.txt", b"hello"),
+        ]);
+
+        let file = dir.path().join("one.json");
+        let result = load_mocks_map_with_limit(file.to_str().unwrap(), DEFAULT_MAX_RESPONSE_FILE);
+        assert_eq!(result.errors, 0);
+        assert_eq!(
+            result.mocks["GET:/one"][0].response_bytes.as_deref(),
+            Some(b"hello".as_slice())
+        );
+    }
+
+    /// Load `dir`, expecting exactly one failing file, and return its message.
+    fn load_error(dir: &TempDir) -> String {
+        let result = load(dir);
+        assert_eq!(result.errors, 1, "expected exactly one load error");
+        assert!(
+            result.mocks.is_empty(),
+            "a mock that fails validation must not be registered"
+        );
+
+        // The message the loader logs is the message `load_single_mock`
+        // returns, so assert on that rather than on captured log output.
+        let root = dir.path().canonicalize().unwrap();
+        let mut messages = Vec::new();
+        let mut scanned = Vec::new();
+        let mut errors = 0;
+        collect_json_files(
+            &root,
+            &root,
+            DEFAULT_MAX_RESPONSE_FILE,
+            &mut scanned,
+            &mut errors,
+        );
+        for (_, outcome) in scanned {
+            if let Err(message) = outcome {
+                messages.push(message);
+            }
+        }
+        messages.join("\n")
     }
 }

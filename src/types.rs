@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -177,12 +178,44 @@ pub struct FormBodyMatcher {
 // Main Mock Configuration
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MockConfig {
     pub method: String,
     pub path: String,
     pub status: u16,
+
+    /// The response body as JSON.
+    ///
+    /// Defaulted rather than required so a mock can serve its body from a
+    /// [`MockConfig::response_file`] instead. With neither field present the
+    /// value is `null`, which is what `"response": null` has always meant.
+    #[serde(default)]
     pub response: serde_json::Value,
+
+    /// A file whose bytes are the response body, resolved relative to the
+    /// directory the mock file itself lives in.
+    ///
+    /// Mutually exclusive with a non-null `response`; the loader rejects a mock
+    /// that sets both. See [`MockConfig::response_bytes`] for the bytes it
+    /// resolves to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_file: Option<String>,
+
+    /// Whether `{{...}}` templates inside a `response_file` body are rendered.
+    ///
+    /// Off by default, and ignored for binary content types: a PNG that happens
+    /// to contain the bytes `{{` is a PNG, not a template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<bool>,
+
+    /// The bytes of [`MockConfig::response_file`], read at load time.
+    ///
+    /// Loader-owned and skipped by serde in both directions: a mock file can't
+    /// set it, and `/admin/mocks` won't dump a PDF into the dashboard. Reading
+    /// at load time — and re-reading every hot-reload cycle — is what keeps
+    /// request handling free of file I/O.
+    #[serde(skip)]
+    pub response_bytes: Option<Bytes>,
 
     #[serde(default = "default_consume_body")]
     pub consume_body: bool,
@@ -254,10 +287,27 @@ impl DelayConfig {
 }
 
 /// One step in a stateful response sequence
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SequenceStep {
     pub status: u16,
+
+    /// This step's body as JSON. Defaulted for the same reason
+    /// [`MockConfig::response`] is: a step can serve a file instead.
+    #[serde(default)]
     pub response: serde_json::Value,
+
+    /// A file whose bytes are this step's body, resolved exactly like
+    /// [`MockConfig::response_file`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_file: Option<String>,
+
+    /// Whether templates inside this step's file body are rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<bool>,
+
+    /// The bytes of this step's `response_file`, read at load time.
+    #[serde(skip)]
+    pub response_bytes: Option<Bytes>,
 
     /// Optional delay applied before returning this step's response
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,6 +327,25 @@ impl MockConfig {
     #[allow(dead_code)]
     pub fn has_advanced_matchers(&self) -> bool {
         self.query_params.is_some() || self.headers.is_some() || self.body.is_some()
+    }
+
+    /// Whether this mock's file body, or any of its steps', is templated *and*
+    /// reads from the request body — the one thing that makes a file-backed
+    /// mock need the request body it would otherwise skip reading.
+    pub fn file_body_references_request_body(&self) -> bool {
+        fn references(bytes: Option<&Bytes>, template: Option<bool>) -> bool {
+            template.unwrap_or(false)
+                && bytes.is_some_and(|b| {
+                    std::str::from_utf8(b).is_ok_and(crate::template::text_references_body)
+                })
+        }
+
+        references(self.response_bytes.as_ref(), self.template)
+            || self
+                .sequence
+                .iter()
+                .flatten()
+                .any(|step| references(step.response_bytes.as_ref(), step.template))
     }
 
     /// Whether this mock can be matched under the given scenario selection.
@@ -554,6 +623,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -632,6 +704,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
 
         let cloned = config.clone();
@@ -659,6 +734,9 @@ mod tests {
                 source: None,
                 sequence: None,
                 tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
             }],
         );
 
@@ -736,6 +814,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -824,6 +905,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
         assert!(!simple.has_advanced_matchers());
 
@@ -841,6 +925,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         };
         assert!(with_query.has_advanced_matchers());
     }
@@ -1141,6 +1228,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 

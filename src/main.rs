@@ -1092,6 +1092,9 @@ mod tests {
             source: None,
             sequence: None,
             tags: Vec::new(),
+            response_file: None,
+            template: None,
+            response_bytes: None,
         }
     }
 
