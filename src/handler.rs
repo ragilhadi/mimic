@@ -485,6 +485,18 @@ pub struct AppState {
     /// so a test can exercise a configuration without writing to the process
     /// environment the rest of the suite shares.
     pub cors: Option<Arc<CorsConfig>>,
+    /// Proxy/passthrough configuration, or `None` for the original behavior:
+    /// an unmatched request gets a 404. Set once at startup from
+    /// `MIMIC_PROXY_UPSTREAM`; see [`crate::proxy`].
+    pub proxy_config: Option<Arc<crate::proxy::ProxyConfig>>,
+    /// Dedupe bookkeeping for `MIMIC_RECORD_UPSTREAM`, shared across every
+    /// proxied request so concurrent identical ones don't race to write the
+    /// same recording twice.
+    pub record_state: Arc<crate::proxy::RecordState>,
+    /// Root mocks directory; recordings land under `<mocks_dir>/_recorded/`.
+    /// Set from `main`'s resolved mocks directory, defaulted here to
+    /// `"mocks"` for tests that never enable proxying and so never read it.
+    pub mocks_dir: String,
 }
 
 impl AppState {
@@ -511,6 +523,9 @@ impl AppState {
             redaction: Arc::new(BodyRedaction::default()),
             admin_token: None,
             cors: cors::configured().cloned().map(Arc::new),
+            proxy_config: None,
+            record_state: Arc::new(crate::proxy::RecordState::new()),
+            mocks_dir: "mocks".to_string(),
         }
     }
 
@@ -541,6 +556,24 @@ impl AppState {
     #[cfg(test)]
     pub fn with_cors(mut self, cors: CorsConfig) -> Self {
         self.cors = Some(Arc::new(cors));
+        self
+    }
+
+    /// Set the proxy/passthrough configuration, as `main` does once it has
+    /// read `MIMIC_PROXY_UPSTREAM`. `None` (the default) leaves an unmatched
+    /// request answered with the ordinary 404.
+    pub fn with_proxy_config(
+        mut self,
+        proxy_config: Option<Arc<crate::proxy::ProxyConfig>>,
+    ) -> Self {
+        self.proxy_config = proxy_config;
+        self
+    }
+
+    /// Set the root mocks directory, so a proxy recording lands under
+    /// `<mocks_dir>/_recorded/` instead of the test-only default.
+    pub fn with_mocks_dir(mut self, mocks_dir: String) -> Self {
+        self.mocks_dir = mocks_dir;
         self
     }
 }
@@ -716,11 +749,14 @@ pub async fn handle_request(
 
     // Decide whether to read the body, scoped to the mocks that could actually
     // serve this method+path — a `body` matcher or `consume_body: true` on some
-    // *other* endpoint is none of this request's business (acquire read lock)
+    // *other* endpoint is none of this request's business (acquire read lock).
+    // When proxying is configured, the body is read unconditionally: a miss
+    // here won't be known until after matching, and by then a proxied
+    // request needs the body forwarded upstream, not silently dropped.
     let needs_body = {
         let mocks = state.mocks.read().await;
         requires_body(&method_str, &path, &mocks, active_tags.as_ref())
-    };
+    } || state.proxy_config.is_some();
 
     // The body is wrapped in `Limited` so the stream is cut off — and the
     // request rejected with 413 — as soon as it exceeds the cap, rather than
@@ -916,6 +952,24 @@ pub async fn handle_request(
                 return response;
             }
 
+            // Proxy/passthrough: an unmatched request that isn't one of the
+            // method+path pairs Mimic answers itself gets one more chance
+            // before 404, forwarded live to the configured upstream.
+            if let Some(proxy_cfg) = state.proxy_config.clone() {
+                if state.reserved.reservation_for(&method_str, &path).is_none() {
+                    return handle_proxy_fallback(
+                        &state,
+                        &proxy_cfg,
+                        &method,
+                        &uri,
+                        &headers,
+                        context,
+                        &parsed_headers,
+                    )
+                    .await;
+                }
+            }
+
             info!("No mock found for: {} {}", method_str, path);
 
             // Diagnose the miss. Only reached on the 404 path — it walks the
@@ -1019,6 +1073,107 @@ async fn answer_preflight(
         header_map,
         Bytes::new(),
     ))
+}
+
+/// Forward an unmatched request to the configured upstream, returning its
+/// response to the client and — if `MIMIC_RECORD_UPSTREAM` is enabled —
+/// recording it as a new mock in the background.
+///
+/// `context` is moved in and consumed: this is the terminal handling for the
+/// request, mirroring the 404 branch it stands in for.
+async fn handle_proxy_fallback(
+    state: &AppState,
+    proxy_cfg: &crate::proxy::ProxyConfig,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    context: RequestContext,
+    parsed_headers: &HashMap<String, String>,
+) -> Response {
+    let method_str = context.method.clone();
+    let path = context.path.clone();
+    let body = context.body.clone().unwrap_or_default();
+
+    match crate::proxy::forward(proxy_cfg, method, &path, uri.query(), headers, body).await {
+        Ok(upstream) => {
+            info!(
+                "Proxied {} {} -> {} ({})",
+                method_str, path, proxy_cfg.upstream, upstream.status
+            );
+
+            if proxy_cfg.record {
+                let record_state = state.record_state.clone();
+                let mocks_dir = std::path::PathBuf::from(&state.mocks_dir).join("_recorded");
+                let record_ctx = context.clone();
+                let status = upstream.status.as_u16();
+                let resp_headers = upstream.headers.clone();
+                let resp_body = upstream.body.clone();
+                tokio::spawn(async move {
+                    crate::proxy::record_exchange(
+                        record_state,
+                        mocks_dir,
+                        record_ctx,
+                        status,
+                        resp_headers,
+                        resp_body,
+                    )
+                    .await;
+                });
+            }
+
+            let response_body_string = String::from_utf8_lossy(&upstream.body).to_string();
+            let response_headers_for_log = recorded_response_headers(&upstream.headers);
+            let path_params = context.path_params.clone();
+            record_request(
+                state,
+                context,
+                RequestOutcome {
+                    matched_mock: Some(format!("proxy:{}", proxy_cfg.upstream)),
+                    response_status: upstream.status.as_u16(),
+                    response_body: Some(response_body_string),
+                    response_headers: response_headers_for_log,
+                    match_score: None,
+                    path_params,
+                    match_explanation: Some(format!("proxied to {}", proxy_cfg.upstream)),
+                },
+            )
+            .await;
+
+            let mut res = Response::new(Body::from(upstream.body));
+            *res.status_mut() = upstream.status;
+            *res.headers_mut() = upstream.headers;
+            res
+        }
+        Err(e) => {
+            warn!("Proxy error for {} {}: {}", method_str, path, e);
+
+            let error_body = json!({
+                "error": "mock not found",
+                "method": method_str,
+                "path": path,
+                "query_params": context.query_params.clone(),
+                "headers_received": parsed_headers.keys().collect::<Vec<_>>(),
+                "upstream_error": e.to_string(),
+            });
+
+            record_request(
+                state,
+                context,
+                RequestOutcome {
+                    matched_mock: None,
+                    response_status: 404,
+                    response_body: Some(error_body.to_string()),
+                    response_headers: HashMap::new(),
+                    match_score: None,
+                    path_params: HashMap::new(),
+                    match_explanation: Some(format!("proxy error: {}", e)),
+                },
+            )
+            .await;
+
+            (StatusCode::NOT_FOUND, Json(error_body)).into_response()
+        }
+    }
 }
 
 /// The response headers to store on a log entry, with sensitive values
@@ -1573,7 +1728,7 @@ fn content_type_for_file(declared: &str) -> &'static str {
 ///
 /// Anything else is treated as opaque bytes: never scanned for `{{`, never
 /// copied into the log.
-fn is_textual_content_type(content_type: &str) -> bool {
+pub(crate) fn is_textual_content_type(content_type: &str) -> bool {
     let ct = content_type.to_ascii_lowercase();
     ct.starts_with("text/")
         || [
@@ -6598,6 +6753,244 @@ mod response_file_tests {
             "application/octet-stream",
         ] {
             assert!(!is_textual_content_type(binary), "{} is not text", binary);
+        }
+    }
+
+    // ========================================================================
+    // Proxy / record-and-replay (#60)
+    // ========================================================================
+
+    mod proxy_tests {
+        use super::*;
+        use crate::proxy::ProxyConfig;
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        /// A tiny upstream that counts hits and answers `GET /widgets/1`
+        /// with a fixed JSON body. Returns its base URL and the shared hit
+        /// counter.
+        async fn spawn_counting_upstream() -> (String, Arc<AtomicU64>) {
+            let hits = Arc::new(AtomicU64::new(0));
+            let counter = hits.clone();
+
+            let app = Router::new().route(
+                "/widgets/1",
+                get(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"id": 1, "name": "Widget"}))
+                    }
+                }),
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            (format!("http://{}", addr), hits)
+        }
+
+        /// An upstream that accepts the connection and then never responds,
+        /// so a client-side timeout is what ends the request.
+        async fn spawn_hanging_upstream() -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    if let Ok((socket, _)) = listener.accept().await {
+                        // Hold the connection open without ever writing a
+                        // response; the client's own timeout must fire.
+                        std::mem::forget(socket);
+                    }
+                }
+            });
+            format!("http://{}", addr)
+        }
+
+        fn proxy_state(mocks_dir: &std::path::Path, upstream: &str, record: bool) -> AppState {
+            let mut state = create_empty_state();
+            state.mocks_dir = mocks_dir.to_str().unwrap().to_string();
+            state.proxy_config = Some(Arc::new(ProxyConfig::for_test(
+                upstream.to_string(),
+                record,
+                2000,
+            )));
+            state
+        }
+
+        #[tokio::test]
+        async fn unmatched_request_is_forwarded_to_the_upstream_and_the_response_passed_through() {
+            let (upstream, hits) = spawn_counting_upstream().await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = proxy_state(dir.path(), &upstream, false);
+
+            let response = handle_request(
+                Method::GET,
+                "/widgets/1".parse().unwrap(),
+                HeaderMap::new(),
+                State(state),
+                Body::empty(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["name"], "Widget");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn upstream_timeout_falls_back_to_a_404_with_an_upstream_error_field() {
+            let upstream = spawn_hanging_upstream().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = create_empty_state();
+            state.mocks_dir = dir.path().to_str().unwrap().to_string();
+            state.proxy_config = Some(Arc::new(ProxyConfig::for_test(upstream, false, 100)));
+
+            let response = handle_request(
+                Method::GET,
+                "/widgets/1".parse().unwrap(),
+                HeaderMap::new(),
+                State(state),
+                Body::empty(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"], "mock not found");
+            assert!(
+                json["upstream_error"].is_string(),
+                "a timed-out proxy attempt must surface why: {}",
+                json
+            );
+        }
+
+        #[tokio::test]
+        async fn reserved_health_and_admin_routes_are_never_proxied() {
+            // Proxying is configured, and neither path exists as a mock —
+            // if the reservation check were missing, these would reach the
+            // (nonexistent) upstream route instead of the ordinary 404 shape.
+            // Only the exact method+path pairs `ReservedRoutes` protects are
+            // covered here; an admin-adjacent path Mimic doesn't itself
+            // answer (e.g. `/admin/not-a-real-route`) is deliberately *not*
+            // reserved — see `ReservedRoutes::reservation_for` — and is free
+            // to be proxied like any other unmocked request.
+            let (upstream, hits) = spawn_counting_upstream().await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = proxy_state(dir.path(), &upstream, false);
+
+            for path in ["/health", "/admin/dashboard"] {
+                let response = handle_request(
+                    Method::GET,
+                    path.parse().unwrap(),
+                    HeaderMap::new(),
+                    State(state.clone()),
+                    Body::empty(),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(json["error"], "mock not found");
+                assert!(
+                    json.get("upstream_error").is_none(),
+                    "{} must never reach the proxy",
+                    path
+                );
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+        }
+
+        /// The full record-and-replay loop from the issue's acceptance
+        /// criteria: a proxied response is written to `mocks/_recorded/`,
+        /// and once that file is loaded back in (simulating the hot-reload
+        /// main.rs runs every few seconds), the *second* identical request
+        /// is answered locally — the upstream must see exactly one hit.
+        #[tokio::test]
+        async fn recorded_response_is_replayed_on_the_next_identical_request_without_a_second_upstream_hit(
+        ) {
+            let (upstream, hits) = spawn_counting_upstream().await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = proxy_state(dir.path(), &upstream, true);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                "Bearer super-secret-token".parse().unwrap(),
+            );
+
+            let first = handle_request(
+                Method::GET,
+                "/widgets/1".parse().unwrap(),
+                headers.clone(),
+                State(state.clone()),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::OK);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+            // The write happens on a detached task; poll briefly for the
+            // recorded file to land instead of guessing a fixed sleep.
+            let recorded_dir = dir.path().join("_recorded");
+            let mut recorded_file = None;
+            for _ in 0..50 {
+                if recorded_dir.is_dir() {
+                    let mut entries: Vec<_> = std::fs::read_dir(&recorded_dir)
+                        .unwrap()
+                        .filter_map(|e| e.ok())
+                        .collect();
+                    if !entries.is_empty() {
+                        recorded_file = Some(entries.remove(0).path());
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let recorded_file = recorded_file.expect("a mock should have been recorded");
+
+            let contents = std::fs::read_to_string(&recorded_file).unwrap();
+            assert!(
+                !contents.contains("super-secret-token"),
+                "the Authorization header value must never reach disk: {}",
+                contents
+            );
+
+            // Simulate the hot-reload main.rs runs on an interval: load what
+            // landed on disk into a fresh mock store.
+            let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
+            assert_eq!(loaded.errors, 0);
+            {
+                let mut mocks = state.mocks.write().await;
+                *mocks = loaded.mocks;
+            }
+
+            let second = handle_request(
+                Method::GET,
+                "/widgets/1".parse().unwrap(),
+                headers,
+                State(state),
+                Body::empty(),
+            )
+            .await;
+
+            assert_eq!(second.status(), StatusCode::OK);
+            let bytes = second.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["name"], "Widget");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "the second identical request must be served from the recorded mock, not the upstream again"
+            );
         }
     }
 }

@@ -4,6 +4,7 @@ mod handler;
 mod loader;
 mod matcher;
 mod openapi;
+mod proxy;
 mod regex_cache;
 mod template;
 mod types;
@@ -198,6 +199,17 @@ async fn run_server() {
         None => info!("  CORS: disabled (set MIMIC_CORS=true to enable)"),
     }
 
+    // Proxy/passthrough: forward a request that matches no local mock to a
+    // real upstream instead of 404ing, optionally recording it as a new mock.
+    let proxy_config = proxy::configured_proxy_config(port).map(std::sync::Arc::new);
+    match proxy_config.as_ref() {
+        Some(cfg) => info!(
+            "  Proxy upstream: {} (record={}, timeout={}ms)",
+            cfg.upstream, cfg.record, cfg.timeout_ms
+        ),
+        None => info!("  Proxy upstream: (none — unmatched requests return 404)"),
+    }
+
     // Load mock configurations
     let mocks = load_mocks(&mocks_dir.path);
     let mut shadowed = {
@@ -215,7 +227,9 @@ async fn run_server() {
     let state = AppState::with_active_tags(mocks.clone(), active_tags)
         .with_reserved(reserved)
         .with_redaction(redaction)
-        .with_admin_token(admin_token);
+        .with_admin_token(admin_token)
+        .with_mocks_dir(mocks_dir.path.clone())
+        .with_proxy_config(proxy_config);
 
     // Spawn background task for hot-reloading mock files
     const RELOAD_INTERVAL_SECS: u64 = 2;
