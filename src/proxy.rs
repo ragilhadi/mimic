@@ -11,9 +11,7 @@ use crate::types::{
     is_sensitive_header, is_truthy, BodyMatcher, FormBodyMatcher, HeaderMatcher, HeaderValue,
     JsonBodyMatcher, MockConfig, QueryParamMatcher, QueryParamValue, TextBodyMatcher,
 };
-use axum::http::{
-    header::CONTENT_TYPE, HeaderMap, HeaderValue as HttpHeaderValue, Method, StatusCode,
-};
+use axum::http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -629,6 +627,7 @@ pub async fn record_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue as HttpHeaderValue;
 
     fn ctx(method: &str, path: &str) -> RequestContext {
         RequestContext {
