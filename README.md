@@ -26,6 +26,7 @@
 - **Scenario Tags** - Keep happy-path and error mocks side by side and switch between them with `MIMIC_ACTIVE_TAGS` or `POST /admin/scenario`
 - **Built-in CORS** - `MIMIC_CORS=true` answers `OPTIONS` preflights automatically and adds the allow-origin header to every mock — no per-endpoint CORS files
 - **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
+- **Proxy / Record-and-Replay** - Forward unmatched requests to a real upstream and optionally save the response as a new mock with `MIMIC_PROXY_UPSTREAM` and `MIMIC_RECORD_UPSTREAM`
 
 ---
 
@@ -165,6 +166,18 @@ MIMIC_CORS_METHODS=GET,POST,PUT,PATCH,DELETE,OPTIONS
 MIMIC_CORS_HEADERS=*
 MIMIC_CORS_CREDENTIALS=false
 MIMIC_CORS_MAX_AGE=600
+
+# Proxy an unmatched request to a real upstream instead of 404ing (default:
+# unset = unchanged 404 behavior). See "Proxy / Record-and-Replay" below.
+MIMIC_PROXY_UPSTREAM=https://api.example.com
+
+# Record proxied responses as new mock files, so the next identical request
+# is replayed from disk (default: false)
+MIMIC_RECORD_UPSTREAM=true
+
+# How long to wait for the upstream before falling back to a 404, in
+# milliseconds (default: 5000)
+MIMIC_PROXY_TIMEOUT_MS=5000
 ```
 
 **Log Levels**:
@@ -1538,6 +1551,57 @@ When there's no example, the schema is walked recursively and each field gets a 
 - **Response keys** may be quoted (`'200'`) or bare (`200`), `default`, or wildcards (`4XX` → `400`).
 - **Only OpenAPI 3.x is supported.** Swagger 2.0 specs are rejected with a clear message — convert first.
 - A malformed spec produces an error and a non-zero exit code, never a panic.
+
+---
+
+## 🔌 Proxy / Record-and-Replay
+
+Point Mimic at a real API once, and it grows a matching mock set for free. When `MIMIC_PROXY_UPSTREAM` is set, a request that matches no local mock is forwarded to that upstream instead of getting the usual `404 "mock not found"` — the real response is returned to the client. Add `MIMIC_RECORD_UPSTREAM=true` and that response is also saved as a new mock file, so the next identical request is served from disk with zero network calls.
+
+```bash
+MIMIC_PROXY_UPSTREAM=https://api.stripe.com MIMIC_RECORD_UPSTREAM=true mimic
+```
+
+```bash
+# First call: no local mock exists, so Mimic forwards to api.stripe.com
+# and returns the live response.
+curl http://localhost:8080/v1/charges/ch_123
+
+# A new file appears at mocks/_recorded/get_v1_charges_ch_123_1.json.
+# The second identical call is served from that file — Stripe never sees it.
+curl http://localhost:8080/v1/charges/ch_123
+```
+
+### Configuration
+
+```bash
+MIMIC_PROXY_UPSTREAM=https://api.example.com   # unset (default) = unchanged 404 behavior
+MIMIC_RECORD_UPSTREAM=false                     # opt-in recording of proxied responses
+MIMIC_PROXY_TIMEOUT_MS=5000                     # how long to wait for the upstream
+```
+
+### What gets recorded
+
+A recorded file uses the exact same shape as any hand-written mock — [`method`, `path`, `status`, `response`](#-mock-examples), plus matchers built from the request that triggered the recording, so the *next* matching request is matched normally rather than through special-cased "recorded" logic:
+
+- **`query_params`** — every query parameter, as an exact match.
+- **`headers`** — every request header, **except**:
+  - sensitive headers (`Authorization`, `Cookie`) — never written to disk, so a recorded mock can't become an accidental secrets store;
+  - headers every mainstream client sends unconditionally (`User-Agent`, `Accept`, `Accept-Encoding`, `Host`, `Connection`, `Content-Length`) — capturing these would make the recording match only the exact tool that happened to trigger it.
+- **`body`** — a JSON, text, or form matcher depending on the request's content type; no matcher at all for an empty body.
+- **`response_headers`** — the upstream's response headers, again with `Set-Cookie` and friends left out.
+
+Files land at `mocks/_recorded/<method>_<sanitized-path>_<n>.json` — e.g. `mocks/_recorded/get_v1_charges_ch_123_1.json` — fully readable and editable like any other mock. They pick up on the next [hot reload](#hot-reload), typically within a couple of seconds.
+
+### Semantics
+
+- **Recording is best-effort and never blocks the response.** The client gets the upstream's response immediately; the mock file is written in the background.
+- **Only text-ish responses are recorded.** JSON, XML, plain text, JavaScript, and form-encoded bodies are recorded; binary responses (images, PDFs, arbitrary `application/octet-stream`) are still proxied to the client but never turned into a mock file — there's no good text representation for a `response` field.
+- **Concurrent identical requests dedupe onto one file.** Several requests with the same method, path, query, (non-noise) headers, and body in flight at once produce exactly one recording, not a race of several.
+- **A repeat of the same request doesn't re-record.** Once a given request shape has been recorded this run, later identical proxy calls (before the file has been hot-reloaded in, or if recording is on but nothing changed) are skipped rather than rewritten.
+- **What Mimic reserves for itself is never proxied.** The health check and the admin API's own endpoints — see [Reserved endpoints](#reserved-endpoints) — are excluded even with no local mock behind them, so `MIMIC_PROXY_UPSTREAM` can't leak them onto the upstream. A path that merely starts with `/admin/` but isn't one Mimic answers (a typo, or an endpoint you're mocking) is an ordinary request and proxies like any other.
+- **Self-referential upstreams are rejected at startup.** An upstream that resolves to Mimic's own listening address (e.g. `MIMIC_PROXY_UPSTREAM=http://localhost:8080` while Mimic itself listens on `8080`) disables proxying with a warning, instead of looping forever.
+- **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`.
 
 ---
 
