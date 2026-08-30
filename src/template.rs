@@ -21,11 +21,21 @@ pub struct TemplateContext<'a> {
 
 fn template_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Matches any `{{ source.key }}` shape; unrecognized sources or missing
-    // keys are resolved to an empty string rather than rejected here, so a
-    // malformed/unknown template never leaks into the response verbatim.
-    RE.get_or_init(|| Regex::new(r"\{\{\s*([a-zA-Z0-9_]+)\.([^{}]+?)\s*\}\}").unwrap())
+    // Matches any `{{ [cast:]source.key }}` shape; unrecognized sources or
+    // missing keys are resolved to an empty string rather than rejected here,
+    // so a malformed/unknown template never leaks into the response verbatim.
+    // The optional cast prefix is deliberately any identifier, not just
+    // `number|bool|json` — an unrecognized cast word (e.g. `{{foo:path.id}}`)
+    // is meant to fall through to the same "resolves to empty" treatment as
+    // an unrecognized source, so it's checked in code rather than the regex.
+    RE.get_or_init(|| {
+        Regex::new(r"\{\{\s*(?:([a-zA-Z0-9_]+)\s*:\s*)?([a-zA-Z0-9_]+)\.([^{}]+?)\s*\}\}").unwrap()
+    })
 }
+
+/// Casts recognized by the `{{cast:source.key}}` syntax. Anything else in the
+/// cast position is treated as an unrecognized/malformed template.
+const KNOWN_CASTS: &[&str] = &["number", "bool", "json"];
 
 /// Render `{{ }}` templates found anywhere in `value`, returning a new JSON value.
 /// If `value` contains no template expressions, it is cloned as-is without
@@ -68,7 +78,7 @@ pub fn text_references_body(text: &str) -> bool {
     text.contains("{{")
         && template_regex()
             .captures_iter(text)
-            .any(|caps| &caps[1] == "body")
+            .any(|caps| &caps[2] == "body")
 }
 
 fn contains_template(value: &Value) -> bool {
@@ -82,7 +92,7 @@ fn contains_template(value: &Value) -> bool {
 
 fn render_value(value: &Value, ctx: &TemplateContext) -> Value {
     match value {
-        Value::String(s) => Value::String(interpolate(s, ctx)),
+        Value::String(s) => render_string(s, ctx),
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| (k.clone(), render_value(v, ctx)))
@@ -93,16 +103,83 @@ fn render_value(value: &Value, ctx: &TemplateContext) -> Value {
     }
 }
 
+/// Render a single string value, taking the typed-cast fast path when `s` is
+/// *exactly* one `{{cast:source.key}}` expression, and falling back to plain
+/// string interpolation otherwise (no cast, or a cast embedded in a larger
+/// string that can't become anything but text).
+fn render_string(s: &str, ctx: &TemplateContext) -> Value {
+    if let Some(caps) = whole_string_template(s) {
+        if let Some(cast) = caps.get(1) {
+            let source = &caps[2];
+            let key = caps[3].trim();
+            return resolve_typed(source, key, cast.as_str(), ctx);
+        }
+    }
+    Value::String(interpolate(s, ctx))
+}
+
+/// If `s` is made up of a single template expression spanning its entire
+/// length, return the captures for it; otherwise `None`.
+fn whole_string_template(s: &str) -> Option<regex::Captures<'_>> {
+    let caps = template_regex().captures(s)?;
+    let m = caps.get(0)?;
+    (m.start() == 0 && m.end() == s.len()).then_some(caps)
+}
+
 fn interpolate(s: &str, ctx: &TemplateContext) -> String {
     if !s.contains("{{") {
         return s.to_string();
     }
 
     template_regex()
-        .replace_all(s, |caps: &regex::Captures| {
-            resolve(&caps[1], caps[2].trim(), ctx).unwrap_or_default()
+        .replace_all(s, |caps: &regex::Captures| match caps.get(1) {
+            // A cast can't survive being spliced into the middle of a larger
+            // string, so it's ignored here and the source resolves exactly as
+            // it would unprefixed — except an unrecognized cast word, which
+            // (like an unrecognized source) resolves to empty.
+            Some(cast) if !KNOWN_CASTS.contains(&cast.as_str()) => String::new(),
+            _ => resolve(&caps[2], caps[3].trim(), ctx).unwrap_or_default(),
         })
         .into_owned()
+}
+
+/// Resolve a `{{cast:source.key}}` expression to a typed JSON value, reusing
+/// [`resolve`] so the cast and plain-interpolation paths can't disagree about
+/// what a source means.
+fn resolve_typed(source: &str, key: &str, cast: &str, ctx: &TemplateContext) -> Value {
+    let raw = resolve(source, key, ctx);
+    match cast {
+        "number" => match raw {
+            Some(s) => parse_number(&s).unwrap_or(Value::String(s)),
+            None => Value::String(String::new()),
+        },
+        "bool" => match raw.as_deref() {
+            Some("true") => Value::Bool(true),
+            Some("false") => Value::Bool(false),
+            Some(s) => Value::String(s.to_string()),
+            None => Value::String(String::new()),
+        },
+        "json" => match raw {
+            Some(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
+            None => Value::Null,
+        },
+        // Unreachable via `render_string`/`interpolate`, which only ever pass
+        // a cast from `KNOWN_CASTS`; kept as a safe default rather than
+        // panicking if that invariant ever slips.
+        _ => Value::String(String::new()),
+    }
+}
+
+/// Parse a resolved string as a JSON number, trying an integer before falling
+/// back to a float so whole numbers don't grow a spurious `.0`.
+fn parse_number(s: &str) -> Option<Value> {
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(Value::from(i));
+    }
+    s.parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
 }
 
 fn resolve(source: &str, key: &str, ctx: &TemplateContext) -> Option<String> {
@@ -475,6 +552,178 @@ mod tests {
         // faker needs nothing from the request.
         let value = json!({"id": "{{faker.uuid}}", "name": "{{faker.name}}"});
         assert!(!references_body(&value));
+    }
+
+    #[test]
+    fn test_number_cast_produces_json_number() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".to_string(), "42".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&path_params, &empty, &empty, None);
+
+        let value = json!({"id": "{{number:path.id}}"});
+        assert_eq!(render_response(&value, &c), json!({"id": 42}));
+    }
+
+    #[test]
+    fn test_bool_cast_produces_json_boolean() {
+        let mut query_params = HashMap::new();
+        query_params.insert("active".to_string(), "true".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&empty, &query_params, &empty, None);
+
+        let value = json!({"active": "{{bool:query.active}}"});
+        assert_eq!(render_response(&value, &c), json!({"active": true}));
+    }
+
+    #[test]
+    fn test_json_cast_produces_nested_object() {
+        let body = ParsedBody::Json(json!({"user": {"id": 1, "name": "alice"}}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"user": "{{json:body.user}}"});
+        assert_eq!(
+            render_response(&value, &c),
+            json!({"user": {"id": 1, "name": "alice"}})
+        );
+    }
+
+    #[test]
+    fn test_number_cast_on_faker_int() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"views": "{{number:faker.int min=1 max=999}}"});
+        let rendered = render_response(&value, &c);
+        let views = rendered["views"].as_i64().expect("number, not string");
+        assert!((1..=999).contains(&views));
+    }
+
+    #[test]
+    fn test_cast_inside_larger_string_stays_plain_interpolation() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".to_string(), "42".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&path_params, &empty, &empty, None);
+
+        let value = json!({"slug": "user-{{number:path.id}}"});
+        assert_eq!(render_response(&value, &c), json!({"slug": "user-42"}));
+    }
+
+    #[test]
+    fn test_uncastable_number_falls_back_to_string_form() {
+        let mut path_params = HashMap::new();
+        path_params.insert("slug".to_string(), "abc".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&path_params, &empty, &empty, None);
+
+        let value = json!({"slug": "{{number:path.slug}}"});
+        assert_eq!(render_response(&value, &c), json!({"slug": "abc"}));
+    }
+
+    #[test]
+    fn test_uncastable_bool_falls_back_to_string_form() {
+        let mut query_params = HashMap::new();
+        query_params.insert("flag".to_string(), "maybe".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&empty, &query_params, &empty, None);
+
+        let value = json!({"flag": "{{bool:query.flag}}"});
+        assert_eq!(render_response(&value, &c), json!({"flag": "maybe"}));
+    }
+
+    #[test]
+    fn test_invalid_json_cast_falls_back_to_string_form() {
+        let mut query_params = HashMap::new();
+        query_params.insert("tag".to_string(), "not-json".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&empty, &query_params, &empty, None);
+
+        let value = json!({"tag": "{{json:query.tag}}"});
+        assert_eq!(render_response(&value, &c), json!({"tag": "not-json"}));
+    }
+
+    #[test]
+    fn test_missing_number_and_bool_cast_fall_back_to_empty_string() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"n": "{{number:query.missing}}", "b": "{{bool:query.missing}}"});
+        assert_eq!(render_response(&value, &c), json!({"n": "", "b": ""}));
+    }
+
+    #[test]
+    fn test_missing_json_cast_yields_null() {
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, None);
+
+        let value = json!({"user": "{{json:body.missing}}"});
+        assert_eq!(render_response(&value, &c), json!({"user": null}));
+    }
+
+    #[test]
+    fn test_unrecognized_cast_prefix_resolves_to_empty_string() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".to_string(), "42".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&path_params, &empty, &empty, None);
+
+        let value = json!({"id": "{{uuid:path.id}}"});
+        assert_eq!(render_response(&value, &c), json!({"id": ""}));
+    }
+
+    #[test]
+    fn test_references_body_detects_json_cast() {
+        let value = json!({"user": "{{json:body.user}}"});
+        assert!(references_body(&value));
+
+        let text = "{{json:body.user}}";
+        assert!(text_references_body(text));
+    }
+
+    #[test]
+    fn test_number_cast_in_sequence_style_response_object() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".to_string(), "7".to_string());
+        let empty = HashMap::new();
+        let c = ctx(&path_params, &empty, &empty, None);
+
+        let value = json!({"step": {"id": "{{number:path.id}}", "done": "{{bool:query.done}}"}});
+        assert_eq!(
+            render_response(&value, &c),
+            json!({"step": {"id": 7, "done": ""}})
+        );
+    }
+
+    #[test]
+    fn test_existing_templates_unaffected_by_cast_support() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".to_string(), "42".to_string());
+        let mut query_params = HashMap::new();
+        query_params.insert("page".to_string(), "2".to_string());
+        let mut headers = HashMap::new();
+        headers.insert("x-actor".to_string(), "admin".to_string());
+        let body = ParsedBody::Json(json!({"username": "alice", "age": 30}));
+        let c = ctx(&path_params, &query_params, &headers, Some(&body));
+
+        let value = json!({
+            "id": "{{path.id}}",
+            "page": "{{query.page}}",
+            "actor": "{{header.x-actor}}",
+            "username": "{{body.username}}",
+            "summary": "{{body.username}} is {{body.age}}"
+        });
+        assert_eq!(
+            render_response(&value, &c),
+            json!({
+                "id": "42",
+                "page": "2",
+                "actor": "admin",
+                "username": "alice",
+                "summary": "alice is 30"
+            })
+        );
     }
 
     #[test]
