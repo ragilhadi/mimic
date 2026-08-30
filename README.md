@@ -27,6 +27,7 @@
 - **Built-in CORS** - `MIMIC_CORS=true` answers `OPTIONS` preflights automatically and adds the allow-origin header to every mock — no per-endpoint CORS files
 - **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
 - **Proxy / Record-and-Replay** - Forward unmatched requests to a real upstream and optionally save the response as a new mock with `MIMIC_PROXY_UPSTREAM` and `MIMIC_RECORD_UPSTREAM`
+- **Typed Template Casts** - `{{number:path.id}}`, `{{bool:query.active}}`, `{{json:body.user}}` render real JSON types instead of quoted strings
 
 ---
 
@@ -1414,12 +1415,60 @@ Notes:
 - Malformed arguments degrade to the generator's defaults instead of failing: `{{faker.int min=abc}}` and `{{faker.int min=100 max=1}}` both use the default `0..=1000000` range.
 - An unknown generator (e.g. `{{faker.credit_card}}`) renders as an empty string, like any other unknown template.
 
+### Typed Casts (opt-in)
+
+By default every templated value is spliced into a JSON *string*, even when
+the source is a number or boolean — `{"id": "{{path.id}}"}` on `GET /users/42`
+renders `{"id": "42"}`, not `{"id": 42}`. That's a hard failure for a typed
+client (`zod`, Go's `encoding/json`, Rust's `serde_json`, Jackson, …), which
+rejects a string where a number or object belongs. Prefix any source
+expression with `number:`, `bool:`, or `json:` to render it as that JSON type
+instead:
+
+| Template | Renders as |
+|---|---|
+| `{{number:path.id}}` | JSON number |
+| `{{bool:query.active}}` | JSON boolean (`true`/`false`) |
+| `{{json:body.user}}` | JSON value parsed from the source (object, array, number, …) |
+
+```json
+{
+  "id": "{{number:path.id}}",
+  "views": "{{number:faker.int min=1 max=999}}",
+  "active": "{{bool:query.active}}",
+  "user": "{{json:body.user}}"
+}
+```
+
+renders `{"id": 42, "views": 317, "active": true, "user": {"name": "alice"}}`
+instead of every field coming back quoted.
+
+Notes:
+
+- **Whole-string only.** A cast applies only when the string is *exactly* one
+  `{{cast:source.key}}` expression. `"user-{{number:path.id}}"` stays plain
+  string interpolation — a number can't be spliced into the middle of a
+  string and still be a number — and renders `"user-42"`.
+- **Failed casts degrade, never panic.** `{{number:path.slug}}` on
+  `/users/abc` falls back to the plain string `"abc"`, and `{{json:query.x}}`
+  on a value that isn't valid JSON falls back the same way.
+- **Null handling differs by cast.** `{{json:body.missing}}` on a field that
+  wasn't sent renders JSON `null`; `{{number:...}}` and `{{bool:...}}` fall
+  back to an empty string on a missing key, same as an unprefixed template.
+- An unrecognized cast word (anything other than `number`, `bool`, or `json`)
+  resolves to an empty string, the same as an unrecognized source.
+- Works everywhere templates work — `response`, sequence step responses, and
+  with every source (`path`, `query`, `header`, `body`, `faker`) — and never
+  affects matching, since templates (casts included) are resolved after a
+  mock is already chosen.
+
 ### Semantics
 
 - Templates are resolved after the mock/sequence step is chosen, so the interpolated value never affects matching itself — `{{faker.*}}` included, so a faker expression sitting in a matcher is treated as a literal string.
 - An unknown source, a missing key, or an explicit JSON `null` all resolve to an empty string — malformed templates never panic and never leak into the response.
 - Non-string body values (numbers, booleans, nested objects/arrays) render using their JSON text form, e.g. `{{body.age}}` for `{"age": 30}` produces `30`.
 - A response with no `{{ }}` expressions is returned unchanged with no templating overhead.
+- See [Typed Casts](#typed-casts-opt-in) above for opt-in `{{number:x}}` / `{{bool:x}}` / `{{json:x}}` output.
 
 ---
 
@@ -2332,6 +2381,7 @@ Built with:
 - [x] Dynamic response templating (`{{query.x}}`, `{{header.x}}`, `{{body.x}}`, `{{path.x}}`)
 - [x] Path parameter matching (`:id`, `{id}` syntax)
 - [x] Faker-style random data generators (`{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int}}`, …)
+- [x] Typed template casts (`{{number:x}}`, `{{bool:x}}`, `{{json:x}}`)
 - [x] Built-in CORS with automatic `OPTIONS` preflight handling (`MIMIC_CORS=true`)
 
 ---
