@@ -79,6 +79,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
 .new-banner{display:none;margin-bottom:.75rem;padding:.45rem .9rem;border-radius:6px;background:var(--accent);color:#fff;font-size:.82rem;cursor:pointer;border:none;font-family:inherit;font-weight:500}
 .new-banner.visible{display:block}
 .paused-note{font-size:.75rem;color:var(--muted);margin-left:.5rem}
+.load-more{text-align:center;margin-top:.75rem}
 .toast{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:.5rem 1rem;border-radius:6px;font-size:.82rem;opacity:0;pointer-events:none;transition:opacity .2s}
 .toast.visible{opacity:1}
 @media(max-width:900px){
@@ -142,6 +143,9 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     </div>
     <button class="new-banner" id="new-banner"></button>
     <div id="requests-container"></div>
+    <div class="load-more" id="requests-load-more" hidden>
+      <button class="btn btn-outline" id="btn-load-more">Load older requests</button>
+    </div>
   </section>
 
   <!-- ── Mocks ────────────────────────────────────────────────────────── -->
@@ -179,6 +183,10 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   var API_RESET     = '/admin/sequences/reset';
   var API_HEALTH    = '/health';
   var REFRESH_INTERVAL_MS = 3000;
+  // The page size /admin/requests defaults to server-side (#111) — kept in
+  // sync here so "Load older" grows by the same increment the first page
+  // already used.
+  var DEFAULT_PAGE_LIMIT = 50;
 
   var refreshTimer = null;
   var activeTab = 'requests';
@@ -187,11 +195,16 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   // selecting survive a refresh.
   var rows = {};
   var expanded = {};
-  var lastQuery = null;
+  var lastFilterKey = null;
   var pointerOverTable = false;
   var pendingRecords = null;
+  var pendingTotal = 0;
   var lastRecords = [];
   var mocksCache = [];
+  // How many of the most recent matching requests to fetch. Grows via "Load
+  // older requests" rather than jumping straight to everything (#111) — a
+  // filter change resets it back to the default.
+  var pageLimit = DEFAULT_PAGE_LIMIT;
 
   function qs(id){ return document.getElementById(id); }
 
@@ -227,8 +240,11 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   }
   function formatPairs(pairs){
     if(!pairs || Object.keys(pairs).length===0) return dash();
+    // A query param's value is a list of every occurrence the client sent
+    // (#108) — a plain string is accepted too, for a log written before that.
     return Object.keys(pairs).sort().map(function(k){
-      return escapeHtml(k)+'='+escapeHtml(pairs[k]);
+      var values = Array.isArray(pairs[k]) ? pairs[k] : [pairs[k]];
+      return escapeHtml(k)+'='+values.map(escapeHtml).join(', ');
     }).join('\n');
   }
   function formatDuration(seconds){
@@ -301,7 +317,11 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   }
 
   // ── requests tab ────────────────────────────────────────────────────
-  function buildRequestsUrl(){
+
+  // The filter part of the URL only — used to tell "the same view, more
+  // results" (a growing pageLimit) apart from "a different view entirely"
+  // (a changed box), which need different reactions from fetchRequests.
+  function requestFilterParams(){
     var params = [];
     var path = qs('filter-path').value.trim();
     var method = qs('filter-method').value;
@@ -312,14 +332,27 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     if(status) params.push('status='+encodeURIComponent(status));
     if(search) params.push('search='+encodeURIComponent(search));
     if(qs('filter-unmatched').checked) params.push('unmatched_only=true');
-    return API_REQUESTS + (params.length ? '?'+params.join('&') : '');
+    return params;
+  }
+
+  // `limit` lets a caller ask for a specific page size — `0` for "every
+  // match", used by Export log — overriding the incrementally-growing
+  // `pageLimit` normal polling uses.
+  function buildRequestsUrl(limit){
+    var params = requestFilterParams();
+    params.push('limit=' + (limit === undefined ? pageLimit : limit));
+    return API_REQUESTS + '?' + params.join('&');
   }
 
   function curlFor(r){
     var parts = ['curl -X ' + r.method];
     var url = window.location.origin + r.path;
-    var query = Object.keys(r.query_params || {}).map(function(k){
-      return encodeURIComponent(k)+'='+encodeURIComponent(r.query_params[k]);
+    var query = [];
+    Object.keys(r.query_params || {}).forEach(function(k){
+      var values = Array.isArray(r.query_params[k]) ? r.query_params[k] : [r.query_params[k]];
+      values.forEach(function(v){
+        query.push(encodeURIComponent(k)+'='+encodeURIComponent(v));
+      });
     });
     if(query.length) url += '?' + query.join('&');
     Object.keys(r.headers || {}).sort().forEach(function(k){
@@ -436,19 +469,25 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     qs('paused-note').hidden = !(pointerOverTable && qs('auto-refresh').checked);
   }
 
-  function applyRequests(records){
+  // `total` is every match on the server, independent of how many of them
+  // this page actually fetched (#111) — the "Shown" stat reads this, not
+  // records.length, so it still reads "1000" even though only a page of
+  // rows renders.
+  function applyRequests(records, total){
     lastRecords = records;
     var container = qs('requests-container');
-    var total = records.length;
     var matched = records.filter(function(r){ return r.matched_mock; }).length;
     qs('stat-total').textContent = total;
     qs('stat-matched').textContent = matched;
-    qs('stat-unmatched').textContent = total - matched;
+    qs('stat-unmatched').textContent = records.length - matched;
+    updateLoadMoreButton(total, records.length);
 
-    if(total === 0){
+    if(records.length === 0){
       rows = {};
-      container.innerHTML = '<div class="empty-state"><p>No requests recorded yet.</p>'
-        + '<p>Send requests to your mock endpoints and they will appear here.</p></div>';
+      container.innerHTML = total === 0
+        ? '<div class="empty-state"><p>No requests recorded yet.</p>'
+          + '<p>Send requests to your mock endpoints and they will appear here.</p></div>'
+        : '<div class="empty-state"><p>Nothing in this page.</p></div>';
       return;
     }
 
@@ -480,29 +519,40 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     });
   }
 
+  // Visible only while the current page hasn't already loaded every match —
+  // clicking it grows `pageLimit` and re-fetches, which is a superset of
+  // what's already shown (nothing already on screen ever disappears).
+  function updateLoadMoreButton(total, shown){
+    qs('requests-load-more').hidden = shown >= total;
+  }
+
   function flushPending(){
     if(!pendingRecords) return;
     var records = pendingRecords;
+    var total = pendingTotal;
     pendingRecords = null;
     qs('new-banner').classList.remove('visible');
-    applyRequests(records);
+    applyRequests(records, total);
   }
 
   function fetchRequests(){
-    var url = buildRequestsUrl();
-    if(url !== lastQuery){
+    var key = requestFilterParams().join('&');
+    if(key !== lastFilterKey){
       // A changed filter means a different result set, not more of the same —
-      // start the table over rather than diffing against the old one.
-      lastQuery = url;
+      // start the table over and go back to the default page size, rather
+      // than diffing against (or trying to grow) the old view.
+      lastFilterKey = key;
+      pageLimit = DEFAULT_PAGE_LIMIT;
       rows = {};
       pendingRecords = null;
       qs('new-banner').classList.remove('visible');
       qs('requests-container').innerHTML = '';
     }
-    return fetch(url)
+    return fetch(buildRequestsUrl())
       .then(function(res){ return res.json(); })
       .then(function(data){
         var records = data.requests || [];
+        var total = data.count || 0;
         if(pointerOverTable && Object.keys(rows).length){
           var added = records.filter(function(r){ return !rows[r.id]; }).length;
           var removed = Object.keys(rows).filter(function(id){
@@ -510,6 +560,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
           }).length;
           if(added || removed){
             pendingRecords = records;
+            pendingTotal = total;
             var banner = qs('new-banner');
             banner.textContent = added
               ? '↑ ' + added + ' new request' + (added === 1 ? '' : 's') + ' — click to show'
@@ -518,12 +569,17 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
           }
           return;
         }
-        applyRequests(records);
+        applyRequests(records, total);
       })
       .catch(function(err){ console.error('Failed to fetch requests:', err); });
   }
 
   qs('new-banner').addEventListener('click', flushPending);
+
+  qs('btn-load-more').addEventListener('click', function(){
+    pageLimit += DEFAULT_PAGE_LIMIT;
+    fetchRequests();
+  });
 
   function clearHistory(){
     if(!confirm('Clear all recorded requests?')) return;
@@ -532,6 +588,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
         expanded = {};
         rows = {};
         pendingRecords = null;
+        pageLimit = DEFAULT_PAGE_LIMIT;
         qs('new-banner').classList.remove('visible');
         qs('requests-container').innerHTML = '';
         fetchRequests();
@@ -539,8 +596,21 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
       .catch(function(err){ console.error('Failed to clear requests:', err); });
   }
 
+  // Exports every match, not just the loaded page (#111) — a fresh request
+  // with limit=0, independent of whatever pageLimit the table is currently
+  // showing.
   function exportLog(){
-    var blob = new Blob([JSON.stringify(lastRecords, null, 2)], {type:'application/json'});
+    fetch(buildRequestsUrl(0))
+      .then(function(res){ return res.json(); })
+      .then(function(data){ downloadLog(data.requests || []); })
+      .catch(function(err){
+        console.error('Failed to export requests:', err);
+        toast('Export failed — see console');
+      });
+  }
+
+  function downloadLog(records){
+    var blob = new Blob([JSON.stringify(records, null, 2)], {type:'application/json'});
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;

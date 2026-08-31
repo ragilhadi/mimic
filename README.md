@@ -235,7 +235,11 @@ INFO mimic: Loaded 31 mock(s)
 **Fields:**
 - `method` - HTTP method (GET, POST, PUT, DELETE, PATCH, etc.)
 - `path` - URL path (e.g., `/users`, `/api/v1/products`)
-- `status` - HTTP status code (200, 201, 404, 500, etc.)
+- `status` - HTTP status code, 100–599 (200, 201, 404, 500, etc.). A value
+  outside that range can't be put on the wire; Mimic serves `200 OK` instead,
+  warns at load time naming the file, and marks the mock `"servable": false`
+  in `GET /admin/mocks` — the request log always records what was actually
+  served, never the out-of-range number from the file.
 - `response` - JSON response body (can be object, array, or null)
 - `response_file` - (Optional) Serve the body from a file next to the mock instead of `response`; see [File-Backed Responses](#-file-backed-responses-response_file)
 - `template` - (Optional) Boolean enabling `{{...}}` templating inside a `response_file` body (default: `false`)
@@ -290,6 +294,26 @@ a restart. **Failures are isolated per file**: if one file has invalid JSON —
 an editor mid-save, a teammate's work-in-progress in a shared mocks directory —
 every other file in that cycle still applies. A single typo can no longer block
 unrelated mock changes from taking effect.
+
+**A cycle where nothing changed does no file I/O.** Each mock file — and each
+`response_file` it references — is fingerprinted by modified time and size;
+unchanged since the last cycle means it's neither re-read nor re-parsed, and
+the mock store's write lock isn't even taken. Editing a file, adding one,
+deleting one, or renaming one is still picked up within the same 2-second
+window it always was, and editing a `response_file` fixture is detected even
+when the mock file that references it isn't touched. A symlink that resolves
+back into the mocks tree — directly, or through a shared-fixtures setup in a
+monorepo — is walked once and reported, rather than registering its mocks
+over and over on every cycle.
+
+Change detection is a dependency-free `stat`-based check rather than
+filesystem-event watching (`notify` or similar): it costs at most one `stat`
+per file per idle cycle, needs no OS-specific watch API, and degrades the same
+way on every platform and every filesystem (including inside a container with
+a bind-mounted mocks directory, where inotify events don't always cross the
+mount). The trade-off is a reload triggered by a `stat` sweep rather than an
+instantaneous filesystem event — invisible at the 2-second cadence Mimic
+already reloads on.
 
 The broken file's own route is not dropped, either. It keeps serving its
 last successfully-loaded response until the file parses again, so routes don't
@@ -572,7 +596,28 @@ curl "http://localhost:8080/search?q=wrong&page=1"  # Returns 404
 - **Exact match**: `"param": "value"`
 - **Regex match**: `"param": {"regex": "^pattern$"}`
 - **Any value**: `"param": {"any": null}` (param must exist)
-- **Strict mode**: `"strict": true` (rejects extra params)
+- **Strict mode**: `"strict": true` (rejects extra params — a repeated key
+  still counts as one param, not one per value)
+
+**Repeated keys** (`?tag=a&tag=b`, `?ids=1&ids=2`) — the standard encoding for
+a list-valued parameter, and what `URLSearchParams`, axios, Go's `url.Values`,
+and an OpenAPI `explode: true` array parameter all emit:
+
+- `"param": "value"` and `{{query.param}}` both read the parameter's **first**
+  value only — a mock written before repeated keys were matchable keeps
+  meaning exactly what it always did.
+- `"param": {"contains": "value"}` matches if *any* occurrence of the key
+  equals `value`.
+- `"param": {"list": ["a", "b"]}` matches only the exact, ordered set of
+  values the key carried — `?tag=a&tag=b` matches `["a", "b"]`, not `["b",
+  "a"]` or `["a"]` alone.
+- `GET /admin/requests` and the dashboard report every value a repeated key
+  carried, in the order sent, as a list — `{"tag": ["a", "b"]}` — rather than
+  silently keeping only the last one.
+
+A repeated field in an `application/x-www-form-urlencoded` body (`opt=a&opt=b`)
+gets the same first-value treatment as `{{query.param}}` for `body` matchers
+and templating.
 
 ### Header Matching
 
@@ -814,10 +859,24 @@ earliest position among mocks sharing that key. The winner never depends on
 load order, so it stays the same across restarts and hot reloads. See
 [ADVANCED_MATCHING.md](ADVANCED_MATCHING.md#match-priority) for details.
 
-**Strict header mode** (`"strict": true`) ignores headers every HTTP client
-sends by default — `accept`, `accept-encoding`, `connection`, `content-length`,
-`host`, `user-agent` — so a plain `curl` request isn't rejected for headers you
-never asked about.
+**Strict header mode** (`"strict": true`) rejects a request that carries a
+header the mock didn't declare in `required` — but a long list of headers
+never count as "extra", because a client sends them unconditionally and no
+mock is ever written to assert on them:
+
+- `accept`, `accept-encoding`, `accept-language`, `cache-control`,
+  `connection`, `content-length`, `dnt`, `host`, `origin`, `pragma`,
+  `referer`, `upgrade-insecure-requests`, `user-agent`
+- anything starting with `sec-` — `sec-fetch-mode`, `sec-fetch-site`,
+  `sec-ch-ua`, `sec-ch-ua-platform`, and whatever browsers add to that family
+  next, matched by prefix rather than enumerated by name
+
+That's enough for `curl` and for a browser's `fetch()` alike — a strict mock
+that passes from `curl` no longer 404s from the browser it was actually
+written to test. A header your client sends that isn't on this list —
+`MIMIC_STRICT_IGNORE_HEADERS=x-request-id,x-correlation-id` (comma-separated,
+additive) — extends it without a release. Anything else undeclared, like
+`x-tenant: acme`, is still rejected; strict mode keeps meaning something.
 
 ---
 
@@ -1102,6 +1161,13 @@ access-control-max-age: 600
   request origin instead and warns once at startup.
 - Matching is untouched: CORS headers are added to the response, never to the
   request the matcher sees.
+- **Mimic's own error responses carry the headers too.** The `mock not found`
+  404, the `payload too large` 413, the admin API's 401, and both proxy
+  fallback outcomes all get the same `Access-Control-Allow-Origin` (and
+  friends) a matched mock would — so a request to a path you forgot to mock
+  reads as a 404 in the browser console, not as an opaque CORS failure. A
+  proxied response that already carries its own `Access-Control-Allow-Origin`
+  from upstream keeps it.
 
 ---
 
@@ -1627,6 +1693,7 @@ curl http://localhost:8080/v1/charges/ch_123
 MIMIC_PROXY_UPSTREAM=https://api.example.com   # unset (default) = unchanged 404 behavior
 MIMIC_RECORD_UPSTREAM=false                     # opt-in recording of proxied responses
 MIMIC_PROXY_TIMEOUT_MS=5000                     # how long to wait for the upstream
+MIMIC_RECORD_MATCH_HEADERS=                     # extra request headers to pin as matchers (comma-separated)
 ```
 
 ### What gets recorded
@@ -1634,11 +1701,20 @@ MIMIC_PROXY_TIMEOUT_MS=5000                     # how long to wait for the upstr
 A recorded file uses the exact same shape as any hand-written mock — [`method`, `path`, `status`, `response`](#-mock-examples), plus matchers built from the request that triggered the recording, so the *next* matching request is matched normally rather than through special-cased "recorded" logic:
 
 - **`query_params`** — every query parameter, as an exact match.
-- **`headers`** — every request header, **except**:
-  - sensitive headers (`Authorization`, `Cookie`) — never written to disk, so a recorded mock can't become an accidental secrets store;
-  - headers every mainstream client sends unconditionally (`User-Agent`, `Accept`, `Accept-Encoding`, `Host`, `Connection`, `Content-Length`) — capturing these would make the recording match only the exact tool that happened to trigger it.
+- **`headers`** — an **allowlist**, not everything the client sent: only
+  `content-type` by default, plus whatever `MIMIC_RECORD_MATCH_HEADERS`
+  names (comma-separated, e.g. `x-tenant,accept`). Everything else — trace
+  and correlation ids (`x-request-id`, `traceparent`), browser headers
+  (`origin`, `referer`, `accept-language`, `sec-fetch-*`, `sec-ch-ua*`), and
+  any other header the client happened to send — is left out, and sensitive
+  headers (`Authorization`, `Cookie`) never make it in regardless of what's
+  configured. This is why: most of those headers vary on every request from
+  a real client, and pinning them as `required` used to mean a recording
+  matched only the one request that created it — see #105. Widen the list
+  only for an API that genuinely varies its response by a header your
+  workflow needs to distinguish.
 - **`body`** — a JSON, text, or form matcher depending on the request's content type; no matcher at all for an empty body.
-- **`response_headers`** — the upstream's response headers, again with `Set-Cookie` and friends left out.
+- **`response_headers`** — the upstream's response headers, with `Set-Cookie` and friends left out, and `date`/`server` dropped too — a replay must not re-serve the timestamp of the original exchange.
 
 Files land at `mocks/_recorded/<method>_<sanitized-path>_<n>.json` — e.g. `mocks/_recorded/get_v1_charges_ch_123_1.json` — fully readable and editable like any other mock. They pick up on the next [hot reload](#hot-reload), typically within a couple of seconds.
 
@@ -1651,6 +1727,7 @@ Files land at `mocks/_recorded/<method>_<sanitized-path>_<n>.json` — e.g. `moc
 - **What Mimic reserves for itself is never proxied.** The health check and the admin API's own endpoints — see [Reserved endpoints](#reserved-endpoints) — are excluded even with no local mock behind them, so `MIMIC_PROXY_UPSTREAM` can't leak them onto the upstream. A path that merely starts with `/admin/` but isn't one Mimic answers (a typo, or an endpoint you're mocking) is an ordinary request and proxies like any other.
 - **Self-referential upstreams are rejected at startup.** An upstream that resolves to Mimic's own listening address (e.g. `MIMIC_PROXY_UPSTREAM=http://localhost:8080` while Mimic itself listens on `8080`) disables proxying with a warning, instead of looping forever.
 - **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`.
+- **A gzip/deflate/brotli-compressed upstream response is decoded before it's forwarded or recorded** (#106) — Mimic's HTTP client decompresses these automatically, so both the live response the client gets and the recorded mock's `response` are plain text/JSON, never the raw compressed bytes a previous version could silently mangle into mojibake. This costs a modestly larger binary (three extra decompression codecs statically linked in); worth it for a proxy whose whole job is to be transparent about what an upstream actually said. An encoding this build doesn't recognize (anything outside gzip/deflate/brotli) is left exactly as the upstream sent it — forwarded to the client unchanged, and skipped from recording (with a `warn!`) rather than written as a corrupt mock.
 
 ---
 
@@ -1720,7 +1797,14 @@ All of them are query parameters on `/admin/requests`, so they work from
 - **Auto-refresh appends** new rows rather than rebuilding the table, and
   **pauses while the pointer is over it** — new requests collect behind a
   "*N* new requests" banner instead of shifting the row you're reading.
-- **Copy as curl** per row, and **Export log** for the whole filtered view.
+- **Paginated, not everything at once** (#111): the table loads the 50 most
+  recent matches, with a **Load older requests** button underneath to fetch
+  further back. The "Shown" stat reads the *total* matching the current
+  filters, even though only a page of rows is actually rendered — the
+  dashboard itself is what used to have to re-fetch and re-render the whole
+  log on every refresh tick.
+- **Copy as curl** per row, and **Export log** for the whole filtered
+  view — regardless of how much of it is currently paged in.
 - **Theme** follows `prefers-color-scheme`, with a manual toggle that sticks.
 - **Redaction**: see [What the request log keeps](#what-the-request-log-keeps)
   — headers *and* body fields are scrubbed by default.
@@ -2150,10 +2234,15 @@ all return JSON — the dashboard is just one client of them.
 | `status` | Exact code (`404`) or class (`4xx`, `5xx`) |
 | `unmatched_only` | `true`/`1`/`yes` — only requests no mock served |
 | `search` | Case-insensitive text search over body, headers and query params |
+| `limit` | How many matches to return, applied *after* every filter above. Defaults to `50`; `limit=0` returns every match, the pre-#111 behavior |
+| `offset` | How many of the most recent matches to skip before taking `limit` — `offset=0` (the default) is the newest page |
 
 ```bash
 # Every 4xx whose path mentions "user" and that nothing matched
 curl "http://localhost:8080/admin/requests?path=user&status=4xx&unmatched_only=true"
+
+# The 50 requests immediately before the most recent 50
+curl "http://localhost:8080/admin/requests?limit=50&offset=50"
 ```
 
 Each record carries the request as before, plus — when there is something to
@@ -2165,7 +2254,7 @@ report — the response served and the match diagnosis:
   "timestamp": "2026-08-07T10:15:04Z",
   "method": "GET",
   "path": "/users/42",
-  "query_params": {},
+  "query_params": { "fields": ["id", "name"] },
   "headers": { "accept": "application/json", "authorization": "[REDACTED]" },
   "matched_mock": "GET:/users/42",
   "response_status": 200,
@@ -2179,6 +2268,36 @@ report — the response served and the match diagnosis:
 
 Every field after `response_status` is additive and omitted when empty, so
 existing consumers of this endpoint keep working unchanged.
+
+`query_params` is one exception (#108): each value is now a **list** of
+every occurrence that key had in the request, in order — `?fields=id&fields=name`
+is `{"fields": ["id", "name"]}`, and a key sent once is still a one-element
+list, `{"page": ["1"]}`. Previously a repeated key silently collapsed to its
+last value and the field was a plain string per key; a request log written by
+that older Mimic still loads, with each value wrapped into a one-element list.
+
+**Pagination (#111).** The top level of the response carries a page of
+`requests` plus enough to know there's more:
+
+```json
+{
+  "count": 1000,
+  "returned": 50,
+  "limit": 50,
+  "offset": 0,
+  "requests": [ /* the 50 most recent matches */ ]
+}
+```
+
+`count` keeps meaning exactly what it always has — the total number of
+requests matching the filters — so a consumer that reads it for "how many
+matched" sees the same number as before. `requests` is now a *page* of that
+total rather than always all of it: the previous version returned every
+match in one response, which meant a busy server's `/admin/requests` could
+approach tens of megabytes and the dashboard re-fetched all of it every few
+seconds. `returned` is `requests.length`, for a consumer that wants it
+without counting. Ask for `limit=0` to get the old everything-in-one-response
+behavior back.
 
 ##### `GET /admin/mocks`
 

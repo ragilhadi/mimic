@@ -14,6 +14,76 @@ pub struct LoadResult {
 }
 
 // ============================================================================
+// Hot-reload change detection (#110)
+// ============================================================================
+
+/// A cheap stand-in for "have this file's bytes changed since I last read
+/// it?" — its modified time and length, both already free with every `stat`
+/// call the walk makes anyway.
+///
+/// Not foolproof (a same-second edit that happens to leave the length
+/// unchanged is a known gap of mtime+size schemes generally), but it's
+/// dependency-free and turns an unconditional re-read into a re-read only
+/// when something plausibly changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+impl FileFingerprint {
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+        })
+    }
+}
+
+/// A mock file's last successful parse, plus the fingerprints of every
+/// fixture it depends on — so a `response_file` edit is detected even though
+/// the mock file that references it hasn't changed.
+struct CachedMock {
+    fingerprint: FileFingerprint,
+    fixture_fingerprints: Vec<(PathBuf, FileFingerprint)>,
+    outcome: LoadedMock,
+}
+
+/// Cross-cycle state a hot-reload loop carries so it can skip re-reading and
+/// re-parsing whatever hasn't changed.
+///
+/// Owned by the caller (the reload task in `main.rs`) and threaded through
+/// [`load_mocks_map_hot_reload`] on every cycle. A fresh, empty cache makes
+/// every file a cache miss — which is exactly [`load_mocks_map`]'s always-read
+/// behavior, so that function is implemented as "call the cached path with a
+/// cache nobody keeps."
+#[derive(Default)]
+pub struct LoaderCache {
+    files: HashMap<PathBuf, CachedMock>,
+    /// Fixture bytes, keyed by canonical path rather than by the mock that
+    /// references them — so two mocks sharing a fixture, or the same mock
+    /// file across cycles, reuse one read.
+    fixtures: HashMap<PathBuf, (FileFingerprint, Bytes)>,
+}
+
+impl LoaderCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A hot-reload cycle's outcome: the loaded mock set, and whether anything
+/// actually changed since the cache's last cycle.
+///
+/// `changed` is what lets the caller skip taking the mock store's write lock
+/// — and re-running the shadowed-mock check and sequence-state pruning that
+/// follow it — on a cycle where nothing did.
+pub struct ReloadOutcome {
+    pub result: LoadResult,
+    pub changed: bool,
+}
+
+// ============================================================================
 // response_file limits
 // ============================================================================
 
@@ -52,6 +122,7 @@ pub fn max_response_file_size() -> u64 {
 /// mock. Fixtures live inside the mocks root — the containment check requires
 /// it — so a `.json` fixture would otherwise be picked up by the walk and
 /// reported as a mock file that failed to parse.
+#[derive(Clone)]
 struct LoadedMock {
     mock: MockConfig,
     /// Canonical paths of the files this mock serves its bodies from.
@@ -172,14 +243,46 @@ pub fn load_mocks_map(path: &str) -> LoadResult {
 
 /// [`load_mocks_map`] with the `response_file` size cap injected, so the cap
 /// can be exercised without a process-wide environment variable.
+///
+/// Implemented on top of the same cached walk [`load_mocks_map_hot_reload`]
+/// uses: a cache nobody keeps between calls is empty on every call, which
+/// makes every file a miss and every file get (re-)read — this function's
+/// contract, unchanged.
 pub fn load_mocks_map_with_limit(path: &str, max_response_file: u64) -> LoadResult {
+    let mut cache = LoaderCache::new();
+    load_mocks_map_core(path, max_response_file, &mut cache).result
+}
+
+/// Reload for a long-lived hot-reload loop: `cache` carries fingerprints and
+/// fixture bytes forward from the previous cycle, so a file whose `stat`
+/// hasn't changed is neither re-read nor re-parsed, and [`ReloadOutcome::changed`]
+/// tells the caller whether the mock store needs updating at all.
+///
+/// Uses the process-wide [`max_response_file_size`] cap, matching
+/// [`load_mocks_map`].
+pub fn load_mocks_map_hot_reload(path: &str, cache: &mut LoaderCache) -> ReloadOutcome {
+    load_mocks_map_core(path, max_response_file_size(), cache)
+}
+
+/// The walk both [`load_mocks_map_with_limit`] and [`load_mocks_map_hot_reload`]
+/// share; only whether `cache` survives past this one call differs between them.
+fn load_mocks_map_core(
+    path: &str,
+    max_response_file: u64,
+    cache: &mut LoaderCache,
+) -> ReloadOutcome {
     let path_obj = Path::new(path);
 
     if !path_obj.exists() {
         warn!("Mock path does not exist: {}", path);
-        return LoadResult {
-            mocks: HashMap::new(),
-            errors: 1,
+        let was_populated = !cache.files.is_empty();
+        cache.files.clear();
+        return ReloadOutcome {
+            result: LoadResult {
+                mocks: HashMap::new(),
+                errors: 1,
+            },
+            changed: was_populated,
         };
     }
 
@@ -192,22 +295,41 @@ pub fn load_mocks_map_with_limit(path: &str, max_response_file: u64) -> LoadResu
     };
     let root = root.canonicalize().unwrap_or(root);
 
-    // Pass one: read every candidate file, in a fixed order.
+    // Pass one: read every candidate file, in a fixed order — skipping
+    // whatever `cache` says is unchanged since last time.
     let mut scanned: Vec<(PathBuf, Result<LoadedMock, String>)> = Vec::new();
     let mut errors: usize = 0;
+    let mut changed = false;
+    // Every mock-candidate file seen this cycle, so a file that vanished
+    // (deleted or renamed away) can be dropped from `cache` afterward instead
+    // of lingering there forever.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     if path_obj.is_file() {
-        scanned.push((
-            path_obj.to_path_buf(),
-            load_single_mock(path_obj, &root, max_response_file),
-        ));
+        seen.insert(path_obj.to_path_buf());
+        let outcome =
+            load_single_mock_maybe_cached(path_obj, &root, max_response_file, cache, &mut changed);
+        scanned.push((path_obj.to_path_buf(), outcome));
     } else if path_obj.is_dir() {
-        collect_json_files(
-            path_obj,
-            &root,
-            max_response_file,
-            &mut scanned,
-            &mut errors,
-        );
+        // Seeded with the root itself: a symlink that resolves back to the
+        // directory the walk started from (`mocks/sub/loop -> ..`) is a cycle
+        // even though the walk hasn't "visited" it as a subdirectory yet.
+        let mut visited = HashSet::new();
+        visited.insert(root.clone());
+        let mut state = ScanState {
+            scanned: &mut scanned,
+            errors: &mut errors,
+            visited: &mut visited,
+            cache,
+            changed: &mut changed,
+            seen: &mut seen,
+        };
+        collect_json_files(path_obj, &root, max_response_file, &mut state, 0);
+    }
+
+    let before = cache.files.len();
+    cache.files.retain(|file, _| seen.contains(file));
+    if cache.files.len() != before {
+        changed = true;
     }
 
     // Every file claimed as a fixture by a mock that loaded. A fixture is
@@ -258,7 +380,15 @@ pub fn load_mocks_map_with_limit(path: &str, max_response_file: u64) -> LoadResu
         }
     }
 
-    LoadResult { mocks, errors }
+    ReloadOutcome {
+        result: LoadResult { mocks, errors },
+        // A file that fails to parse isn't cached (see
+        // `load_single_mock_maybe_cached`), so it's retried — and `errors`
+        // stays nonzero — every cycle until it's fixed or removed. Treating
+        // that as "changed" every time matches `apply_reload`'s existing
+        // carry-forward behavior, which already re-runs on every such cycle.
+        changed: changed || errors > 0,
+    }
 }
 
 /// Loads mock configurations from a directory or file.
@@ -284,18 +414,50 @@ pub fn load_mocks(path: &str) -> MockStore {
 /// counter. Sorting makes bucket order a pure function of the file names:
 /// depth-first, alphabetical by full path, with a subdirectory visited at the
 /// point its own name sorts in.
+/// How many directory levels the walk follows before giving up and reporting
+/// a cycle rather than continuing silently.
+///
+/// This is a backstop for whatever `visited` can't catch — a dangling or
+/// otherwise uncanonicalizable symlink — not a limit any real mocks tree
+/// should come near. `visited`, keyed by canonical path, is what actually
+/// stops an ordinary symlink cycle after one extra level.
+const MAX_WALK_DEPTH: usize = 64;
+
+/// Everything one level of [`collect_json_files`]'s recursion needs, bundled
+/// so adding a cross-cycle concern (the cache, the change flag) doesn't mean
+/// adding another positional parameter to every recursive call.
+struct ScanState<'a> {
+    scanned: &'a mut Vec<(PathBuf, Result<LoadedMock, String>)>,
+    errors: &'a mut usize,
+    visited: &'a mut HashSet<PathBuf>,
+    cache: &'a mut LoaderCache,
+    changed: &'a mut bool,
+    seen: &'a mut HashSet<PathBuf>,
+}
+
 fn collect_json_files(
     dir: &Path,
     root: &Path,
     max_response_file: u64,
-    scanned: &mut Vec<(PathBuf, Result<LoadedMock, String>)>,
-    errors: &mut usize,
+    state: &mut ScanState,
+    depth: usize,
 ) {
+    if depth > MAX_WALK_DEPTH {
+        error!(
+            "Mocks directory walk exceeded {} levels at {}; stopping here \
+             (an unresolvable symlink cycle?)",
+            MAX_WALK_DEPTH,
+            dir.display()
+        );
+        *state.errors += 1;
+        return;
+    }
+
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
             error!("Failed to read directory {}: {}", dir.display(), e);
-            *errors += 1;
+            *state.errors += 1;
             return;
         }
     };
@@ -305,14 +467,112 @@ fn collect_json_files(
 
     for entry_path in paths {
         if entry_path.is_dir() {
-            collect_json_files(&entry_path, root, max_response_file, scanned, errors);
+            // Canonicalizing resolves the symlink (if any) to the real
+            // directory it names, so two different links to the same target
+            // — or a link back to an ancestor — collide on the same key.
+            // A path canonicalize can't resolve just isn't deduplicated; the
+            // depth check above still bounds it.
+            let canonical = entry_path
+                .canonicalize()
+                .unwrap_or_else(|_| entry_path.clone());
+            if !state.visited.insert(canonical.clone()) {
+                warn!(
+                    "Symlink cycle detected: {} has already been walked (as {}); \
+                     skipping to avoid loading its mocks again",
+                    entry_path.display(),
+                    canonical.display()
+                );
+                continue;
+            }
+            collect_json_files(&entry_path, root, max_response_file, state, depth + 1);
         } else if entry_path.is_file()
             && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
         {
-            let outcome = load_single_mock(&entry_path, root, max_response_file);
-            scanned.push((entry_path, outcome));
+            state.seen.insert(entry_path.clone());
+            let outcome = load_single_mock_maybe_cached(
+                &entry_path,
+                root,
+                max_response_file,
+                state.cache,
+                state.changed,
+            );
+            state.scanned.push((entry_path, outcome));
         }
     }
+}
+
+/// [`load_single_mock`], skipped in favor of `cache` when both the mock file
+/// and every fixture it depends on are exactly as they were last cycle.
+///
+/// A cache hit costs one `stat` for the mock file and one more per fixture it
+/// references — no read of file contents. A miss reads and re-parses, then
+/// updates `cache` (or evicts the entry, for a file that stopped loading —
+/// `load_single_mock`'s failure path handles retrying it every cycle without
+/// this function's help).
+fn load_single_mock_maybe_cached(
+    path: &Path,
+    root: &Path,
+    max_response_file: u64,
+    cache: &mut LoaderCache,
+    changed: &mut bool,
+) -> Result<LoadedMock, String> {
+    let fingerprint = fs::metadata(path)
+        .ok()
+        .and_then(|m| FileFingerprint::of(&m));
+
+    if let Some(fp) = fingerprint {
+        if let Some(cached) = cache.files.get(path) {
+            if cached.fingerprint == fp && fixtures_unchanged(&cached.fixture_fingerprints) {
+                return Ok(cached.outcome.clone());
+            }
+        }
+    }
+
+    *changed = true;
+    let outcome = load_single_mock(path, root, max_response_file, &mut cache.fixtures);
+
+    match (&outcome, fingerprint) {
+        (Ok(loaded), Some(fp)) => {
+            let fixture_fingerprints = loaded
+                .fixtures
+                .iter()
+                .filter_map(|f| {
+                    fs::metadata(f)
+                        .ok()
+                        .and_then(|m| FileFingerprint::of(&m))
+                        .map(|fp| (f.clone(), fp))
+                })
+                .collect();
+            cache.files.insert(
+                path.to_path_buf(),
+                CachedMock {
+                    fingerprint: fp,
+                    fixture_fingerprints,
+                    outcome: loaded.clone(),
+                },
+            );
+        }
+        _ => {
+            // Parse failure, or a `stat` that raced with a delete: don't cache
+            // it, so the next cycle retries rather than serving a stale
+            // "still broken" verdict forever.
+            cache.files.remove(path);
+        }
+    }
+
+    outcome
+}
+
+/// True when every fixture a cached mock depends on still matches the
+/// fingerprint it had when that entry was cached — the check that catches a
+/// `response_file` edited without its referencing mock file changing.
+fn fixtures_unchanged(fingerprints: &[(PathBuf, FileFingerprint)]) -> bool {
+    fingerprints.iter().all(|(path, fp)| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|m| FileFingerprint::of(&m))
+            == Some(*fp)
+    })
 }
 
 /// Loads a single mock configuration from a JSON file.
@@ -326,6 +586,7 @@ fn load_single_mock(
     path: &Path,
     root: &Path,
     max_response_file: u64,
+    fixture_cache: &mut HashMap<PathBuf, (FileFingerprint, Bytes)>,
 ) -> Result<LoadedMock, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
@@ -354,20 +615,38 @@ fn load_single_mock(
 
     if let Some(file) = mock.response_file.clone() {
         reject_both_bodies(&mock.response, &file, path)?;
-        let (resolved, bytes) = read_response_file(&file, path, root, max_response_file)?;
+        let (resolved, bytes) =
+            read_response_file(&file, path, root, max_response_file, fixture_cache)?;
         mock.response_bytes = Some(bytes);
         fixtures.push(resolved);
     }
 
+    if !crate::types::is_valid_status(mock.status) {
+        warn!(
+            "{}: status {} is outside 100-599 and will be served as 200 OK",
+            path.display(),
+            mock.status
+        );
+    }
+
     for (index, step) in mock.sequence.iter_mut().flatten().enumerate() {
         step.response_bytes = None;
+        if !crate::types::is_valid_status(step.status) {
+            warn!(
+                "{}: sequence step {} has status {}, outside 100-599, and will be served as 200 OK",
+                path.display(),
+                index,
+                step.status
+            );
+        }
         let Some(file) = step.response_file.clone() else {
             continue;
         };
         reject_both_bodies(&step.response, &file, path)
             .map_err(|e| format!("{} (sequence step {})", e, index))?;
-        let (resolved, bytes) = read_response_file(&file, path, root, max_response_file)
-            .map_err(|e| format!("{} (sequence step {})", e, index))?;
+        let (resolved, bytes) =
+            read_response_file(&file, path, root, max_response_file, fixture_cache)
+                .map_err(|e| format!("{} (sequence step {})", e, index))?;
         step.response_bytes = Some(bytes);
         fixtures.push(resolved);
     }
@@ -405,6 +684,7 @@ fn read_response_file(
     mock_path: &Path,
     root: &Path,
     max_response_file: u64,
+    fixture_cache: &mut HashMap<PathBuf, (FileFingerprint, Bytes)>,
 ) -> Result<(PathBuf, Bytes), String> {
     let base = mock_path.parent().unwrap_or(Path::new("."));
     let candidate = base.join(file);
@@ -457,6 +737,41 @@ fn read_response_file(
         ));
     }
 
+    // A fixture this same walk has already read, unchanged since then, is
+    // served from `fixture_cache` rather than read again — this is what
+    // keeps an edit to the *mock* file from forcing a re-read of a fixture it
+    // references but didn't touch, and what lets two mocks sharing one
+    // fixture pay for the read once.
+    if let Some(fingerprint) = FileFingerprint::of(&metadata) {
+        if let Some((cached_fingerprint, cached_bytes)) = fixture_cache.get(&resolved) {
+            if *cached_fingerprint == fingerprint {
+                return Ok((resolved, cached_bytes.clone()));
+            }
+        }
+
+        let bytes = fs::read(&resolved).map_err(|e| {
+            format!(
+                "{}: failed to read response_file '{}': {}",
+                mock_path.display(),
+                file,
+                e
+            )
+        })?;
+        let bytes = Bytes::from(bytes);
+
+        debug!(
+            "Loaded response_file {} ({} bytes) for {}",
+            resolved.display(),
+            bytes.len(),
+            mock_path.display()
+        );
+
+        fixture_cache.insert(resolved.clone(), (fingerprint, bytes.clone()));
+        return Ok((resolved, bytes));
+    }
+
+    // Metadata lacks a usable modified time (some platforms/filesystems):
+    // caching would be unsound, so just read it every time, as before.
     let bytes = fs::read(&resolved).map_err(|e| {
         format!(
             "{}: failed to read response_file '{}': {}",
@@ -555,6 +870,213 @@ mod tests {
         );
         // A file written before tags existed still loads, with no tags.
         assert!(result.mocks["GET:/users"][0].tags.is_empty());
+    }
+
+    /// `mocks/sub/loop -> ..` points straight back at the mocks root. Without
+    /// the visited-set guard, the walk would descend into it, find `loop`
+    /// again, descend again, and register `users.json` once per level.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_cycle_loads_each_mock_exactly_once() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        fs::create_dir(dir_path.join("sub")).unwrap();
+        File::create(dir_path.join("users.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/users","status":200,"response":[{"id":1}]}"#)
+            .unwrap();
+        std::os::unix::fs::symlink("..", dir_path.join("sub/loop")).unwrap();
+
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+
+        assert_eq!(
+            result.mocks.get("GET:/users").map(|v| v.len()),
+            Some(1),
+            "the mock behind the cycle must be registered exactly once"
+        );
+    }
+
+    /// A symlink to a directory *outside* the mocks tree, with no cycle, is
+    /// exactly the sharing-fixtures-between-projects use case — it must keep
+    /// working.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_to_an_external_directory_with_no_cycle_still_loads() {
+        let shared = TempDir::new().unwrap();
+        File::create(shared.path().join("shared.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/shared","status":200,"response":{"ok":true}}"#)
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+        File::create(dir_path.join("local.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/local","status":200,"response":{}}"#)
+            .unwrap();
+        std::os::unix::fs::symlink(shared.path(), dir_path.join("linked")).unwrap();
+
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+
+        assert_eq!(result.errors, 0);
+        assert!(result.mocks.contains_key("GET:/local"));
+        assert!(result.mocks.contains_key("GET:/shared"));
+    }
+
+    /// Two different symlinks pointing at the same real directory must not
+    /// double-load its mocks either — the guard is by canonical path, not by
+    /// the specific link that led there.
+    #[cfg(unix)]
+    #[test]
+    fn test_two_symlinks_to_the_same_directory_load_its_mocks_once() {
+        let shared = TempDir::new().unwrap();
+        File::create(shared.path().join("shared.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/shared","status":200,"response":{"ok":true}}"#)
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+        std::os::unix::fs::symlink(shared.path(), dir_path.join("a")).unwrap();
+        std::os::unix::fs::symlink(shared.path(), dir_path.join("b")).unwrap();
+
+        let result = load_mocks_map(dir_path.to_str().unwrap());
+
+        assert_eq!(result.mocks.get("GET:/shared").map(|v| v.len()), Some(1));
+    }
+
+    // ── Hot-reload change detection (#110) ──────────────────────────────
+
+    #[test]
+    fn test_hot_reload_reports_unchanged_on_an_idle_second_cycle() {
+        let dir = TempDir::new().unwrap();
+        File::create(dir.path().join("users.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/users","status":200,"response":[]}"#)
+            .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(first.changed, "the first cycle always reports a change");
+        assert!(first.result.mocks.contains_key("GET:/users"));
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(
+            !second.changed,
+            "nothing touched any file between the two cycles"
+        );
+        assert!(second.result.mocks.contains_key("GET:/users"));
+    }
+
+    #[test]
+    fn test_hot_reload_detects_an_edited_mock_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("users.json");
+        File::create(&file)
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/users","status":200,"response":[]}"#)
+            .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert_eq!(first.result.mocks["GET:/users"][0].status, 200);
+
+        File::create(&file)
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/users","status":201,"response":[]}"#)
+            .unwrap();
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(second.changed, "the edited file must be detected");
+        assert_eq!(second.result.mocks["GET:/users"][0].status, 201);
+    }
+
+    #[test]
+    fn test_hot_reload_detects_an_added_file() {
+        let dir = TempDir::new().unwrap();
+        File::create(dir.path().join("users.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/users","status":200,"response":[]}"#)
+            .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert_eq!(first.result.mocks.len(), 1);
+
+        File::create(dir.path().join("orders.json"))
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/orders","status":200,"response":[]}"#)
+            .unwrap();
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(second.changed, "a new file must be detected");
+        assert!(second.result.mocks.contains_key("GET:/orders"));
+    }
+
+    #[test]
+    fn test_hot_reload_detects_a_deleted_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("users.json");
+        File::create(&file)
+            .unwrap()
+            .write_all(br#"{"method":"GET","path":"/users","status":200,"response":[]}"#)
+            .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(first.result.mocks.contains_key("GET:/users"));
+
+        fs::remove_file(&file).unwrap();
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(second.changed, "a deleted file must be detected");
+        assert!(!second.result.mocks.contains_key("GET:/users"));
+    }
+
+    /// The case #110 calls out by name: editing a `response_file` fixture
+    /// must be picked up even though the mock file that references it never
+    /// changed.
+    #[test]
+    fn test_hot_reload_detects_an_edited_response_file_even_though_the_mock_file_did_not_change() {
+        let dir = TempDir::new().unwrap();
+        File::create(dir.path().join("download.json"))
+            .unwrap()
+            .write_all(
+                br#"{"method":"GET","path":"/download","status":200,"response_file":"body.bin"}"#,
+            )
+            .unwrap();
+        File::create(dir.path().join("body.bin"))
+            .unwrap()
+            .write_all(b"original")
+            .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert_eq!(
+            first.result.mocks["GET:/download"][0]
+                .response_bytes
+                .as_deref(),
+            Some(b"original".as_slice())
+        );
+
+        // Only the fixture changes — the mock.json that names it is untouched.
+        File::create(dir.path().join("body.bin"))
+            .unwrap()
+            .write_all(b"a different, longer body")
+            .unwrap();
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(
+            second.changed,
+            "a fixture edit must be detected even though its mock file didn't change"
+        );
+        assert_eq!(
+            second.result.mocks["GET:/download"][0]
+                .response_bytes
+                .as_deref(),
+            Some(b"a different, longer body".as_slice())
+        );
     }
 
     #[test]
@@ -692,7 +1214,12 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(mock.as_bytes()).unwrap();
 
-        let result = load_single_mock(&file_path, temp_dir.path(), DEFAULT_MAX_RESPONSE_FILE);
+        let result = load_single_mock(
+            &file_path,
+            temp_dir.path(),
+            DEFAULT_MAX_RESPONSE_FILE,
+            &mut HashMap::new(),
+        );
         assert!(result.is_ok());
 
         let mock_config = result.unwrap().mock;
@@ -1460,13 +1987,20 @@ mod tests {
         let mut messages = Vec::new();
         let mut scanned = Vec::new();
         let mut errors = 0;
-        collect_json_files(
-            &root,
-            &root,
-            DEFAULT_MAX_RESPONSE_FILE,
-            &mut scanned,
-            &mut errors,
-        );
+        let mut visited = HashSet::new();
+        visited.insert(root.clone());
+        let mut cache = LoaderCache::new();
+        let mut changed = false;
+        let mut seen = HashSet::new();
+        let mut state = ScanState {
+            scanned: &mut scanned,
+            errors: &mut errors,
+            visited: &mut visited,
+            cache: &mut cache,
+            changed: &mut changed,
+            seen: &mut seen,
+        };
+        collect_json_files(&root, &root, DEFAULT_MAX_RESPONSE_FILE, &mut state, 0);
         for (_, outcome) in scanned {
             if let Err(message) = outcome {
                 messages.push(message);

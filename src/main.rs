@@ -18,7 +18,7 @@ use handler::{
     handle_request, health_check, list_mocks, list_requests, list_sequences, max_body_size,
     max_log_entries, reset_sequences, set_scenario, AppState,
 };
-use loader::{load_mocks, load_mocks_map};
+use loader::load_mocks;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use tower_http::trace::TraceLayer;
@@ -247,19 +247,43 @@ async fn run_server() {
         // tokio::time::interval fires immediately on creation; skip the first
         // tick to avoid redundantly reloading mocks that were just loaded at startup.
         interval.tick().await;
+        // Carries fingerprints and fixture bytes across cycles, so an idle
+        // server with unchanged mock files does no re-reading and no
+        // re-parsing after startup — see #110. Owned by this loop and moved
+        // into and back out of each `spawn_blocking` call.
+        let mut cache = loader::LoaderCache::new();
         loop {
             interval.tick().await;
             let mocks_dir = reload_dir.clone();
             // Run blocking file I/O off the async runtime to avoid stalling request handling
-            let result = tokio::task::spawn_blocking(move || load_mocks_map(&mocks_dir))
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("Hot reload task panicked: {}", e);
-                    loader::LoadResult {
-                        mocks: std::collections::HashMap::new(),
-                        errors: 1,
-                    }
-                });
+            let (outcome, returned_cache) = tokio::task::spawn_blocking(move || {
+                let outcome = loader::load_mocks_map_hot_reload(&mocks_dir, &mut cache);
+                (outcome, cache)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Hot reload task panicked: {}", e);
+                (
+                    loader::ReloadOutcome {
+                        result: loader::LoadResult {
+                            mocks: std::collections::HashMap::new(),
+                            errors: 1,
+                        },
+                        changed: true,
+                    },
+                    loader::LoaderCache::new(),
+                )
+            });
+            cache = returned_cache;
+
+            if !outcome.changed {
+                // Nothing added, removed, or edited since last cycle: no
+                // write lock, no shadow-mock diff, no counter pruning.
+                debug!("🔄 Hot reload: no changes detected");
+                continue;
+            }
+            let result = outcome.result;
+
             // The mock lock is released before the counter locks are taken:
             // `list_sequences` reads counters and then mocks, so holding both
             // in the opposite order here would be a deadlock waiting to happen.
@@ -1219,7 +1243,7 @@ mod tests {
     /// Run one hot-reload cycle against a directory, exactly as the background
     /// task does: reload, install, then reconcile per-mock state.
     async fn reload_cycle(state: &AppState, store: &types::MockStore, dir: &std::path::Path) {
-        let result = load_mocks_map(dir.to_str().unwrap());
+        let result = loader::load_mocks_map(dir.to_str().unwrap());
         let live = {
             let mut current = store.write().await;
             *current = apply_reload(&current, result);
@@ -1358,7 +1382,7 @@ mod tests {
             "a.json",
             r#"{"method":"GET","path":"/a","status":200,"response":{}}"#,
         );
-        let current = load_mocks_map(dir.path().to_str().unwrap());
+        let current = loader::load_mocks_map(dir.path().to_str().unwrap());
         assert_eq!(current.errors, 0);
         assert!(current.mocks.contains_key("GET:/a"));
 
@@ -1370,7 +1394,7 @@ mod tests {
         );
         write_mock(dir.path(), "c.json", "{invalid json");
 
-        let result = load_mocks_map(dir.path().to_str().unwrap());
+        let result = loader::load_mocks_map(dir.path().to_str().unwrap());
         assert_eq!(result.errors, 1);
 
         let next = apply_reload(&current.mocks, result);

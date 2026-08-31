@@ -59,6 +59,13 @@ pub enum QueryParamPattern {
     Regex(String),
     /// Any value (parameter must exist)
     Any,
+    /// One of the values a *repeated* query parameter carried — matches if
+    /// any occurrence of the key equals this value. For a key sent once,
+    /// behaves exactly like [`QueryParamValue::Exact`].
+    Contains(String),
+    /// The exact, ordered set of values a repeated query parameter carried —
+    /// `?tag=a&tag=b` matches only `["a", "b"]`, not `["b", "a"]` or `["a"]`.
+    List(Vec<String>),
 }
 
 // ============================================================================
@@ -502,7 +509,12 @@ pub struct RequestRecord {
     pub timestamp: String,
     pub method: String,
     pub path: String,
-    pub query_params: HashMap<String, String>,
+    /// Every value each query parameter carried, in the order the client
+    /// sent them. A key sent once is still a single-element list — see #108:
+    /// this used to collapse a repeated key to its last value, which
+    /// misreported what the client actually sent.
+    #[serde(deserialize_with = "deserialize_query_params_compat")]
+    pub query_params: HashMap<String, Vec<String>>,
     pub headers: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -535,6 +547,37 @@ pub struct RequestRecord {
 
 pub type RequestLog = Arc<tokio::sync::RwLock<Vec<RequestRecord>>>;
 
+/// Accepts either shape `RequestRecord::query_params` has ever had on disk:
+/// the pre-#108 `{"page": "1"}` (one value per key, the last one the client
+/// sent) or the current `{"page": ["1"]}` (every value, in order) — so a
+/// request log written by an older Mimic still deserializes, per this
+/// struct's own compatibility promise.
+fn deserialize_query_params_compat<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let raw: HashMap<String, OneOrMany> = HashMap::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(key, value)| {
+            let values = match value {
+                OneOrMany::One(single) => vec![single],
+                OneOrMany::Many(many) => many,
+            };
+            (key, values)
+        })
+        .collect())
+}
+
 /// True if `value` reads as an affirmative — in a query string
 /// (`?unmatched_only=1`) or an environment variable (`MIMIC_CORS=true`).
 ///
@@ -545,6 +588,16 @@ pub fn is_truthy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// True when `status` is a value Mimic can actually put on the wire as the
+/// HTTP status line: 100–599, the range `StatusCode::from_u16` accepts *and*
+/// that a real HTTP response can carry. A mock outside it is served as
+/// `200 OK` (see [`crate::handler`]'s fallback), so this is what the loader
+/// and `/admin/mocks` use to flag it rather than let the two silently
+/// disagree.
+pub fn is_valid_status(status: u16) -> bool {
+    (100..=599).contains(&status)
 }
 
 /// Create a lookup key from method and path (without query string)
@@ -1125,6 +1178,12 @@ mod tests {
 
         assert_eq!(record.id, 7);
         assert_eq!(record.path, "/users");
+        // The pre-#108 shape — one value per key — still reads; it's wrapped
+        // into the single-element list the current shape uses for that case.
+        assert_eq!(
+            record.query_params.get("page"),
+            Some(&vec!["1".to_string()])
+        );
         assert_eq!(record.matched_mock.as_deref(), Some("GET:/users"));
         // Everything new defaults to "nothing to report" rather than failing
         assert!(record.response_body.is_none());

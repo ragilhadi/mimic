@@ -1,7 +1,8 @@
 use crate::cors::{self, CorsConfig};
 use crate::matcher::{
     explain_match, explain_no_match, find_matching_mock, is_pattern_path, parse_body,
-    parse_headers, parse_query_string, requires_body, route_exists, MatchResult, RequestContext,
+    parse_headers, parse_query_string, parse_query_string_multi, requires_body, route_exists,
+    MatchResult, RequestContext,
 };
 use crate::template::{render_response, TemplateContext};
 use crate::types::{
@@ -381,19 +382,36 @@ pub fn configured_admin_token() -> Option<String> {
 
 /// 401 returned when the admin API is protected and the caller didn't present
 /// the token. Same shape as the other error bodies Mimic returns.
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "error": "unauthorized",
-            "detail": format!(
-                "the admin API requires an 'Authorization: Bearer <token>' header \
-                 matching {}",
-                ADMIN_TOKEN_ENV
-            ),
-        })),
+fn unauthorized(cors: Option<&CorsConfig>, origin: Option<&str>) -> Response {
+    cors_wrap(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "unauthorized",
+                "detail": format!(
+                    "the admin API requires an 'Authorization: Bearer <token>' header \
+                     matching {}",
+                    ADMIN_TOKEN_ENV
+                ),
+            })),
+        )
+            .into_response(),
+        cors,
+        origin,
     )
-        .into_response()
+}
+
+/// Add CORS headers — when configured — to a response Mimic builds itself.
+///
+/// The matched-mock path gets its CORS headers from [`build_response_parts`];
+/// this is the same [`cors::apply_headers`] call for the four responses Mimic
+/// hand-builds (404 "mock not found", 413, 401, and the proxy fallback) so
+/// none of them can quietly skip CORS the way they used to.
+fn cors_wrap(mut response: Response, cors: Option<&CorsConfig>, origin: Option<&str>) -> Response {
+    if let Some(config) = cors {
+        cors::apply_headers(config, origin, response.headers_mut());
+    }
+    response
 }
 
 /// Middleware guarding the admin API when a token is configured.
@@ -434,7 +452,11 @@ pub async fn require_admin_token(
             request.method(),
             request.uri().path()
         );
-        unauthorized()
+        let origin = request
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        unauthorized(state.cors.as_deref(), origin)
     }
 }
 
@@ -731,6 +753,7 @@ pub async fn handle_request(
 
     // Parse query parameters from URI
     let query_params = parse_query_string(uri.query());
+    let query_params_all = parse_query_string_multi(uri.query());
 
     // Parse headers into HashMap (normalized to lowercase)
     let parsed_headers = parse_headers(&headers);
@@ -774,7 +797,13 @@ pub async fn handle_request(
                     "Rejecting {} {}: request body exceeds the {}-byte limit",
                     method_str, path, max_body
                 );
-                return payload_too_large(&method_str, &path, max_body);
+                return payload_too_large(
+                    &method_str,
+                    &path,
+                    max_body,
+                    state.cors.as_deref(),
+                    parsed_headers.get("origin").map(String::as_str),
+                );
             }
             Err(e) => {
                 debug!("Failed to read body: {}", e);
@@ -795,6 +824,7 @@ pub async fn handle_request(
         path: path.clone(),
         path_params: HashMap::new(),
         query_params,
+        query_params_all,
         headers: parsed_headers.clone(),
         body: body_bytes,
         content_type,
@@ -918,7 +948,7 @@ pub async fn handle_request(
                 context,
                 RequestOutcome {
                     matched_mock: Some(matched_key),
-                    response_status: status_u16,
+                    response_status: status.as_u16(),
                     response_body: Some(recorded_body),
                     response_headers: recorded_response_headers(&header_map),
                     match_score: Some(match_score),
@@ -1009,7 +1039,11 @@ pub async fn handle_request(
             .await;
 
             // Return 404 with detailed error message
-            (StatusCode::NOT_FOUND, Json(error_body)).into_response()
+            cors_wrap(
+                (StatusCode::NOT_FOUND, Json(error_body)).into_response(),
+                state.cors.as_deref(),
+                parsed_headers.get("origin").map(String::as_str),
+            )
         }
     }
 }
@@ -1142,7 +1176,11 @@ async fn handle_proxy_fallback(
             let mut res = Response::new(Body::from(upstream.body));
             *res.status_mut() = upstream.status;
             *res.headers_mut() = upstream.headers;
-            res
+            cors_wrap(
+                res,
+                state.cors.as_deref(),
+                parsed_headers.get("origin").map(String::as_str),
+            )
         }
         Err(e) => {
             warn!("Proxy error for {} {}: {}", method_str, path, e);
@@ -1171,7 +1209,11 @@ async fn handle_proxy_fallback(
             )
             .await;
 
-            (StatusCode::NOT_FOUND, Json(error_body)).into_response()
+            cors_wrap(
+                (StatusCode::NOT_FOUND, Json(error_body)).into_response(),
+                state.cors.as_deref(),
+                parsed_headers.get("origin").map(String::as_str),
+            )
         }
     }
 }
@@ -1217,17 +1259,27 @@ fn is_length_limit(err: &(dyn std::error::Error + 'static)) -> bool {
 /// 413 returned when a request body exceeds [`max_body_size`]. Mirrors the
 /// shape of the 404 "mock not found" body so clients can parse either the
 /// same way.
-fn payload_too_large(method: &str, path: &str, max_body: usize) -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Json(json!({
-            "error": "payload too large",
-            "method": method,
-            "path": path,
-            "max_body_size": max_body
-        })),
+fn payload_too_large(
+    method: &str,
+    path: &str,
+    max_body: usize,
+    cors: Option<&CorsConfig>,
+    origin: Option<&str>,
+) -> Response {
+    cors_wrap(
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "payload too large",
+                "method": method,
+                "path": path,
+                "max_body_size": max_body
+            })),
+        )
+            .into_response(),
+        cors,
+        origin,
     )
-        .into_response()
 }
 
 pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -1295,7 +1347,7 @@ async fn record_request(state: &AppState, context: RequestContext, outcome: Requ
         timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         method: context.method,
         path: context.path,
-        query_params: context.query_params,
+        query_params: context.query_params_all,
         headers: redacted_headers,
         body: context
             .body
@@ -1332,7 +1384,22 @@ pub struct RequestFilter {
     /// Case-insensitive free-text search over the body, headers, and query
     /// parameters of each recorded request.
     pub search: Option<String>,
+    /// How many matching records to return, applied *after* every filter
+    /// above. Unset uses [`DEFAULT_REQUEST_PAGE_LIMIT`]; `0` returns every
+    /// match — the pre-#111 behavior, kept for anyone scripting against this
+    /// endpoint who wants it all in one response.
+    pub limit: Option<String>,
+    /// How many of the most recent matches to skip before taking `limit` —
+    /// `offset=0` (the default) is the most recent page, `offset=50` the
+    /// page before that, and so on back through the log.
+    pub offset: Option<String>,
 }
+
+/// Records returned in one page when [`RequestFilter::limit`] is unset.
+///
+/// Small enough that even a slow connection renders it well under a second;
+/// large enough that a normal debugging session rarely needs a second page.
+const DEFAULT_REQUEST_PAGE_LIMIT: usize = 50;
 
 /// True if `status` satisfies a `status` filter of either an exact code
 /// (`"404"`) or a class (`"4xx"`).
@@ -1373,10 +1440,10 @@ fn record_matches_search(record: &RequestRecord, needle: &str) -> bool {
         .headers
         .iter()
         .any(|(k, v)| k.to_lowercase().contains(needle) || v.to_lowercase().contains(needle))
-        || record
-            .query_params
-            .iter()
-            .any(|(k, v)| k.to_lowercase().contains(needle) || v.to_lowercase().contains(needle))
+        || record.query_params.iter().any(|(k, values)| {
+            k.to_lowercase().contains(needle)
+                || values.iter().any(|v| v.to_lowercase().contains(needle))
+        })
 }
 
 pub async fn list_requests(
@@ -1421,9 +1488,46 @@ pub async fn list_requests(
         })
         .collect();
 
+    let total = filtered.len();
+
+    let limit = filter
+        .limit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_REQUEST_PAGE_LIMIT);
+    let offset = filter
+        .offset
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // `offset` counts back from the most recent match, so the default page
+    // (`offset=0`) is "the last `limit` requests" — the shape #111 asked for
+    // — and a larger offset pages further into the past. `limit=0` is the
+    // explicit opt-out: every match, exactly as this endpoint always
+    // returned before pagination existed.
+    let page: &[&RequestRecord] = if limit == 0 {
+        &filtered
+    } else {
+        let end = total.saturating_sub(offset);
+        let start = end.saturating_sub(limit);
+        &filtered[start..end]
+    };
+
     Json(json!({
-        "count": filtered.len(),
-        "requests": filtered
+        // Total matches, unchanged from what `count` has always meant — an
+        // existing consumer that reads `count` for "how many requests
+        // matched" keeps seeing the right number even though `requests` is
+        // now a page of them.
+        "count": total,
+        "returned": page.len(),
+        "limit": limit,
+        "offset": offset,
+        "requests": page
     }))
 }
 
@@ -1472,6 +1576,16 @@ fn describe_mock_entry(
             format!(
                 "{} {} is reserved by {} and will never be served from a mock",
                 mock.method, mock.path, owner
+            )
+        }),
+        // A mock is loaded and listed here even when its declared `status`
+        // can't be put on the wire — the request log would otherwise be the
+        // only place that disagreement showed up, and only after a request.
+        "servable": crate::types::is_valid_status(mock.status),
+        "unservable_reason": (!crate::types::is_valid_status(mock.status)).then(|| {
+            format!(
+                "status {} is outside 100-599 and will be served as 200 OK",
+                mock.status
             )
         }),
         // The whole config, so the dashboard's expand-a-row can show what the
@@ -4734,6 +4848,20 @@ mod tests {
         );
     }
 
+    /// The #108 repro end to end: `?tag=a&tag=b` must not lose `a` on the way
+    /// into the request log.
+    #[tokio::test]
+    async fn test_record_keeps_every_value_of_a_repeated_query_param() {
+        let state = dash_state(vec![dash_mock("GET", "/search", Some("mocks/search.json"))]);
+        let _ = send(&state, Method::GET, "/search?tag=a&tag=b").await;
+
+        let record = only_record(&state).await;
+        assert_eq!(
+            record.query_params.get("tag"),
+            Some(&vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
     #[tokio::test]
     async fn test_record_captures_score_and_explanation_on_a_match() {
         let state = dash_state(vec![dash_mock(
@@ -4951,6 +5079,122 @@ mod tests {
         assert_eq!(body["requests"][0]["path"], "/login");
     }
 
+    // ── Pagination (#111) ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_pagination_defaults_to_the_last_50_most_recent_matches() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
+        for _ in 0..60 {
+            let _ = send(&state, Method::GET, "/users").await;
+        }
+
+        let body = list_requests(State(state), Query(RequestFilter::default()))
+            .await
+            .0;
+
+        assert_eq!(body["count"], 60, "count is every match, not just the page");
+        assert_eq!(body["returned"], 50);
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["offset"], 0);
+        let requests = body["requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 50);
+        // ids run 1..=60; the default page is the most recent 50: 11..=60.
+        assert_eq!(requests[0]["id"], 11);
+        assert_eq!(requests[49]["id"], 60);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_offset_pages_backward_through_history() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
+        for _ in 0..5 {
+            let _ = send(&state, Method::GET, "/users").await;
+        }
+
+        let ids_for = |body: &serde_json::Value| -> Vec<u64> {
+            body["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_u64().unwrap())
+                .collect()
+        };
+
+        let newest = list_requests(
+            State(state.clone()),
+            Query(RequestFilter {
+                limit: Some("2".to_string()),
+                offset: Some("0".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(ids_for(&newest), vec![4, 5]);
+
+        let older = list_requests(
+            State(state),
+            Query(RequestFilter {
+                limit: Some("2".to_string()),
+                offset: Some("2".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(ids_for(&older), vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_limit_zero_returns_everything() {
+        let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
+        for _ in 0..70 {
+            let _ = send(&state, Method::GET, "/users").await;
+        }
+
+        let body = list_requests(
+            State(state),
+            Query(RequestFilter {
+                limit: Some("0".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(body["count"], 70);
+        assert_eq!(body["returned"], 70);
+        assert_eq!(body["requests"].as_array().unwrap().len(), 70);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_applies_after_filters() {
+        let state = dash_state(vec![
+            dash_mock("GET", "/users", Some("mocks/users.json")),
+            dash_mock("POST", "/login", Some("mocks/login.json")),
+        ]);
+        for _ in 0..5 {
+            let _ = send(&state, Method::GET, "/users").await;
+        }
+        let _ = send(&state, Method::POST, "/login").await;
+
+        let body = list_requests(
+            State(state),
+            Query(RequestFilter {
+                path: Some("/users".to_string()),
+                limit: Some("2".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            body["count"], 5,
+            "pagination must be counted against the filtered set, not the whole log"
+        );
+        assert_eq!(body["returned"], 2);
+    }
+
     #[tokio::test]
     async fn test_status_filter_accepts_a_class() {
         let state = dash_state(vec![dash_mock("GET", "/users", Some("mocks/users.json"))]);
@@ -5081,6 +5325,7 @@ mod tests {
             status: Some(String::new()),
             search: Some("   ".to_string()),
             unmatched_only: None,
+            ..Default::default()
         });
         let body = list_requests(State(state), filter).await.0;
         assert_eq!(body["count"], 2);
@@ -5479,6 +5724,104 @@ mod tests {
                 hits.load(Ordering::SeqCst),
                 1,
                 "the second identical request must be served from the recorded mock, not the upstream again"
+            );
+        }
+
+        /// An upstream that answers `GET /gz` with a gzip-compressed JSON
+        /// body and `content-encoding: gzip` — the #106 repro.
+        async fn spawn_gzip_upstream() -> String {
+            let app = Router::new().route(
+                "/gz",
+                get(|| async {
+                    use std::io::Write;
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder
+                        .write_all(br#"{"gzipped":true,"value":42}"#)
+                        .unwrap();
+                    let body = encoder.finish().unwrap();
+                    (
+                        [
+                            (
+                                CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static("application/json"),
+                            ),
+                            (
+                                axum::http::header::CONTENT_ENCODING,
+                                axum::http::HeaderValue::from_static("gzip"),
+                            ),
+                        ],
+                        body,
+                    )
+                }),
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            format!("http://{}", addr)
+        }
+
+        /// The #106 repro end to end: the live response is decoded
+        /// correctly (unsurprising — that part already worked), and the
+        /// *recording* is the decoded JSON too, not mojibake, with no
+        /// `content-encoding` claiming a compression the stored bytes no
+        /// longer have.
+        #[tokio::test]
+        async fn a_gzipped_upstream_response_is_recorded_decoded_not_as_mojibake() {
+            let upstream = spawn_gzip_upstream().await;
+            let dir = tempfile::tempdir().unwrap();
+            let state = proxy_state(dir.path(), &upstream, true);
+
+            let response = handle_request(
+                Method::GET,
+                "/gz".parse().unwrap(),
+                HeaderMap::new(),
+                State(state),
+                Body::empty(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let live: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(live["gzipped"], true);
+            assert_eq!(live["value"], 42);
+
+            let recorded_dir = dir.path().join("_recorded");
+            let mut recorded_file = None;
+            for _ in 0..50 {
+                if recorded_dir.is_dir() {
+                    let mut entries: Vec<_> = std::fs::read_dir(&recorded_dir)
+                        .unwrap()
+                        .filter_map(|e| e.ok())
+                        .collect();
+                    if !entries.is_empty() {
+                        recorded_file = Some(entries.remove(0).path());
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let recorded_file = recorded_file.expect("a mock should have been recorded");
+
+            let recorded: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&recorded_file).unwrap()).unwrap();
+            assert_eq!(
+                recorded["response"],
+                json!({"gzipped": true, "value": 42}),
+                "the recorded response must be the decoded body, not mojibake: {}",
+                recorded
+            );
+            assert!(
+                recorded["response_headers"]
+                    .get("content-encoding")
+                    .is_none(),
+                "a replay must not claim gzip encoding on bytes that are already decoded: {}",
+                recorded
             );
         }
     }
@@ -5940,6 +6283,58 @@ mod scenario_tests {
         let users = entries.iter().find(|e| e["path"] == "/users").unwrap();
         assert_eq!(users["reachable"], true);
         assert_eq!(users["unreachable_reason"], serde_json::Value::Null);
+    }
+
+    // ── Out-of-range status (#104) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_mocks_marks_an_out_of_range_status_unservable() {
+        let mut bad = mock("GET", "/bad", "bad", &[]);
+        bad.status = 1000;
+        let state = state_with(vec![bad, mock("GET", "/users", "users", &[])], None);
+
+        let Json(body) = list_mocks(State(state)).await;
+        let entries = body["mocks"].as_array().unwrap();
+
+        let bad_entry = entries.iter().find(|e| e["path"] == "/bad").unwrap();
+        assert_eq!(bad_entry["servable"], false);
+        assert!(bad_entry["unservable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("outside 100-599"));
+
+        let users = entries.iter().find(|e| e["path"] == "/users").unwrap();
+        assert_eq!(users["servable"], true);
+        assert_eq!(users["unservable_reason"], serde_json::Value::Null);
+    }
+
+    /// The request log must record what was actually put on the wire, not the
+    /// raw configured number — for every shape of "invalid" the repro named.
+    #[tokio::test]
+    async fn response_and_log_agree_for_every_out_of_range_status() {
+        for bad_status in [0u16, 99, 600, 1000] {
+            let mut bad = mock("GET", "/bad", "bad", &[]);
+            bad.status = bad_status;
+            let state = state_with(vec![bad], None);
+
+            let response = handle_request(
+                Method::GET,
+                "/bad".parse().unwrap(),
+                HeaderMap::new(),
+                State(state.clone()),
+                Body::empty(),
+            )
+            .await;
+            let served_status = response.status().as_u16();
+
+            let log = state.request_log.read().await;
+            assert_eq!(log.len(), 1);
+            assert_eq!(
+                log[0].response_status, served_status,
+                "status {} in the mock: log and response disagreed",
+                bad_status
+            );
+        }
     }
 
     // ── Body redaction (#88) ────────────────────────────────────────────
@@ -6590,6 +6985,89 @@ mod cors_tests {
         assert_eq!(
             record.response_headers.get("access-control-allow-origin"),
             Some(&"*".to_string())
+        );
+    }
+
+    // ── Mimic's own hand-built responses (#103) ────────────────────────────
+
+    /// The `mock not found` 404 is the response a browser most needs to read —
+    /// it's what turns a forgotten mock into a readable message instead of an
+    /// opaque "blocked by CORS policy".
+    #[tokio::test]
+    async fn a_404_for_an_unmocked_path_carries_cors_headers() {
+        let state = state_with(vec![mock("GET", "/users")]).with_cors(enabled());
+
+        let response = send(&state, Method::GET, "/nope", &[ORIGIN]).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            header(&response, "access-control-allow-origin"),
+            Some("*".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_from_a_disallowed_origin_still_gets_no_allow_origin_header() {
+        let state = state_with(vec![mock("GET", "/users")]).with_cors(config(&[
+            ("MIMIC_CORS", "true"),
+            ("MIMIC_CORS_ORIGINS", "http://localhost:3000"),
+        ]));
+
+        let response = send(
+            &state,
+            Method::GET,
+            "/nope",
+            &[("origin", "http://evil.example")],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&response, "access-control-allow-origin"), None);
+    }
+
+    #[tokio::test]
+    async fn cors_off_leaves_the_404_exactly_as_it_was() {
+        let state = state_with(vec![mock("GET", "/users")]);
+
+        let response = send(&state, Method::GET, "/nope", &[ORIGIN]).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&response, "access-control-allow-origin"), None);
+    }
+
+    #[test]
+    fn the_401_from_a_missing_admin_token_carries_cors_headers() {
+        let config = enabled();
+        let response = unauthorized(Some(&config), Some("http://localhost:3000"));
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn the_413_from_an_oversized_body_carries_cors_headers() {
+        let config = enabled();
+        let response = payload_too_large(
+            "POST",
+            "/upload",
+            1024,
+            Some(&config),
+            Some("http://localhost:3000"),
+        );
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
         );
     }
 }

@@ -233,6 +233,12 @@ fn describe_query_value(expected: &QueryParamValue) -> String {
             format!("a match for `{}`", truncate_for_display(pattern))
         }
         QueryParamValue::Pattern(QueryParamPattern::Any) => "any value".to_string(),
+        QueryParamValue::Pattern(QueryParamPattern::Contains(value)) => {
+            format!("one of the values to be `{}`", truncate_for_display(value))
+        }
+        QueryParamValue::Pattern(QueryParamPattern::List(values)) => {
+            format!("exactly {:?}", values)
+        }
     }
 }
 
@@ -285,7 +291,16 @@ pub struct RequestContext {
     /// path parameter matching is implemented; reserved so templating
     /// (`{{path.id}}`) has a source to read from once it lands.
     pub path_params: HashMap<String, String>,
+    /// Each query parameter's *first* value — what `{{query.x}}` renders and
+    /// what the ordinary `Exact`/`Regex`/`Any` matchers test against, so a
+    /// mock written before repeated keys were supported keeps meaning exactly
+    /// what it always did. See [`RequestContext::query_params_all`] for every
+    /// value a repeated key carried.
     pub query_params: HashMap<String, String>,
+    /// Every value each query parameter carried, in the order the client
+    /// sent them — what the request log records and what
+    /// [`crate::types::QueryParamPattern::Contains`]/`List` match against.
+    pub query_params_all: HashMap<String, Vec<String>>,
     pub headers: HashMap<String, String>,
     pub body: Option<Bytes>,
     pub content_type: Option<String>,
@@ -299,6 +314,7 @@ impl RequestContext {
             path,
             path_params: HashMap::new(),
             query_params: HashMap::new(),
+            query_params_all: HashMap::new(),
             headers: HashMap::new(),
             body: None,
             content_type: None,
@@ -337,14 +353,17 @@ pub(crate) fn decode_component(raw: &str) -> String {
         .into_owned()
 }
 
-/// Parse query string into HashMap
-/// Example: "page=1&limit=10" -> {"page": "1", "limit": "10"}
+/// Parse a query string into every value each key carried, in the order the
+/// client sent them.
+/// Example: "tag=a&tag=b" -> {"tag": ["a", "b"]}
 ///
 /// Keys and values arrive decoded: `?q=hello+world` and `?q=hello%20world`
-/// both yield `hello world`, which is the form a mock's matcher — and
-/// `{{query.q}}` — sees.
-pub fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
-    let mut params = HashMap::new();
+/// both yield `hello world`. This is the source of truth the request log
+/// reads, and the source [`parse_query_string`]'s first-value view is
+/// derived from — see #108, which is what a repeated key needs to stop
+/// silently losing every value but the last.
+pub fn parse_query_string_multi(query: Option<&str>) -> HashMap<String, Vec<String>> {
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
 
     if let Some(q) = query {
         for pair in q.split('&') {
@@ -352,16 +371,36 @@ pub fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
                 continue;
             }
 
-            if let Some((key, value)) = pair.split_once('=') {
-                params.insert(decode_component(key), decode_component(value));
-            } else {
+            let (key, value) = match pair.split_once('=') {
+                Some((key, value)) => (decode_component(key), decode_component(value)),
                 // Handle params without values (e.g., ?debug)
-                params.insert(decode_component(pair), String::new());
-            }
+                None => (decode_component(pair), String::new()),
+            };
+            params.entry(key).or_default().push(value);
         }
     }
 
     params
+}
+
+/// Each query parameter's first value.
+/// Example: "page=1&limit=10" -> {"page": "1", "limit": "10"}
+///
+/// For a key sent more than once, this is deliberately the *first*
+/// occurrence — see [`RequestContext::query_params`] — which is the form a
+/// mock's ordinary matcher and `{{query.q}}` see.
+pub fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
+    parse_query_string_multi(query)
+        .into_iter()
+        .map(|(key, mut values)| {
+            let first = if values.is_empty() {
+                String::new()
+            } else {
+                values.remove(0)
+            };
+            (key, first)
+        })
+        .collect()
 }
 
 /// Check if request query params match the mock's requirements
@@ -373,13 +412,37 @@ pub fn match_query_params(
     query_params_reject_reason(request_params, matcher).is_none()
 }
 
+/// [`query_params_reject_reason`], without every value a repeated key
+/// carried. `Contains`/`List` fall back to treating each key's single value
+/// as its whole (one-element) list — correct for a key sent once, and the
+/// only case every existing caller of this function exercises.
+///
+/// This is what keeps [`match_query_params`] and every unit test that built a
+/// plain `HashMap<String, String>` before repeated query params were matched
+/// at all (#108) compiling and passing unchanged; [`evaluate_mock`] is the one
+/// caller that has every value to give and calls
+/// [`query_params_reject_reason_all`] directly.
+pub fn query_params_reject_reason(
+    request_params: &HashMap<String, String>,
+    matcher: &QueryParamMatcher,
+) -> Option<RejectReason> {
+    query_params_reject_reason_all(request_params, None, matcher)
+}
+
 /// Why `matcher` rejects `request_params`, or `None` if it accepts them.
 ///
 /// This is the query-parameter matcher; [`match_query_params`] is the boolean
 /// view of it. Keeping one implementation is what stops the dashboard's
 /// explanations from describing a matcher the server doesn't actually run.
-pub fn query_params_reject_reason(
+///
+/// `request_params_all`, when given, is every value each repeated key
+/// carried — what `Contains` and `List` (#108) match against. Every other
+/// matcher, and the `strict` extra-param check, reads `request_params`
+/// exactly as before: one entry per key, so a repeated key is still counted
+/// once under `strict`, not once per value.
+pub fn query_params_reject_reason_all(
     request_params: &HashMap<String, String>,
+    request_params_all: Option<&HashMap<String, Vec<String>>>,
     matcher: &QueryParamMatcher,
 ) -> Option<RejectReason> {
     // Check all required params match. Iterated in name order so a mock with
@@ -387,7 +450,8 @@ pub fn query_params_reject_reason(
     for (key, expected_value) in sorted_by_key(&matcher.params) {
         match request_params.get(key) {
             Some(actual_value) => {
-                if !match_query_param_value(actual_value, expected_value) {
+                let all_values = request_params_all.and_then(|all| all.get(key));
+                if !match_query_param_value(actual_value, all_values, expected_value) {
                     debug!(
                         "Query param '{}' mismatch: expected {:?}, got '{}'",
                         key, expected_value, actual_value
@@ -406,7 +470,9 @@ pub fn query_params_reject_reason(
         }
     }
 
-    // If strict mode, check for extra params
+    // If strict mode, check for extra params. `request_params` has one entry
+    // per key regardless of how many times the client repeated it, so a
+    // repeated key is counted once here, not once per value.
     if matcher.strict {
         for key in sorted_keys(request_params) {
             if !matcher.params.contains_key(key) {
@@ -419,8 +485,17 @@ pub fn query_params_reject_reason(
     None
 }
 
-/// Match a single query parameter value
-fn match_query_param_value(actual: &str, expected: &QueryParamValue) -> bool {
+/// Match a single query parameter value.
+///
+/// `all_values` — every occurrence of this key, when the caller has it — is
+/// only consulted by `Contains` and `List`; `Exact`/`Regex`/`Any` test
+/// `actual` (the first value) exactly as they always have, so a key sent once
+/// matches identically whether or not `all_values` is available.
+fn match_query_param_value(
+    actual: &str,
+    all_values: Option<&Vec<String>>,
+    expected: &QueryParamValue,
+) -> bool {
     match expected {
         QueryParamValue::Exact(value) => actual == value,
         QueryParamValue::Pattern(pattern) => match pattern {
@@ -429,6 +504,14 @@ fn match_query_param_value(actual: &str, expected: &QueryParamValue) -> bool {
                 None => false,
             },
             QueryParamPattern::Any => true,
+            QueryParamPattern::Contains(value) => match all_values {
+                Some(values) => values.iter().any(|v| v == value),
+                None => actual == value,
+            },
+            QueryParamPattern::List(expected_list) => match all_values {
+                Some(values) => values == expected_list,
+                None => expected_list.len() == 1 && expected_list[0] == actual,
+            },
         },
     }
 }
@@ -458,15 +541,69 @@ pub fn parse_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String>
 /// `fetch`, Postman, most libraries), so counting them would make strict mode
 /// reject essentially all real traffic unless every mock declared them.
 /// `accept` in particular is sent by curl (`Accept: */*`) and by every browser
-/// on every request.
+/// on every request. The browser-specific entries here — `origin`, `referer`,
+/// `accept-language`, `cache-control`, `pragma`, `dnt`,
+/// `upgrade-insecure-requests` — are what a bare `fetch()` adds beyond what
+/// curl sends; see [`IGNORED_HEADER_PREFIXES`] for the `sec-*` families
+/// alongside them (#107).
 pub const IGNORED_HEADERS: &[&str] = &[
     "accept",
     "accept-encoding",
+    "accept-language",
+    "cache-control",
     "connection",
     "content-length",
+    "dnt",
     "host",
+    "origin",
+    "pragma",
+    "referer",
+    "upgrade-insecure-requests",
     "user-agent",
 ];
+
+/// Header name *prefixes* `strict: true` never counts as "extra".
+///
+/// A browser's `sec-fetch-*` and `sec-ch-ua*` families grow new members over
+/// time (`sec-fetch-storage-access`, `sec-ch-ua-form-factors`, ...), and
+/// enumerating each one by name is exactly what made #107 possible in the
+/// first place. Matching the `sec-` prefix covers the whole family — and
+/// anything else browsers introduce under it — without another release.
+pub const IGNORED_HEADER_PREFIXES: &[&str] = &["sec-"];
+
+/// Environment variable naming additional headers `strict: true` should
+/// ignore, comma-separated — additive to [`IGNORED_HEADERS`], for a client
+/// Mimic hasn't heard of yet.
+pub const STRICT_IGNORE_HEADERS_ENV: &str = "MIMIC_STRICT_IGNORE_HEADERS";
+
+/// `MIMIC_STRICT_IGNORE_HEADERS`, parsed once: lowercased header names to
+/// additionally ignore under `strict: true`.
+fn configured_strict_ignore_headers() -> &'static HashSet<String> {
+    static EXTRA: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        std::env::var(STRICT_IGNORE_HEADERS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|entry| entry.trim().to_ascii_lowercase())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// True when `strict: true` should never count `name` (already lowercase) as
+/// an undeclared, "extra" header — it's one of [`IGNORED_HEADERS`], matches an
+/// [`IGNORED_HEADER_PREFIXES`] family, or was added via
+/// [`STRICT_IGNORE_HEADERS_ENV`].
+fn is_strict_ignored_header(name: &str) -> bool {
+    IGNORED_HEADERS.contains(&name)
+        || IGNORED_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || configured_strict_ignore_headers().contains(name)
+}
 
 /// Check if request headers match the mock's requirements
 #[allow(dead_code)] // boolean view of the matcher above; exercised by the test suite
@@ -539,7 +676,7 @@ pub fn headers_reject_reason(
     // If strict mode, check for extra headers (excluding standard ones)
     if matcher.strict {
         for name in sorted_keys(request_headers) {
-            if IGNORED_HEADERS.contains(&name.as_str()) {
+            if is_strict_ignored_header(name) {
                 continue;
             }
 
@@ -633,6 +770,11 @@ pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
 /// [`decode_component`] — so `password=secret+pass` and
 /// `password=secret%20pass` both produce `secret pass`, and a mock's
 /// `"password": "secret pass"` matches either.
+///
+/// A field sent more than once (`opt=a&opt=b`) keeps its *first* value, the
+/// same treatment [`parse_query_string`] gives a repeated query key (#108) —
+/// consistent rather than silently keeping whichever happened to be inserted
+/// last.
 fn parse_form_data(text: &str) -> HashMap<String, String> {
     let mut fields = HashMap::new();
 
@@ -642,7 +784,9 @@ fn parse_form_data(text: &str) -> HashMap<String, String> {
         }
 
         if let Some((key, value)) = pair.split_once('=') {
-            fields.insert(decode_component(key), decode_component(value));
+            fields
+                .entry(decode_component(key))
+                .or_insert_with(|| decode_component(value));
         }
     }
 
@@ -1384,7 +1528,11 @@ pub fn evaluate_mock(context: &RequestContext, mock: &MockConfig) -> Evaluation 
 
     // Check query params
     if let Some(ref query_matcher) = mock.query_params {
-        if let Some(reason) = query_params_reject_reason(&context.query_params, query_matcher) {
+        if let Some(reason) = query_params_reject_reason_all(
+            &context.query_params,
+            Some(&context.query_params_all),
+            query_matcher,
+        ) {
             return Evaluation::Rejected(reason);
         }
         // Add score based on number of matched params
@@ -1845,6 +1993,148 @@ mod tests {
         assert!(match_query_params(&request, &matcher));
     }
 
+    // ── Repeated query parameters (#108) ────────────────────────────────
+
+    #[test]
+    fn test_parse_query_string_multi_keeps_every_value_in_order() {
+        let multi = parse_query_string_multi(Some("tag=a&tag=b&tag=c"));
+        assert_eq!(
+            multi.get("tag"),
+            Some(&vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    /// The bug as reported: `?tag=a&tag=b` used to become `{"tag": "b"}`,
+    /// silently dropping `a`. The single-value view is now the *first*
+    /// value, documented as such, rather than whichever happened to be
+    /// inserted last.
+    #[test]
+    fn test_parse_query_string_keeps_the_first_value_of_a_repeated_key() {
+        let single = parse_query_string(Some("tag=a&tag=b"));
+        assert_eq!(single.get("tag"), Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn test_a_repeated_key_still_matches_ordinary_exact_against_its_first_value() {
+        let matcher = QueryParamMatcher {
+            params: HashMap::from([("tag".to_string(), QueryParamValue::Exact("a".to_string()))]),
+            strict: false,
+        };
+        let context = {
+            let mut ctx = RequestContext::new("GET".to_string(), "/search".to_string());
+            ctx.query_params = parse_query_string(Some("tag=a&tag=b"));
+            ctx.query_params_all = parse_query_string_multi(Some("tag=a&tag=b"));
+            ctx
+        };
+
+        assert_eq!(
+            query_params_reject_reason_all(
+                &context.query_params,
+                Some(&context.query_params_all),
+                &matcher
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_contains_matches_any_occurrence_of_a_repeated_key() {
+        let matcher = QueryParamMatcher {
+            params: HashMap::from([(
+                "tag".to_string(),
+                QueryParamValue::Pattern(QueryParamPattern::Contains("b".to_string())),
+            )]),
+            strict: false,
+        };
+        let single = parse_query_string(Some("tag=a&tag=b"));
+        let multi = parse_query_string_multi(Some("tag=a&tag=b"));
+
+        assert_eq!(
+            query_params_reject_reason_all(&single, Some(&multi), &matcher),
+            None,
+            "'b' is among the values 'tag' carried"
+        );
+
+        let matcher_c = QueryParamMatcher {
+            params: HashMap::from([(
+                "tag".to_string(),
+                QueryParamValue::Pattern(QueryParamPattern::Contains("c".to_string())),
+            )]),
+            strict: false,
+        };
+        assert!(query_params_reject_reason_all(&single, Some(&multi), &matcher_c).is_some());
+    }
+
+    #[test]
+    fn test_list_matches_only_the_exact_ordered_set_of_values() {
+        let single = parse_query_string(Some("tag=a&tag=b"));
+        let multi = parse_query_string_multi(Some("tag=a&tag=b"));
+
+        let matches = QueryParamMatcher {
+            params: HashMap::from([(
+                "tag".to_string(),
+                QueryParamValue::Pattern(QueryParamPattern::List(vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                ])),
+            )]),
+            strict: false,
+        };
+        assert_eq!(
+            query_params_reject_reason_all(&single, Some(&multi), &matches),
+            None
+        );
+
+        let wrong_order = QueryParamMatcher {
+            params: HashMap::from([(
+                "tag".to_string(),
+                QueryParamValue::Pattern(QueryParamPattern::List(vec![
+                    "b".to_string(),
+                    "a".to_string(),
+                ])),
+            )]),
+            strict: false,
+        };
+        assert!(query_params_reject_reason_all(&single, Some(&multi), &wrong_order).is_some());
+
+        let missing_one = QueryParamMatcher {
+            params: HashMap::from([(
+                "tag".to_string(),
+                QueryParamValue::Pattern(QueryParamPattern::List(vec!["a".to_string()])),
+            )]),
+            strict: false,
+        };
+        assert!(query_params_reject_reason_all(&single, Some(&multi), &missing_one).is_some());
+    }
+
+    #[test]
+    fn test_strict_mode_counts_a_repeated_key_once_not_once_per_value() {
+        let matcher = QueryParamMatcher {
+            params: HashMap::from([("tag".to_string(), QueryParamValue::Exact("a".to_string()))]),
+            strict: true,
+        };
+        let single = parse_query_string(Some("tag=a&tag=b&tag=c"));
+        let multi = parse_query_string_multi(Some("tag=a&tag=b&tag=c"));
+
+        assert_eq!(
+            query_params_reject_reason_all(&single, Some(&multi), &matcher),
+            None,
+            "one declared key, however many values it carried, must not trip strict mode"
+        );
+    }
+
+    #[test]
+    fn test_a_repeated_form_field_keeps_its_first_value() {
+        let parsed = parse_body(
+            &Bytes::from("opt=a&opt=b"),
+            Some("application/x-www-form-urlencoded"),
+        );
+        let ParsedBody::Form(form) = parsed else {
+            panic!("expected a form body");
+        };
+        assert_eq!(form.get("opt"), Some(&"a".to_string()));
+    }
+
     // Header Tests
     #[test]
     fn test_match_headers_exact() {
@@ -2095,6 +2385,7 @@ mod tests {
             path: "/login".to_string(),
             path_params: HashMap::new(),
             query_params: HashMap::new(),
+            query_params_all: HashMap::new(),
             headers: HashMap::new(),
             body: Some(Bytes::from(format!(r#"{{"role":"{}"}}"#, role))),
             content_type: Some("application/json".to_string()),
@@ -2219,6 +2510,7 @@ mod tests {
             path: path.to_string(),
             path_params: HashMap::new(),
             query_params: HashMap::new(),
+            query_params_all: HashMap::new(),
             headers: HashMap::new(),
             body: None,
             content_type: None,
@@ -2257,6 +2549,7 @@ mod tests {
             path: "/orgs/acme/repos/widgets".to_string(),
             path_params: HashMap::new(),
             query_params: HashMap::new(),
+            query_params_all: HashMap::new(),
             headers: HashMap::new(),
             body: None,
             content_type: None,
@@ -2595,6 +2888,69 @@ mod tests {
         ]);
 
         assert!(!match_headers(&headers, &strict_bearer_matcher()));
+    }
+
+    /// The #107 repro: a browser's `fetch()` carries a family of ambient
+    /// headers beyond what curl sends, and none of them should make a strict
+    /// mock reject a request that would otherwise match.
+    #[test]
+    fn test_strict_mode_allows_a_browsers_ambient_headers() {
+        let headers = HashMap::from([
+            ("authorization".to_string(), "Bearer abc".to_string()),
+            ("origin".to_string(), "http://localhost:3000".to_string()),
+            ("referer".to_string(), "http://localhost:3000/".to_string()),
+            ("accept-language".to_string(), "en-US".to_string()),
+            ("cache-control".to_string(), "no-cache".to_string()),
+            ("pragma".to_string(), "no-cache".to_string()),
+            ("dnt".to_string(), "1".to_string()),
+            ("upgrade-insecure-requests".to_string(), "1".to_string()),
+            ("sec-fetch-mode".to_string(), "cors".to_string()),
+            ("sec-fetch-site".to_string(), "same-origin".to_string()),
+            ("sec-fetch-dest".to_string(), "empty".to_string()),
+            (
+                "sec-ch-ua".to_string(),
+                "\"Chromium\";v=\"120\"".to_string(),
+            ),
+            ("sec-ch-ua-platform".to_string(), "\"Linux\"".to_string()),
+        ]);
+
+        assert!(
+            match_headers(&headers, &strict_bearer_matcher()),
+            "none of a browser's ambient headers should trip strict mode"
+        );
+    }
+
+    /// A future `sec-*` header Mimic has never heard of must still be
+    /// ignored — the whole point of matching by prefix instead of an
+    /// enumerated list.
+    #[test]
+    fn test_strict_mode_ignores_any_sec_prefixed_header() {
+        let headers = HashMap::from([
+            ("authorization".to_string(), "Bearer abc".to_string()),
+            ("sec-fetch-storage-access".to_string(), "active".to_string()),
+            (
+                "sec-ch-ua-form-factors".to_string(),
+                "\"Desktop\"".to_string(),
+            ),
+        ]);
+
+        assert!(match_headers(&headers, &strict_bearer_matcher()));
+    }
+
+    /// A genuinely undeclared, meaningful header must still be rejected —
+    /// widening the ignore list must not make strict mode toothless.
+    #[test]
+    fn test_strict_mode_still_rejects_a_meaningful_undeclared_header() {
+        let headers = HashMap::from([
+            ("authorization".to_string(), "Bearer abc".to_string()),
+            ("x-tenant".to_string(), "acme".to_string()),
+        ]);
+
+        let reason = headers_reject_reason(&headers, &strict_bearer_matcher());
+        match reason {
+            Some(RejectReason::HeaderExtra { name }) => assert_eq!(name, "x-tenant"),
+            other => panic!("expected a HeaderExtra rejection, got {:?}", other),
+        }
     }
 }
 
