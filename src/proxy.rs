@@ -6,14 +6,17 @@
 //! user-facing configuration story; this module is the implementation.
 
 use crate::handler::is_textual_content_type;
-use crate::matcher::{parse_body, ParsedBody, RequestContext, IGNORED_HEADERS};
+use crate::matcher::{parse_body, ParsedBody, RequestContext};
 use crate::types::{
     is_sensitive_header, is_truthy, BodyMatcher, FormBodyMatcher, HeaderMatcher, HeaderValue,
     JsonBodyMatcher, MockConfig, QueryParamMatcher, QueryParamValue, TextBodyMatcher,
 };
-use axum::http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode};
+use axum::http::{
+    header::{CONTENT_ENCODING, CONTENT_TYPE},
+    HeaderMap, Method, StatusCode,
+};
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -156,6 +159,28 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+/// `Content-Encoding` values the `reqwest` client transparently decodes
+/// before we ever see the bytes — see the `gzip`, `deflate`, and `brotli`
+/// features on the `reqwest` dependency (#106).
+///
+/// `reqwest` decodes the *body* but doesn't rewrite the *header* to match —
+/// a known quirk, not a Mimic bug — so a name on this list is what
+/// [`forward`] uses to know the header is now stale and strip it itself.
+/// Anything not on this list (`zstd`, `identity`, a typo) is left exactly as
+/// the upstream sent it, because the body behind it is still whatever the
+/// upstream sent too.
+const DECODED_CONTENT_ENCODINGS: &[&str] = &["gzip", "x-gzip", "deflate", "br"];
+
+/// True when `value` (a raw `Content-Encoding` header value) names an
+/// encoding [`forward`] already decoded for us.
+fn is_transparently_decoded_encoding(value: &axum::http::HeaderValue) -> bool {
+    value.to_str().is_ok_and(|v| {
+        DECODED_CONTENT_ENCODINGS
+            .iter()
+            .any(|enc| v.trim().eq_ignore_ascii_case(enc))
+    })
+}
+
 pub struct ProxyResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -228,6 +253,15 @@ pub async fn forward(
     let mut out_headers = HeaderMap::new();
     for (name, value) in response.headers().iter() {
         if HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        // The body reqwest is about to hand us has already been decoded for
+        // any of these — see `DECODED_CONTENT_ENCODINGS` — so the header
+        // would otherwise tell a client to decode bytes that no longer need
+        // it (#106). `content-length` needs no matching fix: it's already
+        // hop-by-hop above, so axum computes the correct one from the actual
+        // (decoded) body.
+        if name == CONTENT_ENCODING && is_transparently_decoded_encoding(value) {
             continue;
         }
         out_headers.insert(name.clone(), value.clone());
@@ -317,10 +351,13 @@ fn request_signature(context: &RequestContext) -> String {
     query.sort_by_key(|(k, _)| k.as_str());
     query.hash(&mut hasher);
 
+    // The same header set `build_header_matcher` captures — so a request that
+    // differs only in a header the matcher ignores hashes identically, and
+    // dedupes onto the recording that would already answer it (#105).
     let mut headers: Vec<(&String, &String)> = context
         .headers
         .iter()
-        .filter(|(k, _)| !is_sensitive_header(k) && !IGNORED_HEADERS.contains(&k.as_str()))
+        .filter(|(k, _)| !is_sensitive_header(k) && is_recordable_header(k))
         .collect();
     headers.sort_by_key(|(k, _)| k.as_str());
     headers.hash(&mut hasher);
@@ -433,14 +470,26 @@ fn max_existing_index(dir: &Path, prefix: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Response headers whose value belongs to *this one exchange*, not to
+/// replays of the recorded mock: a `date` and `server` from the moment of
+/// recording, re-served forever, would misdescribe every future replay as
+/// having happened right then (shared with #106's `content-encoding` case
+/// below).
+const NON_REPLAYABLE_RESPONSE_HEADERS: &[&str] = &["date", "server"];
+
 /// Response headers worth persisting into a recorded mock's
-/// `response_headers`: not hop-by-hop (already stripped by [`forward`]) and
-/// not carrying credentials the upstream set for this specific exchange
-/// (e.g. `Set-Cookie`).
+/// `response_headers`: not hop-by-hop (already stripped by [`forward`]), not
+/// carrying credentials the upstream set for this specific exchange (e.g.
+/// `Set-Cookie`), and not a per-exchange value a replay must not re-serve
+/// (see [`NON_REPLAYABLE_RESPONSE_HEADERS`], and `content-encoding` —
+/// stripped where the body is decoded, in [`record_exchange`]).
 fn recordable_response_headers(headers: &HeaderMap) -> Option<HashMap<String, String>> {
     let map: HashMap<String, String> = headers
         .iter()
-        .filter(|(name, _)| !is_sensitive_header(name.as_str()))
+        .filter(|(name, _)| {
+            !is_sensitive_header(name.as_str())
+                && !NON_REPLAYABLE_RESPONSE_HEADERS.contains(&name.as_str())
+        })
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -464,16 +513,55 @@ fn build_query_matcher(query_params: &HashMap<String, String>) -> Option<QueryPa
     })
 }
 
-/// Header matcher captured from the proxied request. Sensitive headers
-/// (`Authorization`, `Cookie`, …) and headers every mainstream client sends
-/// unconditionally (`User-Agent`, `Accept-Encoding`, …) are left out — the
-/// former so a recorded mock file is never an accidental secrets store, the
-/// latter so the recorded mock still matches the *next* client that isn't
-/// byte-for-byte identical to the one that triggered the recording.
+/// Environment variable naming extra request headers a recording should
+/// require, comma-separated — additive to [`DEFAULT_RECORD_MATCH_HEADERS`],
+/// for an API that genuinely varies its response by a header (e.g.
+/// `MIMIC_RECORD_MATCH_HEADERS=x-tenant,accept`).
+pub const RECORD_MATCH_HEADERS_ENV: &str = "MIMIC_RECORD_MATCH_HEADERS";
+
+/// Header names captured into every recording's matcher by default.
+///
+/// `content-type` is the one header that plausibly *selects* which response
+/// an endpoint should give; everything else a client sends — trace ids,
+/// `origin`/`referer`, `accept-language`, `sec-fetch-*` — varies per request
+/// for most real clients, and pinning it as `required` is what made a
+/// recording stop matching the very next request (#105).
+const DEFAULT_RECORD_MATCH_HEADERS: &[&str] = &["content-type"];
+
+/// `MIMIC_RECORD_MATCH_HEADERS`, parsed once: lowercased header names to
+/// capture into a recording's matcher, beyond [`DEFAULT_RECORD_MATCH_HEADERS`].
+fn configured_record_match_headers() -> &'static HashSet<String> {
+    static EXTRA: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        std::env::var(RECORD_MATCH_HEADERS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|entry| entry.trim().to_ascii_lowercase())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// True when `name` (already lowercase) belongs in a recorded mock's header
+/// matcher — [`DEFAULT_RECORD_MATCH_HEADERS`], or added via
+/// [`RECORD_MATCH_HEADERS_ENV`].
+fn is_recordable_header(name: &str) -> bool {
+    DEFAULT_RECORD_MATCH_HEADERS.contains(&name) || configured_record_match_headers().contains(name)
+}
+
+/// Header matcher captured from the proxied request.
+///
+/// An *allowlist*, not a denylist: only [`is_recordable_header`] names become
+/// `required` matchers. Sensitive headers (`Authorization`, `Cookie`, …) are
+/// excluded outright so a recorded mock file is never an accidental secrets
+/// store, regardless of what `MIMIC_RECORD_MATCH_HEADERS` names.
 fn build_header_matcher(headers: &HashMap<String, String>) -> Option<HeaderMatcher> {
     let required: HashMap<String, HeaderValue> = headers
         .iter()
-        .filter(|(k, _)| !is_sensitive_header(k) && !IGNORED_HEADERS.contains(&k.as_str()))
+        .filter(|(k, _)| !is_sensitive_header(k) && is_recordable_header(k))
         .map(|(k, v)| (k.clone(), HeaderValue::Exact(v.clone())))
         .collect();
     if required.is_empty() {
@@ -579,6 +667,22 @@ pub async fn record_exchange(
         return;
     }
 
+    // `forward` already strips `content-encoding` for anything it decoded
+    // (see `DECODED_CONTENT_ENCODINGS`), so a value still here names an
+    // encoding this build can't decode — recording it would mean writing the
+    // still-compressed bytes as "text" (#106's mojibake) rather than a
+    // silently corrupt mock.
+    if let Some(encoding) = response_headers.get(CONTENT_ENCODING) {
+        warn!(
+            "Not recording {} {}: response content-encoding '{}' can't be decoded by this build, \
+             so the body isn't text Mimic can record",
+            context.method,
+            context.path,
+            encoding.to_str().unwrap_or("<non-utf8>")
+        );
+        return;
+    }
+
     let signature = request_signature(&context);
     let sanitized_path = sanitize_path_for_filename(&context.path);
     let prefix = format!("{}_{}", context.method.to_lowercase(), sanitized_path);
@@ -635,6 +739,7 @@ mod tests {
             path: path.to_string(),
             path_params: HashMap::new(),
             query_params: HashMap::new(),
+            query_params_all: HashMap::new(),
             headers: HashMap::new(),
             body: None,
             content_type: None,
@@ -774,15 +879,56 @@ mod tests {
     }
 
     #[test]
-    fn request_signature_differs_on_meaningful_headers() {
+    fn request_signature_differs_on_content_type() {
+        // content-type is the one header captured by default (#105) — it
+        // plausibly selects which response an endpoint gives.
         let mut a = ctx("GET", "/users/1");
-        a.headers.insert("x-tenant".to_string(), "acme".to_string());
+        a.headers
+            .insert("content-type".to_string(), "application/json".to_string());
 
         let mut b = ctx("GET", "/users/1");
         b.headers
-            .insert("x-tenant".to_string(), "globex".to_string());
+            .insert("content-type".to_string(), "text/plain".to_string());
 
         assert_ne!(request_signature(&a), request_signature(&b));
+    }
+
+    /// The #105 repro: a recording made against a request carrying a trace id
+    /// must still dedupe with — and its matcher must still accept — the next
+    /// request that differs only in that header.
+    #[test]
+    fn request_signature_ignores_trace_and_browser_headers_by_default() {
+        let mut a = ctx("GET", "/users/1");
+        a.headers
+            .insert("x-request-id".to_string(), "abc-111".to_string());
+        a.headers
+            .insert("traceparent".to_string(), "00-aaa-bbb-01".to_string());
+        a.headers
+            .insert("referer".to_string(), "http://localhost:3000/".to_string());
+        a.headers
+            .insert("origin".to_string(), "http://localhost:3000".to_string());
+        a.headers
+            .insert("accept-language".to_string(), "en-US".to_string());
+
+        let mut b = ctx("GET", "/users/1");
+        b.headers
+            .insert("x-request-id".to_string(), "def-222".to_string());
+        b.headers
+            .insert("traceparent".to_string(), "00-ccc-ddd-01".to_string());
+        b.headers.insert(
+            "referer".to_string(),
+            "http://localhost:3000/page".to_string(),
+        );
+        b.headers
+            .insert("origin".to_string(), "http://localhost:3000".to_string());
+        b.headers
+            .insert("accept-language".to_string(), "fr-FR".to_string());
+
+        assert_eq!(
+            request_signature(&a),
+            request_signature(&b),
+            "none of these should make two otherwise-identical requests dedupe separately"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -826,16 +972,67 @@ mod tests {
             .insert("cookie".to_string(), "session=abc123".to_string());
         context
             .headers
-            .insert("x-api-key".to_string(), "public-ish-key".to_string());
+            .insert("content-type".to_string(), "application/json".to_string());
 
         let mock = build_recorded_mock(&context, 200, &HeaderMap::new(), &Bytes::new());
 
-        let headers = mock
-            .headers
-            .expect("non-sensitive header should still be captured");
+        let headers = mock.headers.expect("content-type should still be captured");
         assert!(!headers.required.contains_key("authorization"));
         assert!(!headers.required.contains_key("cookie"));
-        assert!(headers.required.contains_key("x-api-key"));
+        assert!(headers.required.contains_key("content-type"));
+    }
+
+    // ---------------------------------------------------------------------
+    // build_header_matcher: the allowlist (#105)
+    // ---------------------------------------------------------------------
+
+    /// The other half of the #105 repro: everything a recording used to pin
+    /// by default is exactly what stopped it from ever replaying.
+    #[test]
+    fn recorded_mock_does_not_capture_trace_ids_or_browser_headers_by_default() {
+        let mut context = ctx("GET", "/api/items");
+        context
+            .headers
+            .insert("x-request-id".to_string(), "abc-111".to_string());
+        context
+            .headers
+            .insert("traceparent".to_string(), "00-aaa-bbb-01".to_string());
+        context
+            .headers
+            .insert("origin".to_string(), "http://localhost:3000".to_string());
+        context
+            .headers
+            .insert("referer".to_string(), "http://localhost:3000/".to_string());
+        context
+            .headers
+            .insert("accept-language".to_string(), "en-US".to_string());
+        context
+            .headers
+            .insert("sec-fetch-mode".to_string(), "cors".to_string());
+
+        let mock = build_recorded_mock(&context, 200, &HeaderMap::new(), &Bytes::new());
+
+        assert!(
+            mock.headers.is_none(),
+            "none of these headers plausibly select a response, so the recording \
+             must carry no header matcher at all"
+        );
+    }
+
+    #[test]
+    fn recorded_mock_captures_content_type_by_default() {
+        let mut context = ctx("POST", "/api/items");
+        context
+            .headers
+            .insert("content-type".to_string(), "application/json".to_string());
+
+        let mock = build_recorded_mock(&context, 200, &HeaderMap::new(), &Bytes::new());
+
+        let headers = mock.headers.expect("content-type should be captured");
+        match headers.required.get("content-type") {
+            Some(HeaderValue::Exact(value)) => assert_eq!(value, "application/json"),
+            other => panic!("expected an exact content-type matcher, got {:?}", other),
+        }
     }
 
     #[test]
