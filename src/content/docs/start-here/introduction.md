@@ -9,20 +9,21 @@ It exists because most "real" backends are too slow, too unreliable, or simply d
 
 ## What Mimic is good at
 
-- **Frontend development against a missing backend.** Your team hasn't built the API yet, but the UI ticket is sitting on your board. Mock it with Mimic, ship the UI, swap in the real backend later.
+- **Frontend development against a missing backend.** Your team hasn't built the API yet, but the UI ticket is sitting on your board. Mock it with Mimic, ship the UI, swap in the real backend later — turn on [built-in CORS](/guides/cors/) and point your dev server straight at it.
 - **Reproducing edge cases.** Forcing a real backend to return a `503`, a slow response, or a specific malformed payload is hard. With Mimic it's one line of JSON — see [Response Delays](/dynamic-responses/delays/) and [Stateful Sequences](/dynamic-responses/sequences/).
-- **Third-party API simulation.** Stripe, GitHub, payment gateways — anything you don't want to actually call during tests.
-- **CI pipelines.** Mimic starts in under a second and uses ~1.66 MiB of memory, so it's cheap to spin up alongside your test suite.
-- **Demos and local environments.** Run a credible backend stand-in without provisioning anything.
+- **Third-party API simulation.** Stripe, GitHub, payment gateways — anything you don't want to actually call during tests. [Proxy & record-and-replay](/guides/proxy/) can even build the mock set for you from real traffic the first time you exercise it.
+- **CI pipelines.** Mimic starts in under a second and uses ~1.66 MiB of memory, so it's cheap to spin up alongside your test suite. [Scenario tags](/guides/scenarios/) let one mocks directory serve both your happy-path suite and your error-path suite.
+- **Demos and local environments.** Run a credible backend stand-in without provisioning anything, and inspect exactly what was served from the [admin dashboard](/guides/admin-dashboard/).
+- **Bootstrapping mocks from an existing contract.** Already have an OpenAPI spec? [Generate a whole mocks directory from it](/guides/openapi-import/) instead of hand-writing every file.
 
 ## What Mimic is not
 
 Mimic is intentionally focused. It is **not**:
 
-- A full API gateway or reverse proxy.
+- A full API gateway.
 - A stateful database or a contract-testing tool.
-- A record-and-replay tool (it does not capture real traffic).
 - A load-testing target (though it's fast enough to use as one in a pinch).
+- A transparent proxy for a whole API surface — [proxying](/guides/proxy/) is an opt-in fallback for requests nothing local matches, not the primary way to run Mimic.
 
 If you need any of the above, Mimic is the wrong tool. If you need *"return this JSON when someone hits this path,"* Mimic is exactly the tool.
 

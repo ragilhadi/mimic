@@ -21,6 +21,8 @@ A mock has to match method and path to be considered at all — an **exact** pat
 
 Exact-path candidates are looked up first (an O(1) hash lookup — no performance cost from having many pattern mocks around), and pattern candidates are only considered as a fallback. See [Path Parameters](/matching/path-parameters/) for the full behavior, including how this interacts with [sequences](/dynamic-responses/sequences/).
 
+A request whose literal path matches nothing may still be served via [trailing-slash tolerance](/matching/trailing-slash/) — the match explanation on such a response notes `trailing slash normalized`, with no score penalty for taking that fallback.
+
 ## Example: specific override on top of a fallback
 
 Imagine two mocks for `GET /users`:
@@ -149,7 +151,13 @@ This is the same idea as the pagination example above, just applied to the path 
 
 ## Tie-breaking
 
-If two mocks have the same score, Mimic picks one but the choice is not guaranteed to be stable across reloads. **Design your mocks so no two have identical scores for the same request.** The easiest way is to add another matcher to one of them — even matching a single header is enough to push the score apart.
+Equal scores are broken **deterministically** — the winner never depends on load order, so it stays the same across restarts and hot reloads:
+
+1. **Most literal path segments first** — `/users/:id` (one parameter) beats `/{resource}/:id` (two parameters) for the same score.
+2. **Lowest `METHOD:path` key, lexicographically.**
+3. **Earliest position** among mocks sharing that key — effectively, alphabetical-by-file-path load order (see [Mock Files](/guides/mock-files/#how-mimic-discovers-mocks)).
+
+This makes ties predictable rather than an error to design around, but a mock that depends on winning a tie is still harder to reason about than one that doesn't — adding a matcher to push the score apart remains the clearest way to make a mock's precedence obvious at a glance.
 
 ## Debugging match decisions
 

@@ -35,7 +35,13 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		Match on path parameters, query params, headers, and request body content — not just method and path.
 	</Card>
 	<Card title="Dynamic responses" icon="star">
-		Echo request data back with `{{ }}` templating, simulate latency, return custom headers, or step through a sequence of responses.
+		Echo request data back with `{{ }}` templating, generate fake data with `{{faker.*}}`, simulate latency, or step through a sequence of responses.
+	</Card>
+	<Card title="Admin dashboard" icon="seti:default">
+		See every request, why it did or didn't match, and switch scenarios live — at `/admin/dashboard`.
+	</Card>
+	<Card title="Proxy & record-and-replay" icon="seti:db">
+		Point Mimic at a real API and let it build a matching mock set for you.
 	</Card>
 	<Card title="Docker-first" icon="seti:docker">
 		Prebuilt images on Docker Hub for `amd64` and `arm64`. Mount a folder of mocks and you're done.
@@ -69,5 +75,11 @@ Drop a JSON file in `./mocks/` and Mimic will serve it. That's it.
 	</Card>
 	<Card title="Deploying somewhere?" icon="cloud-download">
 		See the [Docker](/deployment/docker/) and [Docker Compose](/deployment/docker-compose/) deployment guides.
+	</Card>
+	<Card title="Debugging a mismatch?" icon="magnifier">
+		The [Admin Dashboard](/guides/admin-dashboard/) shows every request and explains exactly why a mock did or didn't match.
+	</Card>
+	<Card title="Already have an OpenAPI spec?" icon="seti:json">
+		[Generate a whole mocks directory from it](/guides/openapi-import/) instead of writing every file by hand.
 	</Card>
 </CardGrid>

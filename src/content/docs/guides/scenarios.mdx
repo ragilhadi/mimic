@@ -1,0 +1,93 @@
+---
+title: Scenario Tags
+description: Keep happy-path and error mocks side by side and switch between them with tags.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+One `mocks/` directory can hold **both** your happy-path mocks and your error mocks. Tag them, and switch which set is live per CI job or per test run — no file editing, no second directory, no restart.
+
+## Tagging a mock
+
+Add a `tags` array to any mock:
+
+```json
+{
+  "method": "POST",
+  "path": "/checkout",
+  "status": 500,
+  "tags": ["error-scenario"],
+  "response": { "error": "internal error" }
+}
+```
+
+```bash
+# mocks/checkout_ok.json   → "tags": ["happy-path"]
+# mocks/checkout_500.json  → "tags": ["error-scenario"]
+
+MIMIC_ACTIVE_TAGS=happy-path mimic     # only checkout_ok.json is matchable
+```
+
+## Rules
+
+- **A mock with no `tags` is always matchable.** Existing mock files need zero changes, and a server started without `MIMIC_ACTIVE_TAGS` behaves exactly as it did before this feature existed.
+- **`MIMIC_ACTIVE_TAGS` unset or empty means no filtering** — every mock, tagged or not, is matchable.
+- A tagged mock is matchable **while at least one of its tags is active**.
+- Tags are matched **exactly and case-sensitively**; whitespace around a tag in the comma-separated list is trimmed (`happy-path, smoke-test` is two tags).
+- An inactive mock **404s as if it were not loaded**. Requests fall through to whatever else can serve the path — an untagged mock, or a `/users/:id` pattern route.
+- Tag filtering **does not touch sequence counters**: they are keyed per mock, so switching scenarios and back resumes a [sequence](/dynamic-responses/sequences/) where it left off rather than restarting it.
+- With **no filter active**, two mocks tagged for opposite scenarios on the same path are *both* matchable and one of them wins via [match priority](/matching/priority/) — so set `MIMIC_ACTIVE_TAGS` (or `POST /admin/scenario`) whenever you keep competing scenarios side by side.
+
+## Switching at runtime
+
+Check what's active:
+
+```bash
+curl http://localhost:8080/admin/scenario
+```
+
+```json
+{
+  "active_tags": ["happy-path"],
+  "filtering": true,
+  "known_tags": ["error-scenario", "happy-path"],
+  "matchable_mocks": 12,
+  "total_mocks": 14
+}
+```
+
+Switch scenarios — takes effect on the next request, no restart:
+
+```bash
+curl -X POST http://localhost:8080/admin/scenario \
+  -d '{"tags": ["error-scenario"]}'
+```
+
+Turn filtering off again, so every mock becomes matchable:
+
+```bash
+curl -X POST http://localhost:8080/admin/scenario -d '{"tags": []}'
+```
+
+`POST /admin/scenario` **replaces** the active set (it is not additive) and returns the same body `GET` does. A tag entry may itself be a comma-separated list, so `{"tags": ["a,b"]}` and `{"tags": ["a", "b"]}` are equivalent. A body that isn't valid JSON is answered `400` and leaves the current scenario alone.
+
+## Worked example: testing an error path
+
+```bash
+MIMIC_ACTIVE_TAGS=happy-path mimic &
+
+curl -X POST http://localhost:8080/checkout    # 200 {"order_id": "..."}
+
+curl -X POST http://localhost:8080/admin/scenario -d '{"tags": ["error-scenario"]}'
+
+curl -X POST http://localhost:8080/checkout    # 500 {"error": "internal error"}
+```
+
+## Observability
+
+- [`GET /admin/mocks`](/reference/admin-api/#get-adminmocks) reports each mock's `tags` and an `active` flag, so a mock that is loaded but currently filtered out is obvious.
+- A 404 caused by an inactive mock records *"N mock(s) match `POST:/checkout` but are filtered out by inactive tags"* in the request log and the debug log. The 404 **response body is unchanged** — scenario configuration is never leaked to API clients.
+
+<Aside type="tip">
+Tags are the difference between "one mock file per environment" and one directory that serves every environment, differentiated by `MIMIC_ACTIVE_TAGS` in each CI job's environment variables.
+</Aside>

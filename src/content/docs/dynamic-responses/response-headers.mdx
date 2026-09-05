@@ -39,6 +39,10 @@ By default every Mimic response is served as `Content-Type: application/json`. U
 }
 ```
 
+<Aside type="tip">
+Repeating this on every endpoint gets old fast. For a whole API, set `MIMIC_CORS=true` instead and skip per-mock headers entirely — see [Built-in CORS](/guides/cors/). Per-mock headers are still how you mock a *specific* CORS response, including a deliberately broken one; the env var is for not repeating them everywhere else.
+</Aside>
+
 ## Redirects and created resources
 
 Set a `Location` header alongside a `201 Created` or `3xx` status:
