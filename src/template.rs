@@ -211,14 +211,66 @@ fn resolve_body(body: Option<&ParsedBody>, key: &str) -> Option<String> {
     match body? {
         ParsedBody::Json(root) => {
             let mut current = root;
-            for part in key.split('.') {
-                current = current.get(part)?;
+            for segment in split_body_path(key) {
+                current = index_value(current, &segment)?;
             }
             value_to_template_string(current)
         }
         ParsedBody::Form(fields) => fields.get(key).cloned(),
         _ => None,
     }
+}
+
+/// Split a `{{body.…}}` key into the steps [`index_value`] walks one at a
+/// time, accepting dot and bracket syntax interchangeably at every level:
+/// `items.0.sku`, `items[0].sku`, and `matrix[0][1]` all split into the same
+/// shape — `["items", "0", "sku"]`, `["matrix", "0", "1"]` — one object key
+/// or array index per segment.
+fn split_body_path(key: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = key.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            '[' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                let index: String = chars.by_ref().take_while(|&c| c != ']').collect();
+                if !index.is_empty() {
+                    segments.push(index);
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// One step of a body path: an object key lookup first — so an object whose
+/// keys happen to be numeric strings (`{"0": "zero"}`) still resolves by key
+/// — then, only when `current` is an array, `segment` parsed as a
+/// zero-based index. Anything else (an out-of-range index, a non-numeric
+/// segment against an array, indexing into a string/number/bool/null) is a
+/// miss like any other: `None`, never a panic.
+fn index_value<'a>(current: &'a Value, segment: &str) -> Option<&'a Value> {
+    if let Value::Object(map) = current {
+        return map.get(segment);
+    }
+    if let Value::Array(arr) = current {
+        let index: usize = segment.parse().ok()?;
+        return arr.get(index);
+    }
+    None
 }
 
 /// Missing keys and explicit JSON `null` both render as an empty string;
@@ -393,6 +445,130 @@ mod tests {
             render_response(&value, &c),
             json!({"summary": "age=30 active=true"})
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Array indexing in template paths (#115)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_split_body_path_dot_and_bracket_syntax_produce_identical_segments() {
+        assert_eq!(split_body_path("items.0.sku"), vec!["items", "0", "sku"]);
+        assert_eq!(split_body_path("items[0].sku"), vec!["items", "0", "sku"]);
+    }
+
+    #[test]
+    fn test_split_body_path_handles_nested_and_consecutive_brackets() {
+        assert_eq!(split_body_path("a.0.b.1"), vec!["a", "0", "b", "1"]);
+        assert_eq!(split_body_path("matrix[0][1]"), vec!["matrix", "0", "1"]);
+        assert_eq!(split_body_path("0"), vec!["0"]);
+    }
+
+    #[test]
+    fn test_dot_and_bracket_array_indexing_resolve_identically() {
+        let body = ParsedBody::Json(json!({"items": [{"sku": "A1"}, {"sku": "B2"}]}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let dot = render_response(&json!({"sku": "{{body.items.0.sku}}"}), &c);
+        let bracket = render_response(&json!({"sku": "{{body.items[0].sku}}"}), &c);
+        assert_eq!(dot, json!({"sku": "A1"}));
+        assert_eq!(dot, bracket);
+    }
+
+    #[test]
+    fn test_nested_array_indexing() {
+        let body = ParsedBody::Json(json!({"a": [{"b": ["x", "y", "z"]}]}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"v": "{{body.a.0.b.1}}"});
+        assert_eq!(render_response(&value, &c), json!({"v": "y"}));
+    }
+
+    #[test]
+    fn test_out_of_range_index_becomes_empty_string_no_panic() {
+        let body = ParsedBody::Json(json!({"items": [{"sku": "A1"}]}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"sku": "{{body.items.5.sku}}"});
+        assert_eq!(render_response(&value, &c), json!({"sku": ""}));
+    }
+
+    #[test]
+    fn test_non_numeric_segment_against_an_array_becomes_empty_string_no_panic() {
+        let body = ParsedBody::Json(json!({"items": [1, 2, 3]}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"v": "{{body.items.sku}}"});
+        assert_eq!(render_response(&value, &c), json!({"v": ""}));
+    }
+
+    #[test]
+    fn test_indexing_into_a_non_array_non_object_leaf_becomes_empty_string_no_panic() {
+        let body = ParsedBody::Json(json!({"count": 3}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"v": "{{body.count.0}}"});
+        assert_eq!(render_response(&value, &c), json!({"v": ""}));
+    }
+
+    #[test]
+    fn test_object_with_a_numeric_string_key_resolves_by_key_not_index() {
+        // The object case acceptance criterion #4 calls out by name: a
+        // numeric-looking key on an *object* must not be reinterpreted as an
+        // array index.
+        let body = ParsedBody::Json(json!({"items": {"0": "zero", "1": "one"}}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"v": "{{body.items.0}}"});
+        assert_eq!(render_response(&value, &c), json!({"v": "zero"}));
+    }
+
+    #[test]
+    fn test_top_level_array_body_can_be_indexed_directly() {
+        // Bracket syntax needs at least one dot-attached field name before it
+        // (`{{body.source.key}}` is the template regex's own shape), so a
+        // root-level array is indexed with a leading dot: `{{body.1.sku}}`.
+        let body = ParsedBody::Json(json!([{"sku": "A1"}, {"sku": "B2"}]));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"sku": "{{body.1.sku}}"});
+        assert_eq!(render_response(&value, &c), json!({"sku": "B2"}));
+    }
+
+    #[test]
+    fn test_number_cast_on_an_array_indexed_field() {
+        let body = ParsedBody::Json(json!({"items": [{"qty": 5}, {"qty": 9}]}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"qty": "{{number:body.items[1].qty}}"});
+        assert_eq!(render_response(&value, &c), json!({"qty": 9}));
+    }
+
+    #[test]
+    fn test_json_cast_on_an_array_indexed_object() {
+        let body = ParsedBody::Json(json!({"items": [{"id": 1}, {"id": 2}]}));
+        let empty = HashMap::new();
+        let c = ctx(&empty, &empty, &empty, Some(&body));
+
+        let value = json!({"item": "{{json:body.items.1}}"});
+        assert_eq!(render_response(&value, &c), json!({"item": {"id": 2}}));
+    }
+
+    #[test]
+    fn test_references_body_detects_bracket_syntax() {
+        let value = json!({"sku": "{{body.items[0].sku}}"});
+        assert!(references_body(&value));
+
+        let text = "{{body.items[0].sku}}";
+        assert!(text_references_body(text));
     }
 
     #[test]

@@ -1502,6 +1502,7 @@ Mock responses don't have to be fully static. Use `{{ }}` double-brace syntax in
 | `{{header.x-request-id}}` | Request header value (case-insensitive) |
 | `{{body.username}}` | Top-level JSON (or form) body field |
 | `{{body.user.email}}` | Nested JSON body field (dot notation) |
+| `{{body.items.0.sku}}` or `{{body.items[0].sku}}` | [Array element](#array-indexing) by index — either syntax |
 | `{{path.id}}` | Named [path parameter](#path-parameters) `:id` or `{id}` |
 | `{{faker.uuid}}` | [Random generated data](#faker-generators) — no request input needed |
 
@@ -1546,6 +1547,54 @@ curl -X POST http://localhost:8080/users \
   "self_url": "/users/99"
 }
 ```
+
+### Array Indexing
+
+`{{body.…}}` templates can index into arrays as well as objects — a zero-based
+integer segment reads an array element, in either dot or bracket syntax:
+
+```json
+{
+  "method": "POST",
+  "path": "/orders",
+  "status": 201,
+  "response": {
+    "first_sku": "{{body.items.0.sku}}",
+    "first_sku_bracket": "{{body.items[0].sku}}",
+    "first_qty": "{{number:body.items[0].qty}}"
+  }
+}
+```
+
+```bash
+curl -X POST http://localhost:8080/orders \
+  -H "Content-Type: application/json" \
+  -d '{"items":[{"sku":"WIDGET-1","qty":3},{"sku":"WIDGET-2","qty":1}]}'
+```
+
+**Response:**
+```json
+{
+  "first_sku": "WIDGET-1",
+  "first_sku_bracket": "WIDGET-1",
+  "first_qty": 3
+}
+```
+
+Notes:
+
+- **Dot and bracket syntax are interchangeable, at every level.**
+  `body.items.0.sku`, `body.items[0].sku`, and even `body.a.0.b.1` (nested
+  arrays, mixed with object fields) all resolve the same way — pick whichever
+  reads better for a given field.
+- **Object keys win over array indices.** A JSON object whose keys happen to
+  look numeric (`{"0": "zero"}`) still resolves by key lookup first; only an
+  actual array is indexed by position.
+- **Out-of-range and non-numeric indices degrade gracefully** — an empty
+  string (or `null` under a `json:` cast), never a panic — the same as any
+  other missing key.
+- **Every [typed cast](#typed-casts-opt-in) works on an indexed path**:
+  `{{number:body.items.0.qty}}`, `{{json:body.items.0}}`, and so on.
 
 ### Faker Generators
 
