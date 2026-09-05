@@ -232,7 +232,8 @@ pub fn resolve_mocks_dir_from(
 /// Loads mock configurations from a directory or file into a raw HashMap.
 ///
 /// Args:
-///     path (str): Path to directory containing JSON mock files or a single JSON file.
+///     path (str): Path to a directory containing `.json`/`.yaml`/`.yml` mock
+///     files, or a single such file.
 ///
 /// Returns:
 ///     LoadResult containing mock configurations keyed by "METHOD:PATH" and the
@@ -323,7 +324,7 @@ fn load_mocks_map_core(
             changed: &mut changed,
             seen: &mut seen,
         };
-        collect_json_files(path_obj, &root, max_response_file, &mut state, 0);
+        collect_mock_files(path_obj, &root, max_response_file, &mut state, 0);
     }
 
     let before = cache.files.len();
@@ -394,7 +395,8 @@ fn load_mocks_map_core(
 /// Loads mock configurations from a directory or file.
 ///
 /// Args:
-///     path (str): Path to directory containing JSON mock files or a single JSON file.
+///     path (str): Path to a directory containing `.json`/`.yaml`/`.yml` mock
+///     files, or a single such file.
 ///
 /// Returns:
 ///     MockStore: Thread-safe HashMap of mock configurations keyed by "METHOD:PATH".
@@ -403,7 +405,22 @@ pub fn load_mocks(path: &str) -> MockStore {
     Arc::new(RwLock::new(result.mocks))
 }
 
-/// Recursively collects and loads all JSON mock files from a directory tree.
+/// Extensions the loader treats as a mock definition rather than an ordinary
+/// file (or a fixture named by `response_file`). Which of these a given file
+/// gets parsed with is decided in [`load_single_mock`], purely from this same
+/// extension.
+const MOCK_EXTENSIONS: [&str; 3] = ["json", "yaml", "yml"];
+
+/// Whether `path`'s extension is one [`collect_mock_files`] treats as a mock
+/// definition.
+fn is_mock_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| MOCK_EXTENSIONS.contains(&ext))
+}
+
+/// Recursively collects and loads all `.json`/`.yaml`/`.yml` mock files from a
+/// directory tree.
 ///
 /// Entries are **sorted by path before anything is loaded**. `fs::read_dir`
 /// guarantees no ordering — it differs between ext4 and NTFS, and can change
@@ -435,7 +452,7 @@ struct ScanState<'a> {
     seen: &'a mut HashSet<PathBuf>,
 }
 
-fn collect_json_files(
+fn collect_mock_files(
     dir: &Path,
     root: &Path,
     max_response_file: u64,
@@ -484,10 +501,8 @@ fn collect_json_files(
                 );
                 continue;
             }
-            collect_json_files(&entry_path, root, max_response_file, state, depth + 1);
-        } else if entry_path.is_file()
-            && entry_path.extension().and_then(|s| s.to_str()) == Some("json")
-        {
+            collect_mock_files(&entry_path, root, max_response_file, state, depth + 1);
+        } else if entry_path.is_file() && is_mock_file(&entry_path) {
             state.seen.insert(entry_path.clone());
             let outcome = load_single_mock_maybe_cached(
                 &entry_path,
@@ -575,7 +590,21 @@ fn fixtures_unchanged(fingerprints: &[(PathBuf, FileFingerprint)]) -> bool {
     })
 }
 
-/// Loads a single mock configuration from a JSON file.
+/// Parse `contents` into a [`MockConfig`], picking the parser from `path`'s
+/// extension: `.yaml`/`.yml` goes through `serde_yaml`, everything else
+/// (including plain `.json`) through `serde_json`. Both parsers deserialize
+/// into the same `MockConfig`, so a mock means exactly the same thing in
+/// either format.
+fn parse_mock_config(path: &Path, contents: &str) -> Result<MockConfig, String> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("yaml") | Some("yml") => serde_yaml::from_str(contents)
+            .map_err(|e| format!("Failed to parse YAML in {}: {}", path.display(), e)),
+        _ => serde_json::from_str(contents)
+            .map_err(|e| format!("Failed to parse JSON in {}: {}", path.display(), e)),
+    }
+}
+
+/// Loads a single mock configuration from a `.json`, `.yaml`, or `.yml` file.
 ///
 /// `root` is the mocks root a `response_file` may not escape; `max_response_file`
 /// caps how large one of those files may be.
@@ -591,8 +620,7 @@ fn load_single_mock(
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
 
-    let mut mock: MockConfig = serde_json::from_str(&contents)
-        .map_err(|e| format!("Failed to parse JSON in {}: {}", path.display(), e))?;
+    let mut mock: MockConfig = parse_mock_config(path, &contents)?;
 
     // The file this mock came from is the answer to "where do I go to change
     // this?", so it's recorded here rather than dropped after the parse.
@@ -1528,6 +1556,141 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // YAML mock files (#116)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_a_yaml_mock_loads_and_serves_identically_to_its_json_equivalent() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("users.yaml"),
+            "method: GET\npath: /users\nstatus: 200\nresponse:\n  users: []\n",
+        )
+        .unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        let mock = &result.mocks["GET:/users"][0];
+        assert_eq!(mock.method, "GET");
+        assert_eq!(mock.status, 200);
+        assert_eq!(mock.response, json!({"users": []}));
+    }
+
+    #[test]
+    fn test_yml_extension_is_also_recognized() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("ping.yml"),
+            "method: GET\npath: /ping\nstatus: 200\nresponse: {}\n",
+        )
+        .unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        assert!(result.mocks.contains_key("GET:/ping"));
+    }
+
+    #[test]
+    fn test_json_and_yaml_mocks_coexist_with_deterministic_ordering() {
+        // Same rule as #86 (deterministic load order), now exercised across
+        // formats: bucket order is a function of the full path, regardless of
+        // which extension a given file happens to use.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("a.yaml"),
+            "method: GET\npath: /dup\nstatus: 200\nresponse:\n  from: a\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("m.json"),
+            r#"{"method":"GET","path":"/dup","status":200,"response":{"from":"m"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("z.yml"),
+            "method: GET\npath: /dup\nstatus: 200\nresponse:\n  from: z\n",
+        )
+        .unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        let order: Vec<&str> = result.mocks["GET:/dup"]
+            .iter()
+            .map(|mock| mock.response["from"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn test_an_invalid_yaml_file_is_reported_without_blocking_other_mocks() {
+        // Mirrors `test_reload_skips_on_errors`'s JSON case: one broken file
+        // is a per-file error, not a reason to drop everything else that
+        // parsed fine.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("users.json"),
+            r#"{"method":"GET","path":"/users","status":200,"response":{"users":[]}}"#,
+        )
+        .unwrap();
+        // Unbalanced flow mapping — invalid YAML.
+        fs::write(dir.path().join("broken.yaml"), "method: [GET\n").unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(result.errors, 1);
+        assert!(result.mocks.contains_key("GET:/users"));
+    }
+
+    #[test]
+    fn test_yaml_comments_and_block_scalars_are_supported() {
+        // The two things JSON can't do that motivate YAML mocks at all:
+        // inline documentation, and a literal block for a multi-line body.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("page.yaml"),
+            "# Why this mock exists: the docs page ships static HTML.\n\
+             method: GET\n\
+             path: /page\n\
+             status: 200\n\
+             response:\n\
+             \x20 html: |\n\
+             \x20   <html>\n\
+             \x20     <body>hi</body>\n\
+             \x20   </html>\n",
+        )
+        .unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        let mock = &result.mocks["GET:/page"][0];
+        assert_eq!(
+            mock.response["html"],
+            "<html>\n  <body>hi</body>\n</html>\n"
+        );
+    }
+
+    #[test]
+    fn test_response_file_resolution_is_unchanged_for_a_yaml_mock() {
+        // `response_file` is read by the loader itself, independent of which
+        // format the referencing mock file is written in — so the same
+        // containment and byte-for-byte read behavior applies.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("body.txt"), "hello from disk").unwrap();
+        fs::write(
+            dir.path().join("download.yaml"),
+            "method: GET\npath: /download\nstatus: 200\nresponse_file: body.txt\n",
+        )
+        .unwrap();
+
+        let result = load_mocks_map(dir.path().to_str().unwrap());
+        assert_eq!(result.errors, 0);
+        let mock = &result.mocks["GET:/download"][0];
+        assert_eq!(
+            mock.response_bytes.as_deref(),
+            Some(b"hello from disk".as_slice())
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Mocks directory resolution (#84)
     // ------------------------------------------------------------------
 
@@ -2000,7 +2163,7 @@ mod tests {
             changed: &mut changed,
             seen: &mut seen,
         };
-        collect_json_files(&root, &root, DEFAULT_MAX_RESPONSE_FILE, &mut state, 0);
+        collect_mock_files(&root, &root, DEFAULT_MAX_RESPONSE_FILE, &mut state, 0);
         for (_, outcome) in scanned {
             if let Err(message) = outcome {
                 messages.push(message);

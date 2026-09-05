@@ -473,8 +473,8 @@ fn warn_empty_mock_set(dir: &loader::ResolvedMocksDir) {
         );
     } else {
         warn!(
-            "No mocks loaded: '{}' exists but contains no readable *.json mock files \
-             (subdirectories are searched too). Every request will answer 404 mock not found.",
+            "No mocks loaded: '{}' exists but contains no readable *.json/*.yaml/*.yml mock \
+             files (subdirectories are searched too). Every request will answer 404 mock not found.",
             dir.path
         );
     }

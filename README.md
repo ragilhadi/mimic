@@ -10,7 +10,7 @@
 
 - **Blazing Fast** - Built with Rust and Axum for maximum performance
 - **Ultra Lightweight** - Only **1.66 MiB** memory usage
-- **File-Based Configuration** - Define mocks in simple JSON files
+- **File-Based Configuration** - Define mocks in simple JSON or YAML files, mixed freely in one directory
 - **Hot Reload** - Changes to mock files are reflected immediately
 - **Docker Ready** - Pre-built images available on Docker Hub
 - **Well Tested** - 60+ unit tests with high code coverage
@@ -233,14 +233,16 @@ for what's exposed if it is reached.
 
 ### Mock Files
 
-Mimic reads mock definitions from JSON files, searching the directory it
-resolves at startup and every subdirectory beneath it.
+Mimic reads mock definitions from JSON or YAML files, searching the directory
+it resolves at startup and every subdirectory beneath it. `.json`, `.yaml`,
+and `.yml` files all define the same `MockConfig` shape — pick per file
+whichever reads better, and mix both in one directory freely.
 
 **Where it reads from**, in order:
 
-1. `MIMIC_MOCKS_DIR`, if set — a directory or a single `.json` file. Used
-   verbatim: a path that doesn't exist is reported as missing rather than
-   silently replaced by a default.
+1. `MIMIC_MOCKS_DIR`, if set — a directory, or a single `.json`/`.yaml`/`.yml`
+   file. Used verbatim: a path that doesn't exist is reported as missing
+   rather than silently replaced by a default.
 2. `/app/mocks`, if it exists — the Docker image's mount point, so every
    `docker run -v $(pwd)/mocks:/app/mocks` command below resolves exactly there.
 3. `./mocks`, relative to the working directory — what `cargo run`, `make dev`,
@@ -289,6 +291,39 @@ INFO mimic: Loaded 31 mock(s)
 - `consume_body` - (Optional) Boolean to control request body consumption (default: `false`)
   - `true` - Consume request body (required for file uploads, multipart/form-data)
   - `false` - Skip body consumption (faster, default behavior)
+
+**The same mock, as YAML** (`.yaml` or `.yml` — either extension works):
+
+```yaml
+# Comments are why this one is YAML: worth documenting, not worth an escaped
+# multi-line string.
+method: GET
+path: /users
+status: 200
+response:
+  users:
+    - id: 1
+      name: Alice Johnson
+      email: alice@example.com
+```
+
+YAML's block scalars (`|`) are the other reason to reach for it — a
+multi-line HTML/XML body with no `\n` escaping:
+
+```yaml
+method: GET
+path: /docs
+status: 200
+response:
+  html: |
+    <html>
+      <body>Static docs page</body>
+    </html>
+```
+
+JSON stays the default and first-class format — every example in this README
+that's shown as `.json` works exactly as written; YAML is an alternative for
+files where either of the above is worth it, not a replacement.
 
 ### Reserved endpoints
 
@@ -1589,7 +1624,7 @@ Already have an OpenAPI 3.x spec? Generate a whole `mocks/` directory from it in
 mimic import-openapi ./spec.yaml --out ./mocks/generated
 ```
 
-JSON and YAML specs are both accepted. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status. The output is plain `MockConfig` JSON, so it hot-reloads like any other mock and can be hand-edited afterwards.
+JSON and YAML specs are both accepted as input. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status (`.yaml.disabled` with `--format yaml`). The output is a plain `MockConfig`, JSON by default; pass `--format yaml` to write `.yaml` files instead — either way it hot-reloads like any other mock and can be hand-edited afterwards.
 
 The default output directory, `./mocks/generated`, sits inside the `./mocks`
 the server falls back to locally — so `mimic import-openapi ./spec.yaml && mimic`
@@ -1603,6 +1638,7 @@ it.
 |--------|---------|-------------|
 | `--out <dir>` | `./mocks/generated` | Output directory |
 | `--status <code>` | `200` | Status treated as each operation's *primary* response; its file is the live one |
+| `--format <json\|yaml>` | `json` | Output format for generated mock files (`yml` is accepted as an alias for `yaml`) |
 | `--force` | off | Write into a non-empty output directory, overwriting files of the same name |
 | `--brace-params` | off | Emit path parameters as `{id}` instead of `:id` |
 | `-h`, `--help` | — | Show usage |
@@ -1660,6 +1696,18 @@ components:
   "response": { "code": 0, "message": "string" },
   "consume_body": false
 }
+```
+
+`mimic import-openapi spec.yaml --out ./mocks/generated --format yaml` writes the same two mocks as `get_users_id.yaml` and `get_users_id_404.yaml.disabled` instead:
+
+```yaml
+method: GET
+path: /users/:id
+status: 200
+response:
+  id: 1
+  name: Alice
+consume_body: false
 ```
 
 Start the server and `GET /users/42` returns the 200 body immediately — path parameters are translated to Mimic's `:id` syntax, so generated mocks work with the matcher unedited.
