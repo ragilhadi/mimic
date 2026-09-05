@@ -7,10 +7,10 @@
 //! ```
 //!
 //! The importer reads an OpenAPI 3.x document (JSON or YAML) and writes one
-//! ordinary Mimic mock file per operation + response status. The output is
-//! plain `MockConfig` JSON — nothing about it is special, so it can be
-//! hand-edited afterwards and Mimic's file-based, zero-config model stays
-//! intact.
+//! ordinary Mimic mock file per operation + response status. The output is a
+//! plain `MockConfig`, JSON by default or YAML with `--format yaml` — nothing
+//! about it is special either way, so it can be hand-edited afterwards and
+//! Mimic's file-based, zero-config model stays intact.
 //!
 //! Only the subset of OpenAPI that affects a mock response is parsed
 //! (`paths`, operations, `responses`, `content`, examples, and schemas). The
@@ -44,15 +44,16 @@ const HTTP_METHODS: [&str; 8] = [
 /// deep enough to blow the stack.
 const MAX_STUB_DEPTH: usize = 32;
 
-/// Appended to every non-primary status file.
+/// A non-primary status's file is suffixed with `.disabled` after its normal
+/// extension (`get_a_404.json.disabled`, `get_a_404.yaml.disabled`).
 ///
 /// A spec's alternative responses (`404`, `500`, …) share a path and method
 /// with the primary one and carry no matcher to tell them apart, so leaving
 /// them all live would make the served response depend on directory read
-/// order. The loader only reads `.json`, so this suffix parks them next to
-/// the mock they belong to, inert until renamed — which is what "enable
-/// selectively" has to mean in a directory of files.
-const DISABLED_SUFFIX: &str = ".json.disabled";
+/// order. The loader only reads `.json`/`.yaml`/`.yml`, so this suffix parks
+/// them next to the mock they belong to, inert until renamed — which is what
+/// "enable selectively" has to mean in a directory of files.
+const DISABLED_SUFFIX: &str = ".disabled";
 
 pub const USAGE: &str = "\
 Usage: mimic import-openapi <spec.yaml|spec.json> [options]
@@ -61,16 +62,18 @@ Generate Mimic mock files from an OpenAPI 3.x spec.
 
 One live mock file is written per operation, from its primary response.
 Other documented statuses are written alongside as
-<name>_<status>.json.disabled — rename to drop the suffix to enable one.
+<name>_<status>.<ext>.disabled — rename to drop the suffix to enable one.
 
 Options:
-  --out <dir>      Output directory (default: ./mocks/generated)
-  --status <code>  Status treated as each operation's primary response;
-                   its file is the live one (default: 200)
-  --force          Write into a non-empty output directory, overwriting
-                   files of the same name
-  --brace-params   Emit path parameters as {id} instead of :id
-  -h, --help       Show this help
+  --out <dir>          Output directory (default: ./mocks/generated)
+  --status <code>      Status treated as each operation's primary response;
+                       its file is the live one (default: 200)
+  --format <fmt>       Output format for generated mock files: json or yaml
+                       (default: json)
+  --force              Write into a non-empty output directory, overwriting
+                       files of the same name
+  --brace-params       Emit path parameters as {id} instead of :id
+  -h, --help           Show this help
 ";
 
 // ============================================================================
@@ -128,6 +131,26 @@ pub enum PathStyle {
     Brace,
 }
 
+/// Serialization format for generated mock files, chosen with `--format`.
+/// Same `MockConfig` schema either way — this only changes how it's written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Json,
+    Yaml,
+}
+
+impl OutputFormat {
+    /// The bare extension (no dot) a generated file gets, and the name
+    /// `--format` accepts for it.
+    fn extension(self) -> &'static str {
+        match self {
+            OutputFormat::Json => "json",
+            OutputFormat::Yaml => "yaml",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
     pub spec_path: PathBuf,
@@ -135,6 +158,7 @@ pub struct ImportOptions {
     pub default_status: u16,
     pub force: bool,
     pub path_style: PathStyle,
+    pub format: OutputFormat,
 }
 
 impl Default for ImportOptions {
@@ -145,6 +169,7 @@ impl Default for ImportOptions {
             default_status: DEFAULT_STATUS,
             force: false,
             path_style: PathStyle::Colon,
+            format: OutputFormat::default(),
         }
     }
 }
@@ -161,19 +186,32 @@ pub fn parse_args(args: &[String]) -> Result<ImportOptions, ImportError> {
             "-h" | "--help" => return Err(ImportError::Usage(String::new())),
             "--force" => options.force = true,
             "--brace-params" => options.path_style = PathStyle::Brace,
-            "--out" | "--status" => {
+            "--out" | "--status" | "--format" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| ImportError::Usage(format!("{} requires a value", arg)))?;
-                if arg == "--out" {
-                    options.out_dir = PathBuf::from(value);
-                } else {
-                    options.default_status = value.parse::<u16>().map_err(|_| {
-                        ImportError::Usage(format!(
-                            "--status expects an HTTP status code, got '{}'",
-                            value
-                        ))
-                    })?;
+                match arg {
+                    "--out" => options.out_dir = PathBuf::from(value),
+                    "--status" => {
+                        options.default_status = value.parse::<u16>().map_err(|_| {
+                            ImportError::Usage(format!(
+                                "--status expects an HTTP status code, got '{}'",
+                                value
+                            ))
+                        })?;
+                    }
+                    _ => {
+                        options.format = match value.to_ascii_lowercase().as_str() {
+                            "json" => OutputFormat::Json,
+                            "yaml" | "yml" => OutputFormat::Yaml,
+                            other => {
+                                return Err(ImportError::Usage(format!(
+                                    "--format expects 'json' or 'yaml', got '{}'",
+                                    other
+                                )))
+                            }
+                        };
+                    }
                 }
                 index += 1;
             }
@@ -471,6 +509,7 @@ pub fn generate_mocks(
     spec: &OpenApiSpec,
     default_status: u16,
     path_style: PathStyle,
+    format: OutputFormat,
 ) -> Vec<(String, MockConfig)> {
     let mut generated: Vec<(String, MockConfig)> = Vec::new();
     let mut used_names: HashSet<String> = HashSet::new();
@@ -538,7 +577,7 @@ pub fn generate_mocks(
             for (index, GeneratedResponse { status, body, .. }) in responses.into_iter().enumerate()
             {
                 let name = unique_name(
-                    &base_filename(method, template, status, index == primary),
+                    &base_filename(method, template, status, index == primary, format),
                     &mut used_names,
                 );
                 let response = body;
@@ -578,6 +617,7 @@ pub fn write_mocks(
     mocks: &[(String, MockConfig)],
     out_dir: &Path,
     force: bool,
+    format: OutputFormat,
 ) -> Result<Vec<PathBuf>, ImportError> {
     if !force && dir_has_entries(out_dir)? {
         return Err(ImportError::OutputNotEmpty(out_dir.to_path_buf()));
@@ -597,9 +637,17 @@ pub fn write_mocks(
         if path.exists() {
             warn(format!("overwriting existing file '{}'", path.display()));
         }
-        let mut body = serde_json::to_string_pretty(config)
-            .map_err(|e| ImportError::Io(format!("cannot serialize mock '{}': {}", name, e)))?;
-        body.push('\n');
+        let body = match format {
+            OutputFormat::Json => {
+                let mut body = serde_json::to_string_pretty(config).map_err(|e| {
+                    ImportError::Io(format!("cannot serialize mock '{}': {}", name, e))
+                })?;
+                body.push('\n');
+                body
+            }
+            OutputFormat::Yaml => serde_yaml::to_string(config)
+                .map_err(|e| ImportError::Io(format!("cannot serialize mock '{}': {}", name, e)))?,
+        };
         fs::write(&path, body)
             .map_err(|e| ImportError::Io(format!("cannot write '{}': {}", path.display(), e)))?;
         written.push(path);
@@ -613,14 +661,19 @@ pub fn write_mocks(
 pub fn run_import(args: &[String]) -> Result<Vec<PathBuf>, ImportError> {
     let options = parse_args(args)?;
     let spec = OpenApiSpec::from_path(&options.spec_path)?;
-    let mocks = generate_mocks(&spec, options.default_status, options.path_style);
+    let mocks = generate_mocks(
+        &spec,
+        options.default_status,
+        options.path_style,
+        options.format,
+    );
 
     if mocks.is_empty() {
         warn("spec contained no importable operations; nothing was written");
         return Ok(Vec::new());
     }
 
-    write_mocks(&mocks, &options.out_dir, options.force)
+    write_mocks(&mocks, &options.out_dir, options.force, options.format)
 }
 
 // ============================================================================
@@ -707,13 +760,21 @@ fn translate_path(template: &str, style: PathStyle) -> String {
 }
 
 /// `GET /users/{id}` primary -> `get_users_id.json`;
-/// `GET /users/{id}` + 404 -> `get_users_id_404.json.disabled`.
-fn base_filename(method: &str, template: &str, status: u16, is_primary: bool) -> String {
+/// `GET /users/{id}` + 404 -> `get_users_id_404.json.disabled` (or the `.yaml`
+/// equivalents, with `--format yaml`).
+fn base_filename(
+    method: &str,
+    template: &str,
+    status: u16,
+    is_primary: bool,
+    format: OutputFormat,
+) -> String {
     let slug = path_slug(template);
+    let ext = format.extension();
     if is_primary {
-        format!("{}_{}.json", method, slug)
+        format!("{}_{}.{}", method, slug, ext)
     } else {
-        format!("{}_{}_{}{}", method, slug, status, DISABLED_SUFFIX)
+        format!("{}_{}_{}.{}{}", method, slug, status, ext, DISABLED_SUFFIX)
     }
 }
 
@@ -759,17 +820,22 @@ fn choose_primary(responses: &[GeneratedResponse], default_status: u16) -> usize
 }
 
 /// Split a generated filename into its stem and extension, treating
-/// `.json.disabled` as a single extension.
+/// `.json.disabled` / `.yaml.disabled` as a single extension.
 fn split_extension(filename: &str) -> (&str, &str) {
     // `get_a_404.json.disabled` -> ("get_a_404", ".json.disabled")
-    if let Some(stem) = filename.strip_suffix(DISABLED_SUFFIX) {
-        let stem = stem.strip_suffix(".json").unwrap_or(stem);
-        return (stem, &filename[stem.len()..]);
+    if let Some(rest) = filename.strip_suffix(DISABLED_SUFFIX) {
+        for ext in [".json", ".yaml"] {
+            if let Some(stem) = rest.strip_suffix(ext) {
+                return (stem, &filename[stem.len()..]);
+            }
+        }
     }
-    match filename.strip_suffix(".json") {
-        Some(stem) => (stem, ".json"),
-        None => (filename, ""),
+    for ext in [".json", ".yaml"] {
+        if let Some(stem) = filename.strip_suffix(ext) {
+            return (stem, ext);
+        }
     }
+    (filename, "")
 }
 
 /// Collapse a path template into a filesystem-safe slug: `/users/{id}` ->
@@ -946,7 +1012,7 @@ components:
     }
 
     fn generate(spec: &OpenApiSpec) -> Vec<(String, MockConfig)> {
-        generate_mocks(spec, DEFAULT_STATUS, PathStyle::Colon)
+        generate_mocks(spec, DEFAULT_STATUS, PathStyle::Colon, OutputFormat::Json)
     }
 
     fn find<'a>(mocks: &'a [(String, MockConfig)], name: &str) -> &'a MockConfig {
@@ -1073,7 +1139,12 @@ components:
 
     #[test]
     fn test_brace_params_option_passes_the_template_through() {
-        let mocks = generate_mocks(&fixture(), DEFAULT_STATUS, PathStyle::Brace);
+        let mocks = generate_mocks(
+            &fixture(),
+            DEFAULT_STATUS,
+            PathStyle::Brace,
+            OutputFormat::Json,
+        );
         assert_eq!(find(&mocks, "get_users_id.json").path, "/users/{id}");
     }
 
@@ -1095,7 +1166,7 @@ components:
 
     #[test]
     fn test_status_option_picks_the_primary_when_the_operation_declares_it() {
-        let mocks = generate_mocks(&fixture(), 201, PathStyle::Colon);
+        let mocks = generate_mocks(&fixture(), 201, PathStyle::Colon, OutputFormat::Json);
 
         // POST /users declares 201, so --status 201 makes it the live file.
         assert_eq!(find(&mocks, "post_users.json").status, 201);
@@ -1518,6 +1589,7 @@ paths:
         assert_eq!(options.default_status, 200);
         assert!(!options.force);
         assert_eq!(options.path_style, PathStyle::Colon);
+        assert_eq!(options.format, OutputFormat::Json);
     }
 
     #[test]
@@ -1529,6 +1601,8 @@ paths:
             "201",
             "--force",
             "--brace-params",
+            "--format",
+            "yaml",
             "spec.json",
         ]))
         .unwrap();
@@ -1538,6 +1612,19 @@ paths:
         assert_eq!(options.default_status, 201);
         assert!(options.force);
         assert_eq!(options.path_style, PathStyle::Brace);
+        assert_eq!(options.format, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn test_format_option_accepts_yml_as_an_alias_for_yaml() {
+        let options = parse_args(&args(&["--format", "yml", "spec.json"])).unwrap();
+        assert_eq!(options.format, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn test_format_option_is_case_insensitive() {
+        let options = parse_args(&args(&["--format", "YAML", "spec.json"])).unwrap();
+        assert_eq!(options.format, OutputFormat::Yaml);
     }
 
     #[test]
@@ -1545,6 +1632,8 @@ paths:
         for bad in [
             vec!["--out"],
             vec!["--status", "not-a-number", "spec.yaml"],
+            vec!["--format", "toml", "spec.yaml"],
+            vec!["--format"],
             vec!["--nope", "spec.yaml"],
             vec!["a.yaml", "b.yaml"],
             vec![],
@@ -1577,7 +1666,7 @@ paths:
         let out = dir.path().join("generated");
         let mocks = generate(&fixture());
 
-        let written = write_mocks(&mocks, &out, false).unwrap();
+        let written = write_mocks(&mocks, &out, false, OutputFormat::Json).unwrap();
 
         assert_eq!(written.len(), mocks.len());
         let contents = fs::read_to_string(out.join("get_users_id.json")).unwrap();
@@ -1587,11 +1676,58 @@ paths:
     }
 
     #[test]
+    fn test_format_yaml_writes_yaml_files_the_loader_can_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("generated");
+        let mocks = generate_mocks(
+            &fixture(),
+            DEFAULT_STATUS,
+            PathStyle::Colon,
+            OutputFormat::Yaml,
+        );
+
+        let written = write_mocks(&mocks, &out, false, OutputFormat::Yaml).unwrap();
+
+        assert_eq!(written.len(), mocks.len());
+        let path = out.join("get_users_id.yaml");
+        assert!(path.exists(), "expected a .yaml file, found: {:?}", written);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        assert_eq!(parsed["path"], serde_yaml::Value::from("/users/:id"));
+
+        // What the loader itself reads back must round-trip identically to
+        // the JSON output for the same spec.
+        let loaded = crate::loader::load_mocks_map(out.to_str().unwrap());
+        assert_eq!(loaded.errors, 0);
+        assert!(loaded.mocks.contains_key("GET:/users/:id"));
+    }
+
+    #[test]
+    fn test_format_yaml_names_the_disabled_alternative_status_file() {
+        let mocks = generate_mocks(
+            &fixture(),
+            DEFAULT_STATUS,
+            PathStyle::Colon,
+            OutputFormat::Yaml,
+        );
+        let names: Vec<&str> = mocks.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(names.contains(&"get_users_id.yaml"));
+        assert!(
+            names.contains(&"get_users_id_404.yaml.disabled"),
+            "{:?}",
+            names
+        );
+    }
+
+    #[test]
     fn test_write_mocks_refuses_non_empty_directory_without_force() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("handwritten.json"), "{}").unwrap();
 
-        let error = write_mocks(&generate(&fixture()), dir.path(), false).unwrap_err();
+        let error =
+            write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap_err();
 
         assert!(
             matches!(error, ImportError::OutputNotEmpty(_)),
@@ -1610,7 +1746,7 @@ paths:
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("get_users_id.json"), "stale").unwrap();
 
-        write_mocks(&generate(&fixture()), dir.path(), true).unwrap();
+        write_mocks(&generate(&fixture()), dir.path(), true, OutputFormat::Json).unwrap();
 
         let contents = fs::read_to_string(dir.path().join("get_users_id.json")).unwrap();
         assert!(contents.contains("/users/:id"), "{}", contents);
@@ -1647,7 +1783,7 @@ paths:
     #[test]
     fn test_generated_mocks_are_loadable_and_matchable() {
         let dir = tempfile::tempdir().unwrap();
-        write_mocks(&generate(&fixture()), dir.path(), false).unwrap();
+        write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         assert_eq!(loaded.errors, 0, "every generated file must parse");
@@ -1673,7 +1809,7 @@ paths:
     #[test]
     fn test_only_the_primary_status_is_live_per_route() {
         let dir = tempfile::tempdir().unwrap();
-        write_mocks(&generate(&fixture()), dir.path(), false).unwrap();
+        write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         for (key, mocks) in &loaded.mocks {
@@ -1695,7 +1831,7 @@ paths:
     #[test]
     fn test_renaming_a_disabled_file_enables_it() {
         let dir = tempfile::tempdir().unwrap();
-        write_mocks(&generate(&fixture()), dir.path(), false).unwrap();
+        write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
 
         fs::remove_file(dir.path().join("get_users_id.json")).unwrap();
         fs::rename(
@@ -1720,13 +1856,23 @@ paths:
             split_extension("get_a_404.json.disabled"),
             ("get_a_404", ".json.disabled")
         );
+        assert_eq!(split_extension("get_a.yaml"), ("get_a", ".yaml"));
+        assert_eq!(
+            split_extension("get_a_404.yaml.disabled"),
+            ("get_a_404", ".yaml.disabled")
+        );
     }
 
     #[test]
     fn test_generated_brace_style_mocks_also_match() {
         let dir = tempfile::tempdir().unwrap();
-        let mocks = generate_mocks(&fixture(), DEFAULT_STATUS, PathStyle::Brace);
-        write_mocks(&mocks, dir.path(), false).unwrap();
+        let mocks = generate_mocks(
+            &fixture(),
+            DEFAULT_STATUS,
+            PathStyle::Brace,
+            OutputFormat::Json,
+        );
+        write_mocks(&mocks, dir.path(), false, OutputFormat::Json).unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         let context =
