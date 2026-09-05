@@ -956,6 +956,47 @@ written to test. A header your client sends that isn't on this list —
 additive) — extends it without a release. Anything else undeclared, like
 `x-tenant: acme`, is still rejected; strict mode keeps meaning something.
 
+### Trailing-Slash Tolerance
+
+`/things` and `/things/` are the same endpoint as far as most APIs (and most
+clients) are concerned, but a mock registered for one used to 404 the other.
+Mimic now falls back to the other form automatically, in both directions,
+whenever the literal request path matches nothing at all:
+
+```bash
+# Only /things is registered...
+curl http://localhost:8080/things    # 200 — the exact match
+curl http://localhost:8080/things/   # 200 too — falls back, no redirect
+```
+
+- **Exact matches always win.** The fallback only ever runs once the literal
+  path — as an exact key *and* against every pattern route — matched
+  nothing. Register `/things` **and** `/things/` as separate mocks and each
+  serves only its own exact path; neither one falls back to the other.
+- **Works both directions**, and for pattern routes too: a mock at
+  `/users/:id` matches a request to `/users/42/` just as it matches
+  `/users/42`.
+- **The root path (`/`) is never touched.** There's no other form to fall
+  back to.
+- **Served directly, with no redirect** — a 30x round trip before the real
+  response is exactly what this avoids.
+- **The request log stays transparent about it.** `GET /admin/requests` (and
+  the dashboard's match explanation) always show the path actually
+  requested, and note when the winning mock was only reached by trying its
+  trailing-slash variant:
+
+  ```
+  matched mocks/things.json (score 1000: method+path 1000, trailing slash normalized)
+  ```
+
+- **Opt out with `MIMIC_STRICT_TRAILING_SLASH=true`** to restore the exact
+  pre-#119 behavior — `/things` and `/things/` are entirely distinct paths
+  again, no fallback tried either way.
+- Applies everywhere path matching happens: body-matcher evaluation, the
+  "does this request need its body read" check, and CORS preflight detection
+  all use the same fallback, so a preflight for `/things/` is answered
+  exactly when a real `GET /things/` would be.
+
 ---
 
 ## 📬 Custom Response Headers
