@@ -21,6 +21,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -728,6 +729,34 @@ pub fn configured_port() -> u16 {
         .unwrap_or(8080)
 }
 
+/// Environment variable overriding the address Mimic binds to.
+pub const BIND_ADDRESS_ENV: &str = "MIMIC_BIND_ADDRESS";
+
+/// The address the server is configured to listen on, read from
+/// `MIMIC_BIND_ADDRESS`. Unset defaults to `0.0.0.0` — every interface — which
+/// is what every Mimic before this setting existed always did.
+///
+/// Unlike `configured_port`, a value that's set but doesn't parse is not
+/// silently discarded in favor of the default: binding a wider address than
+/// the operator asked for is exactly the outcome this setting exists to
+/// prevent, so an unparsable value is a startup error instead.
+pub fn configured_bind_address() -> Result<IpAddr, String> {
+    parse_bind_address(std::env::var(BIND_ADDRESS_ENV).ok())
+}
+
+fn parse_bind_address(value: Option<String>) -> Result<IpAddr, String> {
+    match value {
+        None => Ok(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        Some(raw) => raw.trim().parse::<IpAddr>().map_err(|_| {
+            format!(
+                "{} is set to '{}', which is not a valid IPv4 or IPv6 address \
+                 (examples: 127.0.0.1, 0.0.0.0, ::1, ::)",
+                BIND_ADDRESS_ENV, raw
+            )
+        }),
+    }
+}
+
 /// Environment variable selecting the scenario active at startup.
 pub const ACTIVE_TAGS_ENV: &str = "MIMIC_ACTIVE_TAGS";
 
@@ -1296,6 +1325,9 @@ pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Val
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": state.started_at.elapsed().as_secs(),
         "port": configured_port(),
+        "bind_address": configured_bind_address()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
         "max_body_size": max_body_size(),
         "max_log_entries": max_log_entries(),
         "max_recorded_body": max_recorded_body_size(),
@@ -6144,6 +6176,74 @@ mod scenario_tests {
 
         if let Some(value) = restore {
             std::env::set_var(ACTIVE_TAGS_ENV, value);
+        }
+    }
+
+    // ── MIMIC_BIND_ADDRESS parsing (#114) ───────────────────────────────
+
+    #[test]
+    fn parse_bind_address_defaults_to_unspecified_when_unset() {
+        assert_eq!(
+            parse_bind_address(None),
+            Ok(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
+    }
+
+    #[test]
+    fn parse_bind_address_accepts_ipv4_and_ipv6_literals() {
+        assert_eq!(
+            parse_bind_address(Some("127.0.0.1".to_string())),
+            Ok(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_bind_address(Some("::1".to_string())),
+            Ok(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_bind_address(Some("::".to_string())),
+            Ok(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+        );
+    }
+
+    #[test]
+    fn parse_bind_address_rejects_an_unparsable_value_instead_of_falling_back() {
+        // The whole point of the setting: a typo must fail startup rather than
+        // silently binding wider than asked.
+        let err = parse_bind_address(Some("not-an-address".to_string())).unwrap_err();
+        assert!(err.contains(BIND_ADDRESS_ENV));
+        assert!(err.contains("not-an-address"));
+    }
+
+    #[test]
+    fn parse_bind_address_rejects_a_socket_address_with_a_port() {
+        // A common mistake — the setting takes a bare address, not host:port.
+        assert!(parse_bind_address(Some("127.0.0.1:8080".to_string())).is_err());
+    }
+
+    #[test]
+    fn configured_bind_address_reads_the_env_var() {
+        // Serialized by the env var itself: this is the only test that touches
+        // MIMIC_BIND_ADDRESS, so the mutation can't race another test.
+        let restore = std::env::var(BIND_ADDRESS_ENV).ok();
+
+        std::env::set_var(BIND_ADDRESS_ENV, "127.0.0.1");
+        assert_eq!(
+            configured_bind_address(),
+            Ok(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+
+        std::env::remove_var(BIND_ADDRESS_ENV);
+        assert_eq!(
+            configured_bind_address(),
+            Ok(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
+
+        std::env::set_var(BIND_ADDRESS_ENV, "nope");
+        assert!(configured_bind_address().is_err());
+
+        match restore {
+            Some(value) => std::env::set_var(BIND_ADDRESS_ENV, value),
+            None => std::env::remove_var(BIND_ADDRESS_ENV),
         }
     }
 

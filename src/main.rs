@@ -14,13 +14,14 @@ use axum::{
     Router,
 };
 use handler::{
-    admin_dashboard, clear_requests, configured_active_tags, configured_port, get_scenario,
-    handle_request, health_check, list_mocks, list_requests, list_sequences, max_body_size,
-    max_log_entries, reset_sequences, set_scenario, AppState,
+    admin_dashboard, clear_requests, configured_active_tags, configured_bind_address,
+    configured_port, get_scenario, handle_request, health_check, list_mocks, list_requests,
+    list_sequences, max_body_size, max_log_entries, reset_sequences, set_scenario, AppState,
 };
 use loader::load_mocks;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -116,6 +117,15 @@ async fn run_server() {
     // Get port from environment variable
     let port = configured_port();
 
+    // Address to bind to: MIMIC_BIND_ADDRESS, else 0.0.0.0 (every interface),
+    // unchanged from before this setting existed. A value that's set but
+    // doesn't parse fails startup rather than silently falling back — binding
+    // wider than the operator asked for is the one outcome this setting
+    // exists to prevent.
+    let bind_address = configured_bind_address().unwrap_or_else(|e| {
+        panic!("{}", e);
+    });
+
     // Scenario selection: which tagged mock groups start out matchable
     let active_tags = configured_active_tags();
 
@@ -134,6 +144,7 @@ async fn run_server() {
         mocks_dir.path,
         mocks_dir.origin.describe()
     );
+    info!("  Bind address: {}", bind_address);
     info!("  Port: {}", port);
     info!("  Max request body: {} bytes", max_body_size());
     match active_tags.as_ref() {
@@ -322,7 +333,7 @@ async fn run_server() {
     let app = create_router(state);
 
     // Create server address
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = SocketAddr::new(bind_address, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| {

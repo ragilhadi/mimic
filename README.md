@@ -28,6 +28,7 @@
 - **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
 - **Proxy / Record-and-Replay** - Forward unmatched requests to a real upstream and optionally save the response as a new mock with `MIMIC_PROXY_UPSTREAM` and `MIMIC_RECORD_UPSTREAM`
 - **Typed Template Casts** - `{{number:path.id}}`, `{{bool:query.active}}`, `{{json:body.user}}` render real JSON types instead of quoted strings
+- **Configurable Bind Address** - Restrict the server to localhost or a specific interface with `MIMIC_BIND_ADDRESS` instead of always listening on every interface
 
 ---
 
@@ -113,6 +114,13 @@ Create a `.env` file to customize your setup:
 # Port configuration (default: 8080)
 PORT=8080
 
+# Address to bind to (default: 0.0.0.0 — every interface). Set to 127.0.0.1
+# to restrict access to localhost. IPv4 and IPv6 literals are both accepted
+# (e.g. ::1, ::). An unset value keeps today's behavior; a value that's set
+# but doesn't parse as an address fails startup rather than falling back to
+# the default. See "Binding address" below.
+MIMIC_BIND_ADDRESS=0.0.0.0
+
 # Logging level: trace, debug, info, warn, error (default: info)
 RUST_LOG=info
 
@@ -187,6 +195,41 @@ MIMIC_PROXY_TIMEOUT_MS=5000
 - `info` - General information (recommended)
 - `warn` - Warnings only
 - `error` - Errors only
+
+### Binding address
+
+By default Mimic listens on `0.0.0.0` — every network interface — which is
+convenient on a laptop but means the mock server, its request log, and its
+admin API are reachable from anywhere that can route to the machine. On a
+shared box or a machine with a public IP, that's more exposure than most setups
+intend. `MIMIC_BIND_ADDRESS` restricts it:
+
+```bash
+MIMIC_BIND_ADDRESS=127.0.0.1 mimic   # only this machine can reach it
+MIMIC_BIND_ADDRESS=::1 mimic         # IPv6 loopback
+MIMIC_BIND_ADDRESS=::  mimic         # every IPv6 interface
+```
+
+- **Unset behaves exactly as before** — `0.0.0.0`, every interface.
+- **IPv4 and IPv6 literals are both accepted**, since it's parsed as a bare
+  address, not a `host:port` pair — don't append a port.
+- **An unparsable value fails startup** rather than silently falling back to
+  `0.0.0.0`: binding wider than what was asked for is the one outcome this
+  setting exists to prevent, so a typo is reported as a startup error instead
+  of a server that came up more exposed than intended.
+- **The bound address is always visible**: it's printed in the startup log
+  next to the port, and reported by `GET /health` as `bind_address`, so what
+  a running instance is actually listening on is never a guess.
+- **Inside Docker, leave it at `0.0.0.0`.** `127.0.0.1` there means "this
+  container", not "this host" — `docker run -p`/`docker-compose` port
+  publishing can no longer reach it. Restrict access at the host or network
+  level instead (bind the published port to `127.0.0.1:8080:8080`, or don't
+  publish it at all).
+
+If Mimic sits on a shared machine or a box with a public IP, `MIMIC_BIND_ADDRESS=127.0.0.1`
+(or a firewall rule, or an auth layer in front) is what keeps it from being
+remotely reachable at all — see [What the request log keeps](#what-the-request-log-keeps)
+for what's exposed if it is reached.
 
 ### Mock Files
 
@@ -1816,10 +1859,11 @@ All of them are query parameters on `/admin/requests`, so they work from
 ### What the request log keeps
 
 The log lives in memory and is served, unfiltered, by `GET /admin/requests` on
-a server that binds `0.0.0.0`. Two of this README's own use cases — a shared
-team mock server, and CI — put that port somewhere more than one person can
-reach it. So credentials that pass through Mimic are scrubbed on the way *in*
-to the log.
+a server that binds `0.0.0.0` by default. Two of this README's own use cases —
+a shared team mock server, and CI — put that port somewhere more than one
+person can reach it (restrict it with [`MIMIC_BIND_ADDRESS`](#binding-address)
+if that's not what you want). So credentials that pass through Mimic are
+scrubbed on the way *in* to the log.
 
 **Redacted by default:**
 
