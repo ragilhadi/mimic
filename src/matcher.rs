@@ -1190,6 +1190,37 @@ pub fn match_path_pattern(
 }
 
 // ============================================================================
+// Trailing-slash tolerance (#119)
+// ============================================================================
+
+/// Environment variable restoring pre-#119 behavior: `/things` and `/things/`
+/// treated as entirely distinct paths, with no fallback tried between them.
+pub const STRICT_TRAILING_SLASH_ENV: &str = "MIMIC_STRICT_TRAILING_SLASH";
+
+/// Whether trailing-slash tolerance is switched off, read from
+/// [`STRICT_TRAILING_SLASH_ENV`]. Off (i.e. tolerant) unless set truthy —
+/// matching behavior before this setting existed.
+fn strict_trailing_slash() -> bool {
+    std::env::var(STRICT_TRAILING_SLASH_ENV)
+        .map(|v| crate::types::is_truthy(&v))
+        .unwrap_or(false)
+}
+
+/// The other trailing-slash form of `path` — the slash added if it's
+/// missing, removed if it's there — or `None` when there's nothing to try:
+/// the root path (which trailing-slash tolerance leaves alone) has no other
+/// form.
+fn trailing_slash_variant(path: &str) -> Option<String> {
+    if path == "/" {
+        return None;
+    }
+    match path.strip_suffix('/') {
+        Some(stripped) => Some(stripped.to_string()),
+        None => Some(format!("{}/", path)),
+    }
+}
+
+// ============================================================================
 // Mock Finding - Find best matching mock
 // ============================================================================
 
@@ -1217,6 +1248,11 @@ pub struct MatchResult {
     /// The components `score` was assembled from, so the win can be explained
     /// without re-running the matchers
     pub breakdown: ScoreBreakdown,
+    /// True when this mock was only reached by trying the trailing-slash
+    /// toggled form of the request path — the literal path (as an exact key
+    /// or against every pattern route) matched nothing at all. See
+    /// [`STRICT_TRAILING_SLASH_ENV`].
+    pub trailing_slash_normalized: bool,
 }
 
 /// Count the literal — i.e. non-`:name`, non-`{name}` — segments of a declared
@@ -1273,7 +1309,14 @@ pub fn requires_body(
             || mock.file_body_references_request_body()
     }
 
-    let scan = scan_candidates(method, path, mocks, active_tags, mock_needs_body);
+    let scan = scan_candidates(
+        method,
+        path,
+        mocks,
+        active_tags,
+        strict_trailing_slash(),
+        mock_needs_body,
+    );
     scan.probe_hit || !scan.any_candidate
 }
 
@@ -1291,7 +1334,15 @@ pub fn route_exists(
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> bool {
-    scan_candidates(method, path, mocks, active_tags, |_| true).any_candidate
+    scan_candidates(
+        method,
+        path,
+        mocks,
+        active_tags,
+        strict_trailing_slash(),
+        |_| true,
+    )
+    .any_candidate
 }
 
 /// What [`scan_candidates`] found.
@@ -1303,7 +1354,12 @@ struct CandidateScan {
 }
 
 /// Visit every active mock registered for `method` that could serve `path`,
-/// stopping as soon as `probe` accepts one.
+/// stopping as soon as `probe` accepts one. Falls back to `path`'s
+/// trailing-slash variant when the literal path has no candidate at all and
+/// `strict` doesn't forbid it (see [`STRICT_TRAILING_SLASH_ENV`]) — exactly
+/// the fallback [`find_matching_mock`] applies, so "is there an endpoint
+/// behind this preflight?" and "would a request here need its body?" agree
+/// with what a real request to `path` would actually match.
 ///
 /// "Does the body need reading?" and "is there an endpoint behind this
 /// preflight?" are two questions about the same candidate set, both asked
@@ -1314,7 +1370,27 @@ fn scan_candidates(
     path: &str,
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
+    strict: bool,
     mut probe: impl FnMut(&MockConfig) -> bool,
+) -> CandidateScan {
+    let scan = scan_candidates_at(method, path, mocks, active_tags, &mut probe);
+    if scan.any_candidate || strict {
+        return scan;
+    }
+    match trailing_slash_variant(path) {
+        Some(variant) => scan_candidates_at(method, &variant, mocks, active_tags, &mut probe),
+        None => scan,
+    }
+}
+
+/// [`scan_candidates`]'s scan against one literal path, with no trailing-slash
+/// fallback of its own.
+fn scan_candidates_at(
+    method: &str,
+    path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
+    probe: &mut dyn FnMut(&MockConfig) -> bool,
 ) -> CandidateScan {
     let mut scan = CandidateScan {
         any_candidate: false,
@@ -1376,16 +1452,49 @@ fn scan_candidates(
 /// [`MockConfig::is_active`]) are skipped before scoring, so they behave
 /// exactly as if they weren't loaded. `None`, and any mock without `tags`,
 /// means no filtering — the zero-config behavior.
+///
+/// A request whose literal path matches nothing at all — no exact key, no
+/// pattern route — is retried against its trailing-slash variant (`/things`
+/// for `/things/`, and vice versa) unless [`STRICT_TRAILING_SLASH_ENV`] is
+/// set. The literal path always gets first refusal: this fallback only ever
+/// runs once it has come up completely empty, so a mock deliberately
+/// registered at `/things/` keeps serving only `/things/` for as long as a
+/// sibling `/things` mock also exists.
 pub fn find_matching_mock(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> Option<MatchResult> {
-    let base_key = crate::types::create_mock_key(&context.method, &context.path);
+    if let Some(result) = find_matching_mock_at(context, &context.path, mocks, active_tags) {
+        return Some(result);
+    }
+
+    if strict_trailing_slash() {
+        return None;
+    }
+
+    let variant = trailing_slash_variant(&context.path)?;
+    let mut result = find_matching_mock_at(context, &variant, mocks, active_tags)?;
+    result.trailing_slash_normalized = true;
+    Some(result)
+}
+
+/// [`find_matching_mock`]'s search against one literal `lookup_path` — either
+/// the request's own path, or its trailing-slash variant. `context` still
+/// carries the request's real path and is what every matcher (query params,
+/// headers, body) scores against; only the exact-key lookup and the pattern
+/// scan use `lookup_path`.
+fn find_matching_mock_at(
+    context: &RequestContext,
+    lookup_path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
+) -> Option<MatchResult> {
+    let base_key = crate::types::create_mock_key(&context.method, lookup_path);
 
     debug!(
         "Looking for mock: {} (key: {})",
-        format!("{} {}", context.method, context.path),
+        format!("{} {}", context.method, lookup_path),
         base_key
     );
 
@@ -1407,8 +1516,9 @@ pub fn find_matching_mock(
                     index,
                     path_params: HashMap::new(),
                     matched_key: base_key.clone(),
-                    specificity: path_specificity(&context.path),
+                    specificity: path_specificity(lookup_path),
                     breakdown,
+                    trailing_slash_normalized: false,
                 });
             }
         }
@@ -1433,7 +1543,7 @@ pub fn find_matching_mock(
             let Some(pattern) = compile_path_pattern(path_part) else {
                 continue;
             };
-            let Some(params) = match_path_pattern(&pattern, &context.path) else {
+            let Some(params) = match_path_pattern(&pattern, lookup_path) else {
                 continue;
             };
 
@@ -1450,6 +1560,7 @@ pub fn find_matching_mock(
                         matched_key: key.clone(),
                         specificity: path_specificity(path_part),
                         breakdown,
+                        trailing_slash_normalized: false,
                     });
                 }
             }
@@ -1609,6 +1720,9 @@ pub fn explain_match(result: &MatchResult) -> String {
     if !result.path_params.is_empty() {
         parts.push(format!("path pattern -{}", PATTERN_MATCH_PENALTY));
     }
+    if result.trailing_slash_normalized {
+        parts.push("trailing slash normalized".to_string());
+    }
 
     format!(
         "matched {} (score {}: {})",
@@ -1620,6 +1734,73 @@ pub fn explain_match(result: &MatchResult) -> String {
 
 /// Longest list of near-miss candidates spelled out in a no-match explanation.
 const MAX_EXPLAINED_CANDIDATES: usize = 5;
+
+/// Judge every exact-key or pattern-route mock registered for
+/// `context.method` + `lookup_path`, sorting each into `candidates` (an
+/// active mock whose matchers rejected the request) or `tag_filtered` (a
+/// mock a scenario hid that would otherwise have matched) — the same
+/// candidate discovery [`find_matching_mock`] does, so [`explain_no_match`]
+/// judges exactly the set a real request to `lookup_path` would have.
+///
+/// A plain function taking the two accumulators by `&mut Vec` rather than a
+/// closure over them: [`explain_no_match`] calls this twice — once for the
+/// literal path, once for its trailing-slash variant — and needs to inspect
+/// `candidates`/`tag_filtered` in between, which a closure holding them by
+/// mutable capture for its own lifetime cannot allow.
+fn accumulate_candidates_for(
+    context: &RequestContext,
+    lookup_path: &str,
+    mocks: &HashMap<String, Vec<MockConfig>>,
+    active_tags: Option<&HashSet<String>>,
+    candidates: &mut Vec<(String, RejectReason)>,
+    tag_filtered: &mut Vec<String>,
+) {
+    let mut collect = |key: &str, mock_list: &[MockConfig]| {
+        for (index, mock) in mock_list.iter().enumerate() {
+            if !mock.is_active(active_tags) {
+                // Would this mock have matched if its tags were active? Only
+                // then is it worth mentioning; a tagged mock whose matchers
+                // reject the request is just a miss like any other.
+                if matches!(evaluate_mock(context, mock), Evaluation::Matched(_)) {
+                    tag_filtered.push(describe_mock(mock, key, index));
+                }
+                continue;
+            }
+            if let Evaluation::Rejected(reason) = evaluate_mock(context, mock) {
+                candidates.push((describe_mock(mock, key, index), reason));
+            }
+        }
+    };
+
+    let key = crate::types::create_mock_key(&context.method, lookup_path);
+    if let Some(mock_list) = mocks.get(&key) {
+        collect(&key, mock_list);
+    }
+
+    // Pattern routes are candidates for this path too — sorted so the report
+    // doesn't reshuffle with `HashMap` iteration order.
+    let method_prefix = format!("{}:", context.method.to_uppercase());
+    for candidate_key in sorted_keys(mocks) {
+        if *candidate_key == key {
+            continue;
+        }
+        let Some(path_part) = candidate_key.strip_prefix(method_prefix.as_str()) else {
+            continue;
+        };
+        if !is_pattern_path(path_part) {
+            continue;
+        }
+        let Some(pattern) = compile_path_pattern(path_part) else {
+            continue;
+        };
+        if match_path_pattern(&pattern, lookup_path).is_none() {
+            continue;
+        }
+        if let Some(mock_list) = mocks.get(candidate_key) {
+            collect(candidate_key, mock_list);
+        }
+    }
+}
 
 /// Explain why nothing matched: which mocks were even in the running, and the
 /// first matcher that rejected each.
@@ -1646,48 +1827,32 @@ pub fn explain_no_match(
     let mut candidates: Vec<(String, RejectReason)> = Vec::new();
     let mut tag_filtered: Vec<String> = Vec::new();
 
-    let mut collect = |key: &str, mock_list: &[MockConfig]| {
-        for (index, mock) in mock_list.iter().enumerate() {
-            if !mock.is_active(active_tags) {
-                // Would this mock have matched if its tags were active? Only
-                // then is it worth mentioning; a tagged mock whose matchers
-                // reject the request is just a miss like any other.
-                if matches!(evaluate_mock(context, mock), Evaluation::Matched(_)) {
-                    tag_filtered.push(describe_mock(mock, key, index));
-                }
-                continue;
-            }
-            if let Evaluation::Rejected(reason) = evaluate_mock(context, mock) {
-                candidates.push((describe_mock(mock, key, index), reason));
-            }
-        }
-    };
+    accumulate_candidates_for(
+        context,
+        &context.path,
+        mocks,
+        active_tags,
+        &mut candidates,
+        &mut tag_filtered,
+    );
 
-    if let Some(mock_list) = mocks.get(&base_key) {
-        collect(&base_key, mock_list);
-    }
-
-    // Pattern routes are candidates for this path too — sorted so the report
-    // doesn't reshuffle with `HashMap` iteration order.
-    let method_prefix = format!("{}:", context.method.to_uppercase());
-    for key in sorted_keys(mocks) {
-        if *key == base_key {
-            continue;
-        }
-        let Some(path_part) = key.strip_prefix(method_prefix.as_str()) else {
-            continue;
-        };
-        if !is_pattern_path(path_part) {
-            continue;
-        }
-        let Some(pattern) = compile_path_pattern(path_part) else {
-            continue;
-        };
-        if match_path_pattern(&pattern, &context.path).is_none() {
-            continue;
-        }
-        if let Some(mock_list) = mocks.get(key) {
-            collect(key, mock_list);
+    // The literal path came up completely empty: also check its
+    // trailing-slash variant, mirroring the fallback `find_matching_mock`
+    // itself applies — a mock registered at `/things` that rejects a
+    // `/things/` request (say, on its body matcher) should be reported as a
+    // near miss, not hidden behind "no mock is registered".
+    let mut trailing_slash_checked = false;
+    if candidates.is_empty() && tag_filtered.is_empty() && !strict_trailing_slash() {
+        if let Some(variant) = trailing_slash_variant(&context.path) {
+            trailing_slash_checked = true;
+            accumulate_candidates_for(
+                context,
+                &variant,
+                mocks,
+                active_tags,
+                &mut candidates,
+                &mut tag_filtered,
+            );
         }
     }
 
@@ -1721,7 +1886,7 @@ pub fn explain_no_match(
         // cause by far is the right path on the wrong method, so say so when
         // that's what happened.
         let other_methods = methods_registered_for_path(&context.path, mocks);
-        return Some(if other_methods.is_empty() {
+        let mut message = if other_methods.is_empty() {
             format!("no mock is registered for `{}`", base_key)
         } else {
             format!(
@@ -1730,7 +1895,13 @@ pub fn explain_no_match(
                 context.path,
                 other_methods.join(", ")
             )
-        });
+        };
+        if trailing_slash_checked {
+            message.push_str(
+                " (its trailing-slash variant was also checked and had nothing registered either)",
+            );
+        }
+        return Some(message);
     }
 
     let shown: Vec<String> = candidates
@@ -1747,6 +1918,9 @@ pub fn explain_no_match(
     );
     if candidates.len() > shown.len() {
         explanation.push_str(&format!(" (+{} more)", candidates.len() - shown.len()));
+    }
+    if trailing_slash_checked {
+        explanation.push_str("; found via trailing-slash normalization");
     }
     if let Some(note) = tag_note {
         explanation.push_str(&format!("; {}", note));
@@ -2620,6 +2794,191 @@ mod tests {
         )]);
 
         assert!(find_matching_mock(&path_param_context("/posts/1"), &mocks, None).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Trailing-slash tolerance (#119)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_trailing_slash_variant_toggles_both_directions() {
+        assert_eq!(
+            trailing_slash_variant("/things"),
+            Some("/things/".to_string())
+        );
+        assert_eq!(
+            trailing_slash_variant("/things/"),
+            Some("/things".to_string())
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_variant_leaves_the_root_path_alone() {
+        assert_eq!(trailing_slash_variant("/"), None);
+    }
+
+    #[test]
+    fn test_a_mock_registered_without_a_slash_serves_a_request_with_one() {
+        let mocks = mock_map(vec![plain_mock("GET", "/things", "things")]);
+
+        let result = find_matching_mock(&path_param_context("/things/"), &mocks, None).unwrap();
+
+        assert_eq!(result.mock.response["source"], "things");
+        assert_eq!(result.matched_key, "GET:/things");
+        assert!(result.trailing_slash_normalized);
+    }
+
+    #[test]
+    fn test_a_mock_registered_with_a_slash_serves_a_request_without_one() {
+        let mocks = mock_map(vec![plain_mock("GET", "/things/", "things")]);
+
+        let result = find_matching_mock(&path_param_context("/things"), &mocks, None).unwrap();
+
+        assert_eq!(result.mock.response["source"], "things");
+        assert_eq!(result.matched_key, "GET:/things/");
+        assert!(result.trailing_slash_normalized);
+    }
+
+    #[test]
+    fn test_an_exact_match_never_falls_back_to_the_trailing_slash_variant() {
+        // Deliberate `/things` and `/things/` mocks serve independently —
+        // the fallback only ever runs when the literal path matched nothing
+        // at all.
+        let mocks = mock_map(vec![
+            plain_mock("GET", "/things", "no-slash"),
+            plain_mock("GET", "/things/", "with-slash"),
+        ]);
+
+        let no_slash = find_matching_mock(&path_param_context("/things"), &mocks, None).unwrap();
+        assert_eq!(no_slash.mock.response["source"], "no-slash");
+        assert!(!no_slash.trailing_slash_normalized);
+
+        let with_slash = find_matching_mock(&path_param_context("/things/"), &mocks, None).unwrap();
+        assert_eq!(with_slash.mock.response["source"], "with-slash");
+        assert!(!with_slash.trailing_slash_normalized);
+    }
+
+    #[test]
+    fn test_a_pattern_route_matches_a_request_with_a_trailing_slash() {
+        let mocks = HashMap::from([(
+            "GET:/users/:id".to_string(),
+            vec![path_param_mock(
+                "/users/:id",
+                serde_json::json!({"name": "Mock User"}),
+            )],
+        )]);
+
+        let result = find_matching_mock(&path_param_context("/users/42/"), &mocks, None).unwrap();
+        assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
+        assert!(result.trailing_slash_normalized);
+    }
+
+    #[test]
+    fn test_the_root_path_never_falls_back_to_anything() {
+        let mocks = mock_map(vec![plain_mock("GET", "/health-ish", "unrelated")]);
+        assert!(find_matching_mock(&path_param_context("/"), &mocks, None).is_none());
+    }
+
+    #[test]
+    fn test_route_exists_true_for_a_trailing_slash_variant_of_a_registered_path() {
+        let mocks = mock_map(vec![plain_mock("GET", "/things", "things")]);
+        assert!(route_exists("GET", "/things/", &mocks, None));
+        assert!(!route_exists("POST", "/things/", &mocks, None));
+    }
+
+    #[test]
+    fn test_requires_body_true_when_only_a_trailing_slash_variant_mock_needs_it() {
+        let mock = MockConfig {
+            consume_body: true,
+            ..plain_mock("POST", "/submit", "submit")
+        };
+        let mocks = mock_map(vec![mock]);
+        assert!(requires_body("POST", "/submit/", &mocks, None));
+    }
+
+    #[test]
+    fn test_explain_match_notes_trailing_slash_normalization() {
+        let mocks = mock_map(vec![plain_mock("GET", "/things", "things")]);
+        let result = find_matching_mock(&path_param_context("/things/"), &mocks, None).unwrap();
+        assert!(explain_match(&result).contains("trailing slash normalized"));
+    }
+
+    #[test]
+    fn test_explain_no_match_finds_a_body_matcher_rejection_via_trailing_slash() {
+        // A mock registered at `/things` (no slash) declares a body matcher
+        // that this request's body doesn't satisfy. The 404 explanation must
+        // name that rejection rather than claim nothing is registered at all
+        // — the whole point of aligning the fallback with `find_matching_mock`.
+        let mock = MockConfig {
+            body: Some(BodyMatcher::Json(JsonBodyMatcher {
+                exact: Some(serde_json::json!({"ok": true})),
+                partial: None,
+                strict: false,
+            })),
+            ..plain_mock("POST", "/things", "things")
+        };
+        let mocks = mock_map(vec![mock]);
+
+        let mut context = path_param_context("/things/");
+        context.method = "POST".to_string();
+        context.body = Some(Bytes::from(r#"{"ok": false}"#));
+        context.content_type = Some("application/json".to_string());
+
+        let explanation = explain_no_match(&context, &mocks, None).unwrap();
+        assert!(explanation.contains("candidate mock"), "{}", explanation);
+        assert!(
+            explanation.contains("trailing-slash normalization"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn test_explain_no_match_reports_a_still_unregistered_path_even_after_the_trailing_slash_check()
+    {
+        let mocks = mock_map(vec![plain_mock("GET", "/unrelated", "unrelated")]);
+        let explanation = explain_no_match(&path_param_context("/things/"), &mocks, None).unwrap();
+        assert!(
+            explanation.contains("no mock is registered"),
+            "{}",
+            explanation
+        );
+        assert!(
+            explanation.contains("trailing-slash variant was also checked"),
+            "{}",
+            explanation
+        );
+    }
+
+    #[test]
+    fn test_strict_trailing_slash_env_var_disables_the_fallback() {
+        // Serialized by the env var itself: this is the only test that
+        // touches MIMIC_STRICT_TRAILING_SLASH, so the mutation can't race
+        // another test relying on the tolerant (default) behavior.
+        let restore = std::env::var(STRICT_TRAILING_SLASH_ENV).ok();
+        let mocks = mock_map(vec![plain_mock("GET", "/things", "things")]);
+
+        std::env::set_var(STRICT_TRAILING_SLASH_ENV, "true");
+        assert!(
+            find_matching_mock(&path_param_context("/things/"), &mocks, None).is_none(),
+            "strict mode must not fall back to the trailing-slash variant"
+        );
+        assert!(!route_exists("GET", "/things/", &mocks, None));
+        assert!(
+            requires_body("GET", "/things/", &mocks, None),
+            "no candidate at all means the body is worth logging"
+        );
+
+        std::env::remove_var(STRICT_TRAILING_SLASH_ENV);
+        assert!(
+            find_matching_mock(&path_param_context("/things/"), &mocks, None).is_some(),
+            "unset must restore the tolerant default"
+        );
+
+        match restore {
+            Some(value) => std::env::set_var(STRICT_TRAILING_SLASH_ENV, value),
+            None => std::env::remove_var(STRICT_TRAILING_SLASH_ENV),
+        }
     }
 
     // ------------------------------------------------------------------
