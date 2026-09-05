@@ -5,12 +5,16 @@ description: Environment variables for tuning the Mimic server.
 
 Mimic is configured entirely through environment variables. There is no configuration file — the mocks directory *is* the configuration, and everything about the server itself is set via env vars.
 
-## Variables
+## Core variables
 
 | Variable   | Default | Description |
 |------------|---------|-------------|
 | `PORT`     | `8080`  | The TCP port Mimic listens on. |
 | `RUST_LOG` | `info`  | Log verbosity. One of `trace`, `debug`, `info`, `warn`, `error`. |
+| `MIMIC_MOCKS_DIR` | `./mocks` (or `/app/mocks` in the Docker image) | Where mock files are read from. |
+| `MIMIC_BIND_ADDRESS` | `0.0.0.0` | Network interface to bind — restrict to `127.0.0.1` on a shared machine. |
+
+Mimic has grown a lot more configuration since those first two variables — CORS, proxying, admin authentication, request-log redaction, scenario tags, and more each have their own env var. See the full [Environment Variables reference](/reference/environment/) for every variable, grouped by feature.
 
 ## Setting variables with Docker
 

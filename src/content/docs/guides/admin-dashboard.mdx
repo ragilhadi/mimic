@@ -1,0 +1,110 @@
+---
+title: Admin Dashboard
+description: Inspect loaded mocks, read why a request didn't match, and see the exact response served.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+```
+http://localhost:8080/admin/dashboard
+```
+
+A single dependency-free page — no build step, no CDN — for answering the two questions that otherwise send you back to `RUST_LOG=debug`: *what is this server configured to do?* and *why didn't my mock match?*
+
+## Tabs
+
+| Tab | What it shows |
+|-----|---------------|
+| **Requests** | Every recorded request. Expand a row for its headers, query params and body, **the response that was actually served** (status, headers, body), and a **Match** section explaining which mock won and why — or, for a 404, which mocks were in the running and what rejected each. |
+| **Mocks** | Every loaded mock: method, path, status, which matchers it declares, delay, sequence length, hit count, and the file it came from. Expand a row for the full mock JSON. |
+| **Sequences** | Each stateful sequence's current step, with a per-path **Reset** button. |
+
+The header bar reads `/health` for mocks loaded, uptime, port, and max body size.
+
+## Match explanations
+
+A matched request records the arithmetic behind its score:
+
+```
+matched mocks/get_users_id.json (score 1150: method+path 1000, headers +50, path pattern -100)
+```
+
+An unmatched one records the near-miss diagnosis instead — the mocks that shared its `METHOD:path`, and the first matcher that turned each down:
+
+```
+2 candidate mock(s) for `GET:/users`, none matched:
+  mocks/get_users.json — required header `x-api-key` was absent;
+  mocks/get_users_admin.json — query param `role` was `viewer`, expected `admin`
+```
+
+When nothing is registered at all, the explanation says so — and points out the wrong-verb case, which is what it usually is:
+
+```
+no mock is registered for `GET:/users` — `/users` is registered for POST, PUT
+```
+
+Explanations are produced by the matchers themselves, so an explanation can never describe a rule the server doesn't actually enforce. See [Match Priority](/matching/priority/) for the scoring rules behind the numbers.
+
+## Filtering
+
+| Filter | Behaviour |
+|--------|-----------|
+| Path | **Substring** match (`user` finds `/users` and `/users/active`) |
+| Method | Exact, case-insensitive |
+| Status | An exact code (`404`) or a class (`4xx`, `5xx`) |
+| Unmatched only | Keeps just the requests no mock served |
+| Search | Case-insensitive, over each request's body, headers and query params |
+
+All of them are query parameters on [`/admin/requests`](/reference/admin-api/#get-adminrequests), so they work from `curl` too — the dashboard is a client of the same public API.
+
+## Other behaviour
+
+- **Auto-refresh appends** new rows rather than rebuilding the table, and **pauses while the pointer is over it** — new requests collect behind a "*N* new requests" banner instead of shifting the row you're reading.
+- **Paginated, not everything at once**: the table loads the 50 most recent matches, with a **Load older requests** button underneath to fetch further back. The "Shown" stat reads the *total* matching the current filters, even though only a page of rows is actually rendered.
+- **Copy as curl** per row, and **Export log** for the whole filtered view — regardless of how much of it is currently paged in.
+- **Theme** follows `prefers-color-scheme`, with a manual toggle that sticks.
+- **Redaction**: see [What the Request Log Keeps](#what-the-request-log-keeps) — headers *and* body fields are scrubbed by default.
+- **Bounded by default**: the log keeps the last `MIMIC_MAX_LOG_ENTRIES` requests (1000), and stored bodies are truncated past `MIMIC_MAX_RECORDED_BODY` (64 KB) with a `…[truncated]` marker — so a long-running server doesn't degrade the very UI meant to observe it.
+
+## What the request log keeps
+
+The log lives in memory and is served, unfiltered, by `GET /admin/requests` on a server that binds `0.0.0.0` by default. A shared team mock server, or a CI runner, can put that port somewhere more than one person can reach it. So credentials that pass through Mimic are scrubbed on the way *in* to the log.
+
+**Redacted by default:**
+
+| Where | What | Configured by |
+|---|---|---|
+| Request headers, response headers, match explanations | `authorization`, `cookie`, `set-cookie` | — (fixed list) |
+| Request bodies **and** response bodies | fields named `password`, `passwd`, `token`, `access_token`, `refresh_token`, `id_token`, `secret`, `client_secret`, `api_key`, `apikey`, `private_key`, `authorization` | `MIMIC_REDACT_BODY_FIELDS` |
+
+Body redaction walks JSON — through nested objects and arrays — and `application/x-www-form-urlencoded` fields. Field names match **case-insensitively and exactly**: `token` scrubs `token`, not `tokenizer`, which is why the default list spells out the common variants. A matching key loses its whole value, object or array included. Anything with no field structure (plain text, XML, binary) is stored as it came in.
+
+**Not redacted:** query strings, paths, and the values of fields you haven't named. `?api_key=...` in a URL is stored verbatim — put secrets in headers or bodies.
+
+**Binary response bodies** — a [`response_file`](/dynamic-responses/response-file/) with a non-text content type — are stored as a descriptor (`<70 bytes of image/png from fixtures/avatar.png>`) rather than as bytes, so they never blow past `MIMIC_MAX_RECORDED_BODY` or arrive in the dashboard as a wall of replacement characters.
+
+**Redaction is a property of the log only.** The body sent to the client, the body matching runs against, and the values `{{body.*}}` interpolates are all untouched.
+
+```bash
+MIMIC_REDACT_BODY_FIELDS=password,cvv,pin mimic   # replace the default list
+MIMIC_REDACT_BODY_FIELDS= mimic                   # store bodies verbatim
+MIMIC_DISABLE_BODY_LOG=true mimic                 # store no bodies at all
+```
+
+## Protecting the admin API
+
+`MIMIC_ADMIN_TOKEN` puts the admin endpoints behind a bearer token. Unset — the default — leaves them open exactly as they have always been.
+
+```bash
+MIMIC_ADMIN_TOKEN=s3cret mimic
+```
+
+```bash
+curl -H 'Authorization: Bearer s3cret' http://localhost:8080/admin/requests
+```
+
+Without the header, those endpoints answer `401 {"error": "unauthorized"}`. Two things stay open on purpose: `/health`, because liveness probes call it and carry no credentials, and any path under the admin prefix that Mimic doesn't itself answer (`GET /admin/users`), because that's an ordinary mock.
+
+<Aside type="caution">
+`/admin/dashboard` is guarded too, so a browser won't load it while a token is set — use the token with `curl`, move the admin API somewhere private with `MIMIC_ADMIN_PREFIX`, or leave the token unset on a machine only you can reach. See [Reserved Endpoints](/reference/reserved-endpoints/) and [Environment Variables](/reference/environment/).
+</Aside>

@@ -143,9 +143,31 @@ All listed params must match (this is an AND, not an OR):
 
 This matches any request to the configured path that has all three params, with `page` numeric and `sort` being either `asc` or `desc`.
 
+## Repeated keys
+
+`?tag=a&tag=b` and `?ids=1&ids=2` are the standard encoding for a list-valued parameter — what `URLSearchParams`, axios, Go's `url.Values`, and an OpenAPI `explode: true` array parameter all emit. Two more matcher forms handle them:
+
+```json
+{
+  "query_params": {
+    "params": {
+      "tag": { "contains": "b" },
+      "ids": { "list": ["1", "2"] }
+    }
+  }
+}
+```
+
+- `"param": {"contains": "value"}` matches if *any* occurrence of the key equals `value`.
+- `"param": {"list": ["a", "b"]}` matches only the exact, ordered set of values the key carried — `?tag=a&tag=b` matches `["a", "b"]`, not `["b", "a"]` or `["a"]` alone.
+- `"param": "value"` (plain exact match) and [`{{query.param}}`](/dynamic-responses/templating/) both still read only the parameter's **first** value — a mock written before repeated keys were matchable keeps meaning exactly what it always did.
+- `GET /admin/requests` and the [dashboard](/guides/admin-dashboard/) report every value a repeated key carried, in the order sent, as a list — `{"tag": ["a", "b"]}` — rather than silently keeping only the last one.
+- A repeated field in an `application/x-www-form-urlencoded` body (`opt=a&opt=b`) gets the same first-value treatment as `{{query.param}}` for `body` matchers and templating.
+- **Strict mode counts a repeated key once.** `strict: true` rejects extra *parameter names*, not extra values — sending `?tag=a&tag=b` against a mock that declares `tag` doesn't fail strict mode just because the key appeared twice.
+
 ## Common gotchas
 
 - **Values are strings.** A request to `/users?page=1` has a query param `page` with value `"1"`, not `1`. Always quote.
 - **URL encoding.** Mimic compares decoded values. `?q=hello%20world` matches `"q": "hello world"`.
 - **Order doesn't matter.** `?a=1&b=2` and `?b=2&a=1` are equivalent for matching purposes.
-- **Repeated params.** If a request sends `?tag=a&tag=b`, Mimic compares against the first value. If you need to match on multiple values of the same key, file an issue on the Mimic repo.
+- **Repeated params without `contains`/`list`** — a plain exact matcher only ever sees the first value sent. See [Repeated Keys](#repeated-keys) above.

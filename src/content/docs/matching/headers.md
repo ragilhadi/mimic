@@ -90,6 +90,21 @@ Specify headers that must **not** be present:
 
 This matches a request with a Bearer token but **without** any debug or internal headers — useful for simulating production behavior where internal headers would be stripped at a gateway.
 
+## Strict mode's built-in ignore list
+
+`"strict": true` rejects a request that carries a header the mock didn't declare in `required` — but a long list of headers never count as "extra", because a client sends them unconditionally and no mock is ever written to assert on them:
+
+- `accept`, `accept-encoding`, `accept-language`, `cache-control`, `connection`, `content-length`, `dnt`, `host`, `origin`, `pragma`, `referer`, `upgrade-insecure-requests`, `user-agent`
+- anything starting with `sec-` — `sec-fetch-mode`, `sec-fetch-site`, `sec-ch-ua`, `sec-ch-ua-platform`, and whatever browsers add to that family next, matched by prefix rather than enumerated by name
+
+That's enough for `curl` and for a browser's `fetch()` alike — a strict mock that passes from `curl` no longer 404s from the browser it was actually written to test. A header your client sends that isn't on this list — say, a tracing header your gateway injects — can be added without a release:
+
+```bash
+MIMIC_STRICT_IGNORE_HEADERS=x-request-id,x-correlation-id mimic
+```
+
+Comma-separated, additive to the built-in list. Anything else undeclared, like `x-tenant: acme`, is still rejected — strict mode keeps meaning something.
+
 ## Header names are case-insensitive
 
 HTTP header names are case-insensitive per the spec, and Mimic follows this rule. These are all equivalent:

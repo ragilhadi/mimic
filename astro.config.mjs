@@ -59,6 +59,11 @@ export default defineConfig({
             { label: 'Hot Reload', slug: 'guides/hot-reload' },
             { label: 'File Uploads', slug: 'guides/file-uploads' },
             { label: 'Configuration', slug: 'guides/configuration' },
+            { label: 'Scenario Tags', slug: 'guides/scenarios' },
+            { label: 'Built-in CORS', slug: 'guides/cors' },
+            { label: 'Proxy & Record-and-Replay', slug: 'guides/proxy' },
+            { label: 'OpenAPI Import', slug: 'guides/openapi-import' },
+            { label: 'Admin Dashboard', slug: 'guides/admin-dashboard' },
           ],
         },
         {
@@ -69,6 +74,7 @@ export default defineConfig({
             { label: 'Query Parameters', slug: 'matching/query-params' },
             { label: 'Headers', slug: 'matching/headers' },
             { label: 'Request Body', slug: 'matching/body' },
+            { label: 'Trailing-Slash Tolerance', slug: 'matching/trailing-slash' },
             { label: 'Match Priority', slug: 'matching/priority' },
           ],
         },
@@ -76,6 +82,7 @@ export default defineConfig({
           label: 'Dynamic Responses',
           items: [
             { label: 'Response Templating', slug: 'dynamic-responses/templating' },
+            { label: 'File-Backed Responses', slug: 'dynamic-responses/response-file' },
             { label: 'Custom Response Headers', slug: 'dynamic-responses/response-headers' },
             { label: 'Response Delays', slug: 'dynamic-responses/delays' },
             { label: 'Stateful Sequences', slug: 'dynamic-responses/sequences' },
@@ -93,6 +100,8 @@ export default defineConfig({
           items: [
             { label: 'Mock File Schema', slug: 'reference/mock-schema' },
             { label: 'Environment Variables', slug: 'reference/environment' },
+            { label: 'Admin API', slug: 'reference/admin-api' },
+            { label: 'Reserved Endpoints', slug: 'reference/reserved-endpoints' },
           ],
         },
       ],

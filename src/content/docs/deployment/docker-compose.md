@@ -143,6 +143,22 @@ docker compose pull
 docker compose up -d --force-recreate
 ```
 
+## Restricting network access
+
+If the compose host is reachable beyond your own machine, bind the published port to localhost instead of every interface:
+
+```yaml
+services:
+  mimic:
+    image: ragilhadi/mimic:latest
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./mocks:/app/mocks:ro
+```
+
+Leave `MIMIC_BIND_ADDRESS` at its default `0.0.0.0` inside the container — it's the `127.0.0.1:` prefix on the host-side port mapping that actually restricts reachability. See [Binding Address](/reference/environment/#binding-address) and, if the admin API is exposed, [Protecting the Admin API](/guides/admin-dashboard/#protecting-the-admin-api).
+
 ## Next steps
 
 - For configuring log level and port: [Environment Variables](/reference/environment/).

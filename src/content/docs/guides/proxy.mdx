@@ -1,0 +1,57 @@
+---
+title: Proxy & Record-and-Replay
+description: Forward unmatched requests to a real upstream and optionally save the response as a new mock.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Point Mimic at a real API once, and it grows a matching mock set for free. When `MIMIC_PROXY_UPSTREAM` is set, a request that matches no local mock is forwarded to that upstream instead of getting the usual `404 "mock not found"` — the real response is returned to the client. Add `MIMIC_RECORD_UPSTREAM=true` and that response is also saved as a new mock file, so the next identical request is served from disk with zero network calls.
+
+```bash
+MIMIC_PROXY_UPSTREAM=https://api.stripe.com MIMIC_RECORD_UPSTREAM=true mimic
+```
+
+```bash
+# First call: no local mock exists, so Mimic forwards to api.stripe.com
+# and returns the live response.
+curl http://localhost:8080/v1/charges/ch_123
+
+# A new file appears at mocks/_recorded/get_v1_charges_ch_123_1.json.
+# The second identical call is served from that file — Stripe never sees it.
+curl http://localhost:8080/v1/charges/ch_123
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `MIMIC_PROXY_UPSTREAM` | unset | Upstream base URL. Unset means unchanged 404 behavior. |
+| `MIMIC_RECORD_UPSTREAM` | `false` | Opt-in recording of proxied responses as new mock files. |
+| `MIMIC_PROXY_TIMEOUT_MS` | `5000` | How long to wait for the upstream before falling back to a 404. |
+| `MIMIC_RECORD_MATCH_HEADERS` | unset | Extra request headers to pin as matchers on a recording (comma-separated). |
+
+## What gets recorded
+
+A recorded file uses the exact same shape as any hand-written mock — `method`, `path`, `status`, `response` — plus matchers built from the request that triggered the recording, so the *next* matching request is matched normally rather than through special-cased "recorded" logic:
+
+- **`query_params`** — every query parameter, as an exact match.
+- **`headers`** — an **allowlist**, not everything the client sent: only `content-type` by default, plus whatever `MIMIC_RECORD_MATCH_HEADERS` names (comma-separated, e.g. `x-tenant,accept`). Everything else — trace and correlation ids (`x-request-id`, `traceparent`), browser headers (`origin`, `referer`, `accept-language`, `sec-fetch-*`, `sec-ch-ua*`), and any other header the client happened to send — is left out, and sensitive headers (`Authorization`, `Cookie`) never make it in regardless of what's configured. Most of those headers vary on every request from a real client, so pinning them as `required` used to mean a recording matched only the one request that created it. Widen the list only for an API that genuinely varies its response by a header your workflow needs to distinguish.
+- **`body`** — a JSON, text, or form matcher depending on the request's content type; no matcher at all for an empty body.
+- **`response_headers`** — the upstream's response headers, with `Set-Cookie` and friends left out, and `date`/`server` dropped too — a replay must not re-serve the timestamp of the original exchange.
+
+Files land at `mocks/_recorded/<method>_<sanitized-path>_<n>.json` — e.g. `mocks/_recorded/get_v1_charges_ch_123_1.json` — fully readable and editable like any other mock. They pick up on the next [hot reload](/guides/hot-reload/), typically within a couple of seconds.
+
+## Semantics
+
+- **Recording is best-effort and never blocks the response.** The client gets the upstream's response immediately; the mock file is written in the background.
+- **Only text-ish responses are recorded.** JSON, XML, plain text, JavaScript, and form-encoded bodies are recorded; binary responses (images, PDFs, arbitrary `application/octet-stream`) are still proxied to the client but never turned into a mock file — there's no good text representation for a `response` field.
+- **Concurrent identical requests dedupe onto one file.** Several requests with the same method, path, query, (non-noise) headers, and body in flight at once produce exactly one recording, not a race of several.
+- **A repeat of the same request doesn't re-record.** Once a given request shape has been recorded this run, later identical proxy calls are skipped rather than rewritten.
+- **What Mimic reserves for itself is never proxied.** The health check and the admin API's own endpoints — see [Reserved Endpoints](/reference/reserved-endpoints/) — are excluded even with no local mock behind them. A path that merely starts with `/admin/` but isn't one Mimic answers (a typo, or an endpoint you're mocking) is an ordinary request and proxies like any other.
+- **Self-referential upstreams are rejected at startup.** An upstream that resolves to Mimic's own listening address (e.g. `MIMIC_PROXY_UPSTREAM=http://localhost:8080` while Mimic itself listens on `8080`) disables proxying with a warning, instead of looping forever.
+- **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`.
+- **A gzip/deflate/brotli-compressed upstream response is decoded** before it's forwarded or recorded — both the live response the client gets and the recorded mock's `response` are plain text/JSON, never raw compressed bytes. An encoding Mimic doesn't recognize is forwarded to the client unchanged and skipped from recording, rather than written as a corrupt mock.
+
+<Aside type="tip">
+This is a fast way to seed a mocks directory from a real staging environment: point Mimic at staging with recording on, exercise your app once, then point it back at `MIMIC_MOCKS_DIR` alone and keep working offline against the recorded fixtures.
+</Aside>

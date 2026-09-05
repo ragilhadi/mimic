@@ -50,6 +50,20 @@ docker run -d \
 
 Both the host port mapping and Mimic's internal port need to change. See [Environment Variables](/reference/environment/).
 
+## Restricting network access
+
+Mimic binds `0.0.0.0` (every interface) by default. Inside a container that's fine — leave it alone, and restrict access at the host level instead by only publishing the port to localhost:
+
+```bash
+docker run -d \
+  --name mimic \
+  -p 127.0.0.1:8080:8080 \
+  -v $(pwd)/mocks:/app/mocks:ro \
+  ragilhadi/mimic:latest
+```
+
+`-p 127.0.0.1:8080:8080` (instead of `-p 8080:8080`) means the published port only accepts connections from the Docker host itself — nothing on the network can reach it. Setting `MIMIC_BIND_ADDRESS=127.0.0.1` *inside* the container has no equivalent effect on a published port, since the container's own loopback isn't the host's. See [Binding Address](/reference/environment/#binding-address) and [What the Request Log Keeps](/guides/admin-dashboard/#what-the-request-log-keeps) for why this matters — the admin API has no authentication unless you set `MIMIC_ADMIN_TOKEN`.
+
 ## Health checks
 
 Mimic exposes a `/health` endpoint. Use it for Docker's built-in health check:

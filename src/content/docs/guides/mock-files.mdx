@@ -5,7 +5,7 @@ description: The anatomy of a Mimic mock file and how Mimic discovers them.
 
 import { Aside } from '@astrojs/starlight/components';
 
-A **mock file** is a single JSON file that describes one HTTP endpoint. Mimic reads every `.json` file in the mounted mocks directory and turns each one into a route.
+A **mock file** is a single JSON or YAML file that describes one HTTP endpoint. Mimic reads every `.json`, `.yaml`, and `.yml` file in the mounted mocks directory and turns each one into a route.
 
 ## File location
 
@@ -16,6 +16,14 @@ Inside the container, mocks live at `/app/mocks`. With the recommended Docker se
 ```
 
 The `:ro` flag mounts it read-only — Mimic never writes to your mocks folder.
+
+**Where Mimic actually reads from**, in order:
+
+1. `MIMIC_MOCKS_DIR`, if set — a directory or a single mock file. Used verbatim: a path that doesn't exist is reported as missing rather than silently replaced by a default.
+2. `/app/mocks`, if it exists — the Docker image's mount point, so the command above resolves exactly there.
+3. `./mocks`, relative to the working directory — what `cargo run`, `make dev`, or a release build picks up from a clone of the repo.
+
+The resolved directory is logged at startup, and a run that registers no mocks says which of the two reasons applies — the directory isn't there, or it's there and holds no mock files.
 
 ## Anatomy of a mock file
 
@@ -53,10 +61,45 @@ Here is a complete mock with every common field:
 | `headers`      | object  | —       | Match against request headers. See [Headers](/matching/headers/). |
 | `body`         | object  | —       | Match against the request body. See [Request Body](/matching/body/). |
 | `response_headers` | object | — | Custom response headers (CORS, `Location`, non-JSON content types, …). See [Custom Response Headers](/dynamic-responses/response-headers/). |
+| `response_file` | string | — | Serve the body from a file next to the mock instead of `response`. See [File-Backed Responses](/dynamic-responses/response-file/). |
+| `template`     | boolean | `false` | Enable `{{ }}` templating inside a `response_file` body. |
 | `delay_ms`     | number or object | — | Simulate latency: a fixed delay or a random range. See [Response Delays](/dynamic-responses/delays/). |
 | `sequence`     | array   | —       | Return a different response on each successive call. See [Stateful Sequences](/dynamic-responses/sequences/). |
+| `tags`         | string[] | —      | Restrict this mock to a [scenario](/guides/scenarios/) — matchable only when one of its tags is active. |
 
 The `path` field can also use `:id` / `{id}` segments to match a whole family of URLs with one mock — see [Path Parameters](/matching/path-parameters/) — and any string inside `response` can pull data from the request via `{{ }}` templates — see [Response Templating](/dynamic-responses/templating/).
+
+## YAML mocks
+
+The same shape works as `.yaml` or `.yml`, and either extension can sit alongside `.json` files in the same directory — pick per file whichever reads better:
+
+```yaml
+# Comments are why this one is YAML: worth documenting, not worth an
+# escaped multi-line string.
+method: GET
+path: /users
+status: 200
+response:
+  users:
+    - id: 1
+      name: Alice Johnson
+      email: alice@example.com
+```
+
+YAML's block scalars (`|`) are the other reason to reach for it — a multi-line HTML/XML body with no `\n` escaping:
+
+```yaml
+method: GET
+path: /docs
+status: 200
+response:
+  html: |
+    <html>
+      <body>Static docs page</body>
+    </html>
+```
+
+JSON stays the default and first-class format; YAML is an alternative for files where either of the above is worth it, not a replacement.
 
 ## Naming and organizing files
 
@@ -92,10 +135,14 @@ curl http://localhost:8080/health
 # {"status":"healthy","mocks_loaded":5,"service":"mimic"}
 ```
 
-If a file fails to parse — invalid JSON, missing required field — Mimic logs an error and skips that file. The rest still load. Set `RUST_LOG=debug` to see exactly which file was rejected and why.
+If a file fails to parse — invalid JSON/YAML, missing required field — Mimic logs an error and skips that file. The rest still load, and via [hot reload](/guides/hot-reload/) the broken file's own route keeps serving its last successfully-loaded response until the file is fixed. Set `RUST_LOG=debug` to see exactly which file was rejected and why.
+
+Mock files load in a fixed order — depth-first, alphabetical by full path — so which of several mocks registered for the same `METHOD:path` wins a tie (see [Match Priority](/matching/priority/)) is a function of their file names alone, not load order. It doesn't vary between filesystems, between a fresh clone and a rebuilt image, or after an unrelated file is added to the directory.
+
+Two files claiming the same route also don't collide with Mimic's own routes: `/health` and everything under `/admin` are matched before the mock set — see [Reserved Endpoints](/reference/reserved-endpoints/) for what's reserved and how to free a path if your API needs it.
 
 <Aside type="caution">
-Two mocks with the same `method` and `path` will both be loaded. When a request comes in, Mimic uses its [match priority](/matching/priority/) scoring to decide which one wins. This is intentional — it lets you have multiple variants of the same endpoint differentiated by query params, headers, or body content.
+Two mocks with the same `method` and `path` will both be loaded. When a request comes in, Mimic uses its [match priority](/matching/priority/) scoring to decide which one wins. This is intentional — it lets you have multiple variants of the same endpoint differentiated by query params, headers, body content, or an active [scenario tag](/guides/scenarios/).
 </Aside>
 
 ## What happens when nothing matches
