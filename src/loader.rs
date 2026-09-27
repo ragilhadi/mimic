@@ -1010,6 +1010,12 @@ mod tests {
         let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
         assert_eq!(first.result.mocks["GET:/users"][0].status, 200);
 
+        // Unlike the other hot-reload tests, "200" -> "201" keeps the file's
+        // byte length identical, so the fingerprint's change detection rests
+        // entirely on mtime. A small sleep guarantees the second write lands
+        // in a different tick regardless of clock/filesystem resolution.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
         File::create(&file)
             .unwrap()
             .write_all(br#"{"method":"GET","path":"/users","status":201,"response":[]}"#)
