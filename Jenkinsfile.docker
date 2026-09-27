@@ -1,0 +1,63 @@
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY = 'docker.io'
+        IMAGE_NAME = 'mimic'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Read & Validate Version') {
+            steps {
+                script {
+                    if (!fileExists('vars/version')) {
+                        error 'vars/version file not found'
+                    }
+                    def version = readFile('vars/version').trim()
+                    if (!(version =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/)) {
+                        error "Invalid version format. Expected format: v1.0.0. Current version: ${version}"
+                    }
+                    env.VERSION = version
+                    echo "Version validated: ${env.VERSION}"
+                }
+            }
+        }
+
+        // GH Actions triggered this whole job only on a push that touched
+        // vars/version, or on a v* tag. Jenkins can't cheaply skip the
+        // trigger itself for a generic Git source, so instead this stage
+        // is skipped (job still runs, just does nothing) unless one of
+        // those conditions holds.
+        stage('Build & Push') {
+            when {
+                anyOf {
+                    changeset 'vars/version'
+                    buildingTag()
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_TOKEN')]) {
+                    sh 'echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin "$REGISTRY"'
+                    sh 'docker build -t "$REGISTRY/$DOCKERHUB_USER/$IMAGE_NAME:$VERSION" .'
+                    sh 'docker push "$REGISTRY/$DOCKERHUB_USER/$IMAGE_NAME:$VERSION"'
+                    script {
+                        if (env.BRANCH_NAME == 'main') {
+                            sh 'docker tag "$REGISTRY/$DOCKERHUB_USER/$IMAGE_NAME:$VERSION" "$REGISTRY/$DOCKERHUB_USER/$IMAGE_NAME:latest"'
+                            sh 'docker push "$REGISTRY/$DOCKERHUB_USER/$IMAGE_NAME:latest"'
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout "$REGISTRY" || true'
+        }
+    }
+}
