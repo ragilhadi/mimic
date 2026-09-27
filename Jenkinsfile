@@ -99,7 +99,13 @@ pipeline {
             }
             steps {
                 sh 'cargo install cargo-audit --locked'
-                sh 'cargo audit'
+                // GH Actions ran this as a separate, non-gating job: a
+                // vulnerability showed up red there but never blocked the
+                // required "test" check. Mirror that here rather than
+                // hard-failing the whole pipeline on an audit finding.
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh 'cargo audit'
+                }
             }
         }
     }
