@@ -1221,6 +1221,27 @@ fn trailing_slash_variant(path: &str) -> Option<String> {
 }
 
 // ============================================================================
+// HEAD from GET fallback (#112)
+// ============================================================================
+
+/// Environment variable switching the HEAD-from-GET fallback off, restoring
+/// the pre-#112 behavior: a `HEAD` request only ever answered by an explicit
+/// `HEAD` mock, 404 otherwise.
+pub const HEAD_FROM_GET_ENV: &str = "MIMIC_HEAD_FROM_GET";
+
+/// Whether an unmatched `HEAD` request may fall back to the mock `GET` would
+/// have matched, read from [`HEAD_FROM_GET_ENV`]. **On by default** — the
+/// fallback is the RFC 9110 answer, and the setting exists to switch it off —
+/// so unlike [`strict_trailing_slash`] the polarity is inverted: a set-but-
+/// falsy value (`false`, `0`, `no`, `off`) disables the fallback, and unset
+/// or anything truthy keeps it.
+fn head_from_get_enabled() -> bool {
+    std::env::var(HEAD_FROM_GET_ENV)
+        .map(|v| crate::types::is_truthy(&v))
+        .unwrap_or(true)
+}
+
+// ============================================================================
 // Mock Finding - Find best matching mock
 // ============================================================================
 
@@ -1253,6 +1274,11 @@ pub struct MatchResult {
     /// or against every pattern route) matched nothing at all. See
     /// [`STRICT_TRAILING_SLASH_ENV`].
     pub trailing_slash_normalized: bool,
+    /// True when this mock was only reached by retrying a `HEAD` request
+    /// against the mock `GET` would have matched — no `HEAD` mock matched.
+    /// The handler strips the response body and the explanation notes the
+    /// rewrite. See [`HEAD_FROM_GET_ENV`].
+    pub head_from_get: bool,
 }
 
 /// Count the literal — i.e. non-`:name`, non-`{name}` — segments of a declared
@@ -1328,14 +1354,33 @@ pub fn requires_body(
 /// CORS preflight poses — it carries none of the real request's body or
 /// headers, so running the full matchers against it would 404 every preflight
 /// for an endpoint that happens to declare a `body` or `headers` matcher.
+///
+/// A `HEAD` with no mock of its own looks at what `GET` would have had — the
+/// same rewrite [`find_matching_mock`] applies, so a preflight for
+/// `Access-Control-Request-Method: HEAD` is answered exactly when the actual
+/// `HEAD` would be. See [`HEAD_FROM_GET_ENV`].
 pub fn route_exists(
     method: &str,
     path: &str,
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> bool {
-    scan_candidates(
+    let exists = scan_candidates(
         method,
+        path,
+        mocks,
+        active_tags,
+        strict_trailing_slash(),
+        |_| true,
+    )
+    .any_candidate;
+
+    if exists || !head_from_get_enabled() || !method.eq_ignore_ascii_case("HEAD") {
+        return exists;
+    }
+
+    scan_candidates(
+        "GET",
         path,
         mocks,
         active_tags,
@@ -1460,22 +1505,52 @@ fn scan_candidates_at(
 /// runs once it has come up completely empty, so a mock deliberately
 /// registered at `/things/` keeps serving only `/things/` for as long as a
 /// sibling `/things` mock also exists.
+///
+/// A `HEAD` request whose lookup comes up empty through all of the above is
+/// finally retried as `GET` — RFC 9110 defines `HEAD` as `GET` without the
+/// body, so the mapping is the standard's, not an invention. An explicit
+/// `HEAD` mock always wins, exactly as an explicit mock beats every other
+/// fallback. `MIMIC_HEAD_FROM_GET=false` restores the pre-#112 404. See
+/// [`HEAD_FROM_GET_ENV`].
 pub fn find_matching_mock(
     context: &RequestContext,
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> Option<MatchResult> {
-    if let Some(result) = find_matching_mock_at(context, &context.path, mocks, active_tags) {
+    let mut result = find_matching_mock_at(context, &context.path, mocks, active_tags);
+
+    // The trailing-slash fallback only runs once the literal path has come up
+    // completely empty — and regardless of whether the strict knob governs it,
+    // the HEAD-from-GET fallback below stays reachable, the two settings being
+    // orthogonal.
+    if result.is_none() && !strict_trailing_slash() {
+        if let Some(variant) = trailing_slash_variant(&context.path) {
+            if let Some(mut fallback) = find_matching_mock_at(context, &variant, mocks, active_tags)
+            {
+                fallback.trailing_slash_normalized = true;
+                result = Some(fallback);
+            }
+        }
+    }
+
+    if let Some(result) = result {
         return Some(result);
     }
 
-    if strict_trailing_slash() {
+    // Only a `HEAD` that nothing matched is rewritten as `GET`: an explicit
+    // `HEAD` mock always wins because it would have matched above. The retry
+    // is a full `find_matching_mock` call so the rewrite composes with the
+    // trailing-slash fallback — `HEAD /users/` can still reach `GET:/users`.
+    // `context`'s request data (query params, headers, body) is untouched, so
+    // every GET-mock matcher judges the HEAD request as-is.
+    if !head_from_get_enabled() || !context.method.eq_ignore_ascii_case("HEAD") {
         return None;
     }
 
-    let variant = trailing_slash_variant(&context.path)?;
-    let mut result = find_matching_mock_at(context, &variant, mocks, active_tags)?;
-    result.trailing_slash_normalized = true;
+    let mut get_context = context.clone();
+    get_context.method = "GET".to_string();
+    let mut result = find_matching_mock(&get_context, mocks, active_tags)?;
+    result.head_from_get = true;
     Some(result)
 }
 
@@ -1519,6 +1594,7 @@ fn find_matching_mock_at(
                     specificity: path_specificity(lookup_path),
                     breakdown,
                     trailing_slash_normalized: false,
+                    head_from_get: false,
                 });
             }
         }
@@ -1561,6 +1637,7 @@ fn find_matching_mock_at(
                         specificity: path_specificity(path_part),
                         breakdown,
                         trailing_slash_normalized: false,
+                        head_from_get: false,
                     });
                 }
             }
@@ -1722,6 +1799,12 @@ pub fn explain_match(result: &MatchResult) -> String {
     }
     if result.trailing_slash_normalized {
         parts.push("trailing slash normalized".to_string());
+    }
+    if result.head_from_get {
+        parts.push(format!(
+            "HEAD answered from the GET mock at `{}`",
+            result.matched_key
+        ));
     }
 
     format!(
@@ -2952,9 +3035,11 @@ mod tests {
 
     #[test]
     fn test_strict_trailing_slash_env_var_disables_the_fallback() {
-        // Serialized by the env var itself: this is the only test that
-        // touches MIMIC_STRICT_TRAILING_SLASH, so the mutation can't race
-        // another test relying on the tolerant (default) behavior.
+        // Serialized by [`env_guard`]: this test flips MIMIC_STRICT_TRAILING_SLASH,
+        // and every other test relying on the tolerant (default) behavior
+        // holds the same lock. See #112, which added a second knob of the
+        // same kind and needed the coordination to be explicit.
+        let _env = env_guard();
         let restore = std::env::var(STRICT_TRAILING_SLASH_ENV).ok();
         let mocks = mock_map(vec![plain_mock("GET", "/things", "things")]);
 
@@ -2978,6 +3063,199 @@ mod tests {
         match restore {
             Some(value) => std::env::set_var(STRICT_TRAILING_SLASH_ENV, value),
             None => std::env::remove_var(STRICT_TRAILING_SLASH_ENV),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HEAD answered from the GET mock (#112)
+    // ------------------------------------------------------------------
+
+    /// Serialized access to the process environment: held by every test in
+    /// this module that mutates an env var, and by every test whose behavior
+    /// depends on one's default — through the same lock the async handler
+    /// tests await, so the two groups serialize against each other too. See
+    /// [`crate::types::env_lock`].
+    fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::types::env_lock().blocking_lock()
+    }
+
+    fn head_context(path: &str) -> RequestContext {
+        RequestContext {
+            method: "HEAD".to_string(),
+            ..path_param_context(path)
+        }
+    }
+
+    #[test]
+    fn test_head_request_falls_back_to_the_get_mock() {
+        let _env = env_guard();
+        let mocks = mock_map(vec![plain_mock("GET", "/users", "users")]);
+
+        let result = find_matching_mock(&head_context("/users"), &mocks, None)
+            .expect("HEAD with only a GET mock registered should fall back to it");
+        assert!(
+            result.head_from_get,
+            "the win must be marked as the fallback"
+        );
+        assert_eq!(result.matched_key, "GET:/users");
+        // Today's lookup (the flag off, i.e. what a pre-#112 Mimic did) is
+        // what any *other* method continues to do unchanged.
+        assert!(
+            find_matching_mock(&path_param_context("/users"), &mocks, None).is_some(),
+            "GET keeps matching its own mock"
+        );
+        assert!(
+            find_matching_mock(
+                &RequestContext {
+                    method: "PUT".to_string(),
+                    ..path_param_context("/users")
+                },
+                &mocks,
+                None
+            )
+            .is_none(),
+            "PUT gets no such rewrite"
+        );
+    }
+
+    #[test]
+    fn test_an_explicit_head_mock_wins_over_the_get_fallback() {
+        let _env = env_guard();
+        let mocks = mock_map(vec![
+            plain_mock("GET", "/users", "get-users"),
+            plain_mock("HEAD", "/users", "head-users"),
+        ]);
+
+        let result = find_matching_mock(&head_context("/users"), &mocks, None)
+            .expect("the explicit HEAD mock must match");
+        assert_eq!(
+            result.mock.response,
+            serde_json::json!({"source": "head-users"})
+        );
+        assert!(
+            !result.head_from_get,
+            "an explicit HEAD mock is not the fallback"
+        );
+    }
+
+    #[test]
+    fn test_head_fallback_matches_a_pattern_route() {
+        let _env = env_guard();
+        let mocks = mock_map(vec![path_param_mock(
+            "/users/:id",
+            serde_json::json!({"name": "Mock User"}),
+        )]);
+
+        let result = find_matching_mock(&head_context("/users/42"), &mocks, None)
+            .expect("HEAD /users/42 should be answered by GET /users/:id");
+        assert!(result.head_from_get);
+        assert_eq!(result.path_params.get("id"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn test_head_fallback_composes_with_trailing_slash_normalization() {
+        let _env = env_guard();
+        let mocks = mock_map(vec![plain_mock("GET", "/things", "things")]);
+
+        let result =
+            find_matching_mock(&head_context("/things/"), &mocks, None).expect("should match");
+        assert!(result.head_from_get, "answered via the GET rewrite");
+        assert!(
+            result.trailing_slash_normalized,
+            "and via the slash variant"
+        );
+    }
+
+    #[test]
+    fn test_head_fallback_evaluates_the_get_mock_matchers_against_the_request() {
+        let _env = env_guard();
+        let mut query = plain_mock("GET", "/users", "users");
+        query.query_params = Some(QueryParamMatcher {
+            params: HashMap::from([("page".to_string(), QueryParamValue::Exact("1".to_string()))]),
+            strict: false,
+        });
+        let mocks = mock_map(vec![query.clone()]);
+
+        let mut request = head_context("/users");
+        request.query_params = parse_query_string(Some("page=1"));
+        assert!(
+            find_matching_mock(&request, &mocks, None).is_some(),
+            "a HEAD carrying page=1 satisfies the GET mock's query matcher"
+        );
+
+        request.query_params.clear();
+        assert!(
+            find_matching_mock(&request, &mocks, None).is_none(),
+            "a HEAD failing the GET mock's matcher is still a miss"
+        );
+    }
+
+    #[test]
+    fn test_route_exists_for_head_when_only_the_get_mock_is_registered() {
+        let _env = env_guard();
+        let mocks = mock_map(vec![plain_mock("GET", "/users", "users")]);
+
+        assert!(
+            route_exists("HEAD", "/users", &mocks, None),
+            "a HEAD preflight sees the endpoint GET registered"
+        );
+        assert!(
+            !route_exists("HEAD", "/nope", &mocks, None),
+            "a HEAD preflight for an unregistered path is still a miss"
+        );
+    }
+
+    #[test]
+    fn test_explain_match_names_the_get_mock_for_the_head_fallback() {
+        let _env = env_guard();
+        let mut source_mock = plain_mock("GET", "/things", "things");
+        source_mock.source = Some("mocks/things.json".to_string());
+        let mocks = mock_map(vec![source_mock]);
+
+        let result = find_matching_mock(&head_context("/things"), &mocks, None).unwrap();
+        let explanation = explain_match(&result);
+        assert!(
+            explanation.contains("HEAD answered from the GET mock at `GET:/things`"),
+            "{}",
+            explanation
+        );
+        assert!(explanation.contains("mocks/things.json"), "{}", explanation);
+    }
+
+    #[test]
+    fn test_head_from_get_env_var_disables_the_fallback() {
+        // Serialized by [`env_guard`]: this test flips MIMIC_HEAD_FROM_GET,
+        // and every other test relying on the enabled (default) behavior
+        // holds the same lock.
+        let _env = env_guard();
+        let restore = std::env::var(HEAD_FROM_GET_ENV).ok();
+        let mocks = mock_map(vec![plain_mock("GET", "/users", "users")]);
+
+        std::env::set_var(HEAD_FROM_GET_ENV, "false");
+        assert!(
+            find_matching_mock(&head_context("/users"), &mocks, None).is_none(),
+            "false must restore the pre-#112 404"
+        );
+        assert!(
+            !route_exists("HEAD", "/users", &mocks, None),
+            "a preflight for HEAD must keep the OFF behavior too"
+        );
+
+        std::env::set_var(HEAD_FROM_GET_ENV, "true");
+        assert!(
+            find_matching_mock(&head_context("/users"), &mocks, None).is_some(),
+            "an explicit true keeps the fallback"
+        );
+
+        std::env::remove_var(HEAD_FROM_GET_ENV);
+        assert!(
+            find_matching_mock(&head_context("/users"), &mocks, None).is_some(),
+            "unset must restore the enabled default"
+        );
+
+        match restore {
+            Some(value) => std::env::set_var(HEAD_FROM_GET_ENV, value),
+            None => std::env::remove_var(HEAD_FROM_GET_ENV),
         }
     }
 

@@ -1040,9 +1040,15 @@ mod tests {
         let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
         assert_eq!(first.result.mocks["GET:/users"][0].status, 200);
 
+        // Same-status edit, different byte length: the fingerprint has
+        // something to notice even on a filesystem whose mtimes are too
+        // coarse for two writes inside the same tick, which a same-length
+        // edit (`200` → `201`) would otherwise race.
         File::create(&file)
             .unwrap()
-            .write_all(br#"{"method":"GET","path":"/users","status":201,"response":[]}"#)
+            .write_all(
+                br#"{"method":"GET","path":"/users","status":201,"response":[],"note":"edited"}"#,
+            )
             .unwrap();
 
         let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);

@@ -12,7 +12,7 @@ use crate::types::{
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode, Uri},
+    http::{header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -153,21 +153,46 @@ impl ReservedRoutes {
 
     /// Whether `method path` is one of the admin API's own endpoints.
     ///
-    /// This is the set `MIMIC_ADMIN_TOKEN` guards. The health check is
-    /// deliberately outside it: liveness probes call it and carry no
-    /// credentials.
+    /// This is the set mocks are checked against — one array, so a route can't
+    /// be reserved in the diagnostic and unregistered in the router, or the
+    /// reverse. The health check is deliberately outside it: liveness probes
+    /// call it and carry no credentials.
     pub fn is_admin_endpoint(&self, method: &str, path: &str) -> bool {
-        let Some(prefix) = self.admin_prefix.as_deref() else {
-            return false;
-        };
-        let Some(suffix) = path.strip_prefix(prefix) else {
-            return false;
-        };
-        ADMIN_ROUTES.iter().any(|(route, methods)| {
-            *route == suffix
+        self.matched_admin_route(method, path).is_some()
+    }
+
+    /// Whether `method path` is an admin endpoint the bearer token guards.
+    ///
+    /// Everything but the dashboard's own `GET`: the shell has to reach the
+    /// browser before it can ask for anything, and it is a compiled-in
+    /// constant with no request-specific content — nothing to protect beyond
+    /// "a Mimic is running here", which the unguarded health check already
+    /// says. Every data endpoint stays guarded (#113): the page presents a
+    /// token for them, the API keeps its gate.
+    pub fn is_token_guarded(&self, method: &str, path: &str) -> bool {
+        match self.matched_admin_route(method, path) {
+            Some((route, _)) => !(route == "/dashboard" && method.eq_ignore_ascii_case("GET")),
+            None => false,
+        }
+    }
+
+    /// The `ADMIN_ROUTES` entry `method path` would hit, or `None`. The one
+    /// place that translates a requested route into the admin API's own —
+    /// [`ReservedRoutes::is_admin_endpoint`] and the token guard decide what
+    /// they each do with the answer.
+    fn matched_admin_route(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<(&'static str, &'static [&'static str])> {
+        let prefix = self.admin_prefix.as_deref()?;
+        let suffix = path.strip_prefix(prefix)?;
+        ADMIN_ROUTES.iter().find_map(|(route, methods)| {
+            (*route == suffix
                 && methods
                     .iter()
-                    .any(|allowed| method.eq_ignore_ascii_case(allowed))
+                    .any(|allowed| method.eq_ignore_ascii_case(allowed)))
+            .then_some((*route, *methods))
         })
     }
 }
@@ -418,10 +443,14 @@ fn cors_wrap(mut response: Response, cors: Option<&CorsConfig>, origin: Option<&
 /// Middleware guarding the admin API when a token is configured.
 ///
 /// Deliberately scoped to the method+path pairs the admin API answers, taken
-/// from the same [`ReservedRoutes`] the router registered from. Two things
+/// from the same [`ReservedRoutes`] the router registered from. Three things
 /// stay unguarded on purpose: the health check, which is what liveness probes
-/// call and they carry no credentials, and any admin-prefixed path Mimic
-/// doesn't itself answer, which is an ordinary mock request.
+/// call and they carry no credentials, the dashboard's own page load — the
+/// shell must reach the browser before it can present a token (#113), and it
+/// is a constant with no data in it — and any admin-prefixed path Mimic
+/// doesn't itself answer, which is an ordinary mock request. Everything else,
+/// the data endpoints the dashboard feeds from, still answers 401 without the
+/// token.
 pub async fn require_admin_token(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -432,7 +461,7 @@ pub async fn require_admin_token(
     };
     if !state
         .reserved
-        .is_admin_endpoint(request.method().as_str(), request.uri().path())
+        .is_token_guarded(request.method().as_str(), request.uri().path())
     {
         return next.run(request).await;
     }
@@ -872,6 +901,10 @@ pub async fn handle_request(
             // the dashboard is the arithmetic that actually ran.
             let match_explanation = explain_match(&result);
             let match_score = result.score;
+            // Whether the mock only won because a `HEAD` request was answered
+            // from the mock `GET` would have matched (#112) — read before the
+            // destructure, like the score and explanation above.
+            let head_fallback = result.head_from_get;
             let MatchResult {
                 mock,
                 index,
@@ -956,7 +989,7 @@ pub async fn handle_request(
                 bytes,
                 template,
             });
-            let (header_map, body) = build_response_parts(
+            let (mut header_map, built_body) = build_response_parts(
                 &response,
                 file_body.as_ref(),
                 &template_ctx,
@@ -964,11 +997,41 @@ pub async fn handle_request(
                 state.cors.as_deref(),
                 cors::request_origin(&context),
             );
-            let recorded_body = recorded_response_body(
-                &body,
-                declared_content_type(&header_map),
-                file_body.as_ref(),
-            );
+
+            // A `HEAD` answered from the GET mock (#112) carries the GET's
+            // status and headers with no body — RFC 9110 defines HEAD as GET
+            // without one — except `Content-Length`, which reports the size of
+            // the body the GET would have sent so a client sizing a download
+            // gets the right answer. A `Content-Length` the mock declared
+            // itself is left alone, the same precedence the content type gets.
+            // What the client never receives, the log stores only as a
+            // descriptor, in the shape a binary body is already recorded in.
+            let (response_body, recorded_body) = if head_fallback {
+                let declared_ct = declared_content_type(&header_map).to_string();
+                if !header_map.contains_key(CONTENT_LENGTH) {
+                    match axum::http::HeaderValue::from_str(&built_body.len().to_string()) {
+                        Ok(value) => {
+                            header_map.insert(CONTENT_LENGTH, value);
+                        }
+                        Err(_) => warn!("Skipping invalid Content-Length: {}", built_body.len()),
+                    }
+                }
+                (
+                    Bytes::new(),
+                    format!(
+                        "<{} bytes of {} — body withheld for HEAD>",
+                        built_body.len(),
+                        declared_ct
+                    ),
+                )
+            } else {
+                let recorded_body = recorded_response_body(
+                    &built_body,
+                    declared_content_type(&header_map),
+                    file_body.as_ref(),
+                );
+                (built_body, recorded_body)
+            };
 
             // Record the request with the status and response actually served
             let path_params = context.path_params.clone();
@@ -999,7 +1062,7 @@ pub async fn handle_request(
             }
 
             // Return configured response with any custom headers
-            assemble_response(status, header_map, body)
+            assemble_response(status, header_map, response_body)
         }
         None => {
             // Gap-fill a CORS preflight before writing this off as a miss: the
@@ -2304,6 +2367,301 @@ mod tests {
         assert_eq!(json["error"], "mock not found");
         assert_eq!(json["method"], "GET");
         assert_eq!(json["path"], "/nonexistent");
+    }
+
+    // =========================================================================
+    // HEAD answered from the GET mock (#112)
+    // =========================================================================
+
+    /// Serialized access to the process environment, shared with the matcher
+    /// tests: a `HEAD` request's outcome depends on `MIMIC_HEAD_FROM_GET`'s
+    /// default, which the matcher test module's env test flips. See
+    /// [`crate::types::env_lock`].
+    async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::types::env_lock().lock().await
+    }
+
+    /// The byte length of the body a GET to `method path` returns on `state`.
+    async fn get_body_length(state: &AppState, method: Method, path: &str) -> usize {
+        let response = handle_request(
+            method,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_head_answered_from_the_get_mock() {
+        let _env = env_guard().await;
+        let state = create_test_state();
+        let expected_len = get_body_length(&state, Method::GET, "/users").await;
+
+        let response = handle_request(
+            Method::HEAD,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(parts.status, StatusCode::OK);
+        assert!(
+            bytes.is_empty(),
+            "the fallback serves the GET's headers with no body"
+        );
+        assert_eq!(
+            parts
+                .headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap(),
+            expected_len.to_string(),
+            "Content-Length reports what GET would have sent"
+        );
+        assert_eq!(
+            parts
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap(),
+            "application/json",
+            "the GET's content type comes along"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_explicit_head_mock_is_unaffected() {
+        let _env = env_guard().await;
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "HEAD:/users".to_string(),
+            vec![MockConfig {
+                method: "HEAD".to_string(),
+                path: "/users".to_string(),
+                status: 202,
+                response: json!({"queued": true}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                source: None,
+                sequence: None,
+                tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
+            }],
+        );
+        let response = handle_request(
+            Method::HEAD,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)))),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "the explicit HEAD mock serves the request, not any GET it shadows"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_head_fallback_serves_a_pattern_route() {
+        let _env = env_guard().await;
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/users/:id".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users/:id".to_string(),
+                status: 200,
+                response: json!({"name": "Mock User"}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                source: None,
+                sequence: None,
+                tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
+            }],
+        );
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+        let expected_len = get_body_length(&state, Method::GET, "/users/42").await;
+
+        let response = handle_request(
+            Method::HEAD,
+            "/users/42".parse().unwrap(),
+            HeaderMap::new(),
+            State(state),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (parts, body) = response.into_parts();
+        assert!(body.collect().await.unwrap().to_bytes().is_empty());
+        assert_eq!(
+            parts
+                .headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap(),
+            expected_len.to_string(),
+            "HEAD /users/42 is served by GET /users/:id with the GET's size"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_head_fallback_bumps_the_get_mocks_state() {
+        let _env = env_guard().await;
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "GET:/users".to_string(),
+            vec![MockConfig {
+                method: "GET".to_string(),
+                path: "/users".to_string(),
+                status: 200,
+                response: json!({"users": []}),
+                consume_body: false,
+                query_params: None,
+                headers: None,
+                body: None,
+                delay_ms: None,
+                response_headers: None,
+                source: Some("mocks/users.json".to_string()),
+                sequence: Some(vec![
+                    SequenceStep {
+                        status: 503,
+                        response: json!({"error": "unavailable"}),
+                        delay_ms: None,
+                        response_file: None,
+                        template: None,
+                        response_bytes: None,
+                        repeat: false,
+                    },
+                    SequenceStep {
+                        status: 200,
+                        response: json!({"ok": true}),
+                        delay_ms: None,
+                        response_file: None,
+                        template: None,
+                        response_bytes: None,
+                        repeat: true,
+                    },
+                ]),
+                tags: Vec::new(),
+                response_file: None,
+                template: None,
+                response_bytes: None,
+            }],
+        );
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
+
+        // The HEAD is a call: it consumes sequence step 0 and counts a hit.
+        let response = handle_request(
+            Method::HEAD,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // ...and the next GET continues the sequence from step 1.
+        let response = handle_request(
+            Method::GET,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let identity = {
+            let mocks = state.mocks.read().await;
+            MockIdentity::of(&mocks["GET:/users"][0], "GET:/users", 0)
+        };
+        assert_eq!(
+            *state.mock_hits.read().await.get(&identity).unwrap(),
+            2,
+            "both calls were served by the GET mock: HEAD (the fallback) then GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_head_fallback_is_recorded_as_a_head() {
+        let _env = env_guard().await;
+        let state = create_test_state();
+
+        let response = handle_request(
+            Method::HEAD,
+            "/users".parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The GET body's size, the same way build_response_parts serializes it.
+        let expected_len = serde_json::to_string(&json!({"users": [{"id": 1, "name": "Alice"}]}))
+            .unwrap()
+            .len();
+
+        let log = state.request_log.read().await;
+        let record = log.last().unwrap();
+        assert_eq!(
+            record.method, "HEAD",
+            "the log records the request as it came in"
+        );
+        assert_eq!(record.matched_mock.as_deref(), Some("HEAD:/users"));
+        let explanation = record.match_explanation.as_deref().unwrap();
+        assert!(
+            explanation.contains("HEAD answered from the GET mock at `GET:/users`"),
+            "{}",
+            explanation
+        );
+        assert_eq!(
+            record.response_body.as_deref(),
+            Some(
+                format!(
+                    "<{} bytes of application/json — body withheld for HEAD>",
+                    expected_len
+                )
+                .as_str()
+            ),
+            "the body the client never got is stored as a descriptor"
+        );
+        assert_eq!(
+            record.response_headers.get("content-length"),
+            Some(&expected_len.to_string()),
+            "the response headers the client got are what the log keeps"
+        );
     }
 
     // =========================================================================
@@ -5522,6 +5880,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_dashboard_html_wires_up_the_token_prompt() {
+        let html = admin_dashboard().await.0;
+        for needle in [
+            "auth-overlay",
+            "authFetch(",
+            "sessionStorage",
+            "Authorization': 'Bearer '",
+            "?token=",
+            "history.replaceState",
+            "mimic-admin-token",
+        ] {
+            assert!(
+                html.contains(needle),
+                "dashboard's token wiring is missing {}",
+                needle
+            );
+        }
+    }
+
     // ========================================================================
     // Proxy / record-and-replay (#60)
     // ========================================================================
@@ -6706,6 +7084,56 @@ mod scenario_tests {
         // Not an endpoint Mimic answers — an ordinary mock request.
         assert!(!routes.is_admin_endpoint("GET", "/admin/users"));
         assert!(!routes.is_admin_endpoint("PUT", "/admin/requests"));
+    }
+
+    #[test]
+    fn the_token_guards_every_data_endpoint_but_frees_the_dashboard_shell() {
+        let routes = ReservedRoutes::default();
+
+        for route in ["requests", "mocks", "sequences", "scenario"] {
+            assert!(
+                routes.is_token_guarded("GET", &format!("/admin/{route}")),
+                "a data endpoint stays guarded: /admin/{route}"
+            );
+        }
+        // The reset endpoint is POST-only, and POST is what it guards with.
+        assert!(routes.is_token_guarded("POST", "/admin/sequences/reset"));
+        assert!(
+            !routes.is_token_guarded("GET", "/admin/sequences/reset"),
+            "a GET isn't the reset endpoint at all"
+        );
+
+        // The shell must reach the browser before it can present a token
+        // (#113) — it is a compiled-in constant, no data in it. It is still
+        // an admin endpoint (a mock for it stays shadowed); it just isn't
+        // the token's business.
+        assert!(!routes.is_token_guarded("GET", "/admin/dashboard"));
+        assert!(routes.is_admin_endpoint("GET", "/admin/dashboard"));
+
+        // Unguarded on the same grounds the predicate above records.
+        assert!(!routes.is_token_guarded("GET", "/health"));
+        assert!(!routes.is_token_guarded("GET", "/admin/users"));
+        assert!(!routes.is_token_guarded("PUT", "/admin/requests"));
+    }
+
+    #[test]
+    fn a_moved_admin_prefix_moves_the_shell_exemption_with_it() {
+        let routes = ReservedRoutes::from_values(None, Some("/_mimic".to_string()), None);
+
+        assert!(!routes.is_token_guarded("GET", "/_mimic/dashboard"));
+        assert!(routes.is_token_guarded("GET", "/_mimic/requests"));
+        assert_eq!(
+            routes.reservation_for("GET", "/_mimic/dashboard"),
+            Some("Mimic's admin API")
+        );
+    }
+
+    #[test]
+    fn no_admin_prefix_guards_or_reserves_nothing() {
+        let routes = ReservedRoutes::from_values(None, None, Some("true".to_string()));
+
+        assert!(!routes.is_token_guarded("GET", "/admin/dashboard"));
+        assert!(!routes.is_token_guarded("GET", "/admin/requests"));
     }
 
     #[tokio::test]

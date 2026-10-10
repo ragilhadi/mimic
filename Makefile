@@ -94,7 +94,7 @@ fmt:
 
 lint:
 	@echo "Running clippy linter..."
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 audit:
 	@echo "Auditing dependencies for security vulnerabilities..."

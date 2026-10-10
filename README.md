@@ -168,6 +168,10 @@ MIMIC_DISABLE_BODY_LOG=false
 # (default: 10485760 = 10 MB, 0 = no limit). See "File-Backed Responses" below.
 MIMIC_MAX_RESPONSE_FILE=10485760
 
+# Answer a HEAD from the matching GET mock (default: true). See "HEAD
+# Requests Answered from the GET Mock" below.
+MIMIC_HEAD_FROM_GET=true
+
 # Built-in CORS (default: off — no response gains a header, OPTIONS still 404s).
 # See "Built-in CORS" below.
 MIMIC_CORS=false
@@ -998,6 +1002,55 @@ curl http://localhost:8080/things/   # 200 too — falls back, no redirect
   all use the same fallback, so a preflight for `/things/` is answered
   exactly when a real `GET /things/` would be.
 
+### HEAD Requests Answered from the GET Mock
+
+`HEAD` isn't an exotic method you'd think to mock — it's one clients issue on
+their own initiative: HTTP libraries and CDNs probe with it before a `GET`,
+health checkers and load balancers default to it, and `curl -I` is the reflex
+when you want to see the headers a mock returns. RFC 9110 defines `HEAD` as
+`GET` without the body, so whenever a `HEAD` matches no mock of its own,
+Mimic answers it from the mock `GET` would have matched:
+
+```bash
+# Only GET /users is registered...
+curl -sI -o /dev/null -w '%{http_code}\n' http://localhost:8080/users  # 200
+curl -s  -o /dev/null -w '%{http_code}\n' http://localhost:8080/users  # 200
+```
+
+- **Automatic, no configuration** — and an explicit `HEAD` mock always wins,
+  exactly the way an explicit `OPTIONS` mock wins over the CORS preflight
+  gap-filler. If you're mocking a deliberately broken `HEAD`, it serves.
+- **Empty body, GET's headers.** Status, `response_headers`, `content-type`
+  and any CORS headers are the `GET`'s. `Content-Length` reports the size of
+  the body the `GET` would have sent — per RFC 9110, so a client sizing a
+  download gets the right answer.
+- **The GET mock's matchers apply as usual.** Query, header and body matchers
+  are evaluated against the incoming `HEAD` request, so a `GET` mock that
+  requires `?page=1` requires it of the `HEAD` too. The fallback also works
+  for pattern routes: `HEAD /users/42` is answered by `GET /users/:id`.
+- **A HEAD is a call.** Since the GET mock really did serve the request, its
+  semantics follow: `delay_ms` applies, the hit count increments, and a
+  `sequence` advances. A `HEAD` between two `GET`s on a 503-then-200 sequence
+  consumes the 503 step — worth keeping in mind when a client probes with
+  `HEAD` before its real request.
+- **The fallback is visible, not magic.** The request log records the request
+  as a `HEAD`, under the path actually requested, with an explanation naming
+  the GET mock that answered it:
+
+  ```
+  matched mocks/users.json (score 1000: method+path 1000, HEAD answered from the GET mock at `GET:/users`)
+  ```
+
+  The response body is stored as a descriptor (`<N bytes of … — body
+  withheld for HEAD>`), since the client never received one.
+- **Composes with the trailing-slash fallback**: `HEAD /things/` reaches a
+  mock registered at `GET /things`, and a CORS preflight for
+  `Access-Control-Request-Method: HEAD` is answered exactly when the actual
+  `HEAD` would be.
+- **Opt out with `MIMIC_HEAD_FROM_GET=false`** to restore the pre-#112
+  behavior — a `HEAD` is answered only by an explicit `HEAD` mock, 404
+  otherwise.
+
 ---
 
 ## 📬 Custom Response Headers
@@ -1730,6 +1783,7 @@ it.
 | `--out <dir>` | `./mocks/generated` | Output directory |
 | `--status <code>` | `200` | Status treated as each operation's *primary* response; its file is the live one |
 | `--format <json\|yaml>` | `json` | Output format for generated mock files (`yml` is accepted as an alias for `yaml`) |
+| `--base-path <path>` | from `servers[0]` | Prefix for every generated mock's path; an empty value (`--base-path ''`) drops it entirely |
 | `--force` | off | Write into a non-empty output directory, overwriting files of the same name |
 | `--brace-params` | off | Emit path parameters as `{id}` instead of `:id` |
 | `-h`, `--help` | — | Show usage |
@@ -1844,6 +1898,7 @@ When there's no example, the schema is walked recursively and each field gets a 
 - **The primary response** is `--status` if the operation declares it, otherwise its lowest declared `2xx`, otherwise its lowest declared status. So a `POST` documenting only `201` gets a live `201`, and an operation documenting only errors still gets a live mock rather than an all-disabled route.
 - **OpenAPI's `default` key** maps to `--status` for its filename, but never outranks a declared success response — it usually documents an *error* shape, and serving that by default would be misleading. It becomes the live mock only when it's all an operation has.
 - **`$ref` is resolved** for schemas, responses, path items, and named examples. Circular references collapse to `{}` at the point of recursion rather than looping forever; external (`./other.yaml#/...`) and unresolvable refs degrade to `{}` with a warning.
+- **The spec's `servers` base path is applied.** A client built from `servers: [{url: "https://api.example.com/v1"}]` calls `/v1/users/1`, so the generated mocks serve `/v1/users/:id` — otherwise the importer's mocks 404 for exactly the client they exist to support, one prefix away, with no hint why. The scheme, host, and port of a server URL are irrelevant to a mock and ignored; a server with no path contributes nothing, which is the common case and exactly what specs without the block always did. When a base path is applied the importer says so (`Applying base path /v1 from servers[0]`), and the summary line mentions it — the prefix is never a surprise discovered at request time. Details: the first server wins (multiple entries warn and point at `--base-path`); server *variables* are resolved from their `default` values, and one inside the path without a default is dropped with a warning rather than emitted literally; a path-level `servers` list overrides the global one for that path, per OpenAPI's semantics. `--base-path /api` overrides the spec outright (for a gateway that maps the paths elsewhere), and `--base-path ''` drops the prefix entirely (for a gateway that strips it). File names are unaffected — the prefix lives in the mock's `path`, not its file name.
 - **Existing files are protected.** A non-empty `--out` directory is refused unless you pass `--force`, so a re-import can't silently clobber mocks you edited by hand. With `--force`, every overwritten file is named in a warning.
 - **Response keys** may be quoted (`'200'`) or bare (`200`), `default`, or wildcards (`4XX` → `400`).
 - **Only OpenAPI 3.x is supported.** Swagger 2.0 specs are rejected with a clear message — convert first.
@@ -2166,10 +2221,30 @@ Two things stay open on purpose: `/health`, because liveness probes call it
 and carry no credentials, and any path under the admin prefix that Mimic
 doesn't itself answer (`GET /admin/users`), because that's an ordinary mock.
 
-Note that `/admin/dashboard` is guarded too, so a browser won't load it while a
-token is set — use the token with `curl`, move the admin API somewhere private
-with `MIMIC_ADMIN_PREFIX`, or leave the token unset on a machine only you can
-reach.
+The dashboard is usable under a token as well (#113): `GET <prefix>/dashboard`
+serves only the compiled-in HTML shell — no data — and the page asks for the
+token the first time an API call comes back 401. Paste the token once; it is
+kept in `sessionStorage` (it dies with the tab, not on disk) and sent as
+`Authorization: Bearer …` on every admin fetch after that. Wrong token shows
+an error, the auto-refresh timer pauses while the prompt is open, and the
+"Log out" button in the header clears it. Every data endpoint still answers
+401 without the token — with or without `?token=` in the URL; the query
+parameter is not a credential.
+
+For convenience you can also open the dashboard directly with the token in
+the URL — the seed is read once and then stripped from the address bar with
+`history.replaceState`:
+
+```
+http://localhost:8080/admin/dashboard?token=s3cret
+```
+
+That's a link someone can paste once, and it is documented as convenience,
+with a caveat: a URL is more visible than a header — browser history, server
+access logs. Prefer the prompt when the token isn't yours to circulate.
+
+With the token unset, none of this activates: no header is sent, the prompt
+never appears, and the dashboard behaves exactly as it always has.
 
 ---
 
