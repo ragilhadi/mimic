@@ -2230,10 +2230,11 @@ docker pull ragilhadi/mimic:v1.0.0
 
 ### Image Details
 
-- **Base Image**: Debian Bookworm Slim
+- **Base Image**: Debian Trixie Slim
 - **Size**: ~90 MB (compressed)
 - **Platforms**: linux/amd64, linux/arm64
-- **Runtime**: Minimal dependencies (ca-certificates, wget)
+- **Runtime**: Only the Debian base set + the TLS trust bundle — `wget` is not
+  installed and the healthcheck runs via bash `/dev/tcp` instead
 
 ---
 
