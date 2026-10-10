@@ -15,8 +15,12 @@ RUN cargo build --release
 # Stage 2: Create minimal runtime image
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
+# Install runtime dependencies + apply all security point-release updates.
+# The published base image can be old (its packages predate bookworm updates),
+# and scanners like Trivy/Hub report CVEs that Debian has already fixed via
+# point releases -- `upgrade` here pulls those fixes into this image.
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
