@@ -2219,10 +2219,30 @@ Two things stay open on purpose: `/health`, because liveness probes call it
 and carry no credentials, and any path under the admin prefix that Mimic
 doesn't itself answer (`GET /admin/users`), because that's an ordinary mock.
 
-Note that `/admin/dashboard` is guarded too, so a browser won't load it while a
-token is set — use the token with `curl`, move the admin API somewhere private
-with `MIMIC_ADMIN_PREFIX`, or leave the token unset on a machine only you can
-reach.
+The dashboard is usable under a token as well (#113): `GET <prefix>/dashboard`
+serves only the compiled-in HTML shell — no data — and the page asks for the
+token the first time an API call comes back 401. Paste the token once; it is
+kept in `sessionStorage` (it dies with the tab, not on disk) and sent as
+`Authorization: Bearer …` on every admin fetch after that. Wrong token shows
+an error, the auto-refresh timer pauses while the prompt is open, and the
+"Log out" button in the header clears it. Every data endpoint still answers
+401 without the token — with or without `?token=` in the URL; the query
+parameter is not a credential.
+
+For convenience you can also open the dashboard directly with the token in
+the URL — the seed is read once and then stripped from the address bar with
+`history.replaceState`:
+
+```
+http://localhost:8080/admin/dashboard?token=s3cret
+```
+
+That's a link someone can paste once, and it is documented as convenience,
+with a caveat: a URL is more visible than a header — browser history, server
+access logs. Prefer the prompt when the token isn't yours to circulate.
+
+With the token unset, none of this activates: no header is sent, the prompt
+never appears, and the dashboard behaves exactly as it always has.
 
 ---
 

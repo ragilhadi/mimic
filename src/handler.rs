@@ -153,21 +153,46 @@ impl ReservedRoutes {
 
     /// Whether `method path` is one of the admin API's own endpoints.
     ///
-    /// This is the set `MIMIC_ADMIN_TOKEN` guards. The health check is
-    /// deliberately outside it: liveness probes call it and carry no
-    /// credentials.
+    /// This is the set mocks are checked against — one array, so a route can't
+    /// be reserved in the diagnostic and unregistered in the router, or the
+    /// reverse. The health check is deliberately outside it: liveness probes
+    /// call it and carry no credentials.
     pub fn is_admin_endpoint(&self, method: &str, path: &str) -> bool {
-        let Some(prefix) = self.admin_prefix.as_deref() else {
-            return false;
-        };
-        let Some(suffix) = path.strip_prefix(prefix) else {
-            return false;
-        };
-        ADMIN_ROUTES.iter().any(|(route, methods)| {
-            *route == suffix
+        self.matched_admin_route(method, path).is_some()
+    }
+
+    /// Whether `method path` is an admin endpoint the bearer token guards.
+    ///
+    /// Everything but the dashboard's own `GET`: the shell has to reach the
+    /// browser before it can ask for anything, and it is a compiled-in
+    /// constant with no request-specific content — nothing to protect beyond
+    /// "a Mimic is running here", which the unguarded health check already
+    /// says. Every data endpoint stays guarded (#113): the page presents a
+    /// token for them, the API keeps its gate.
+    pub fn is_token_guarded(&self, method: &str, path: &str) -> bool {
+        match self.matched_admin_route(method, path) {
+            Some((route, _)) => !(route == "/dashboard" && method.eq_ignore_ascii_case("GET")),
+            None => false,
+        }
+    }
+
+    /// The `ADMIN_ROUTES` entry `method path` would hit, or `None`. The one
+    /// place that translates a requested route into the admin API's own —
+    /// [`ReservedRoutes::is_admin_endpoint`] and the token guard decide what
+    /// they each do with the answer.
+    fn matched_admin_route(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<(&'static str, &'static [&'static str])> {
+        let prefix = self.admin_prefix.as_deref()?;
+        let suffix = path.strip_prefix(prefix)?;
+        ADMIN_ROUTES.iter().find_map(|(route, methods)| {
+            (*route == suffix
                 && methods
                     .iter()
-                    .any(|allowed| method.eq_ignore_ascii_case(allowed))
+                    .any(|allowed| method.eq_ignore_ascii_case(allowed)))
+            .then_some((*route, *methods))
         })
     }
 }
@@ -418,10 +443,14 @@ fn cors_wrap(mut response: Response, cors: Option<&CorsConfig>, origin: Option<&
 /// Middleware guarding the admin API when a token is configured.
 ///
 /// Deliberately scoped to the method+path pairs the admin API answers, taken
-/// from the same [`ReservedRoutes`] the router registered from. Two things
+/// from the same [`ReservedRoutes`] the router registered from. Three things
 /// stay unguarded on purpose: the health check, which is what liveness probes
-/// call and they carry no credentials, and any admin-prefixed path Mimic
-/// doesn't itself answer, which is an ordinary mock request.
+/// call and they carry no credentials, the dashboard's own page load — the
+/// shell must reach the browser before it can present a token (#113), and it
+/// is a constant with no data in it — and any admin-prefixed path Mimic
+/// doesn't itself answer, which is an ordinary mock request. Everything else,
+/// the data endpoints the dashboard feeds from, still answers 401 without the
+/// token.
 pub async fn require_admin_token(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -432,7 +461,7 @@ pub async fn require_admin_token(
     };
     if !state
         .reserved
-        .is_admin_endpoint(request.method().as_str(), request.uri().path())
+        .is_token_guarded(request.method().as_str(), request.uri().path())
     {
         return next.run(request).await;
     }
@@ -5851,6 +5880,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_dashboard_html_wires_up_the_token_prompt() {
+        let html = admin_dashboard().await.0;
+        for needle in [
+            "auth-overlay",
+            "authFetch(",
+            "sessionStorage",
+            "Authorization': 'Bearer '",
+            "?token=",
+            "history.replaceState",
+            "mimic-admin-token",
+        ] {
+            assert!(
+                html.contains(needle),
+                "dashboard's token wiring is missing {}",
+                needle
+            );
+        }
+    }
+
     // ========================================================================
     // Proxy / record-and-replay (#60)
     // ========================================================================
@@ -7035,6 +7084,56 @@ mod scenario_tests {
         // Not an endpoint Mimic answers — an ordinary mock request.
         assert!(!routes.is_admin_endpoint("GET", "/admin/users"));
         assert!(!routes.is_admin_endpoint("PUT", "/admin/requests"));
+    }
+
+    #[test]
+    fn the_token_guards_every_data_endpoint_but_frees_the_dashboard_shell() {
+        let routes = ReservedRoutes::default();
+
+        for route in ["requests", "mocks", "sequences", "scenario"] {
+            assert!(
+                routes.is_token_guarded("GET", &format!("/admin/{route}")),
+                "a data endpoint stays guarded: /admin/{route}"
+            );
+        }
+        // The reset endpoint is POST-only, and POST is what it guards with.
+        assert!(routes.is_token_guarded("POST", "/admin/sequences/reset"));
+        assert!(
+            !routes.is_token_guarded("GET", "/admin/sequences/reset"),
+            "a GET isn't the reset endpoint at all"
+        );
+
+        // The shell must reach the browser before it can present a token
+        // (#113) — it is a compiled-in constant, no data in it. It is still
+        // an admin endpoint (a mock for it stays shadowed); it just isn't
+        // the token's business.
+        assert!(!routes.is_token_guarded("GET", "/admin/dashboard"));
+        assert!(routes.is_admin_endpoint("GET", "/admin/dashboard"));
+
+        // Unguarded on the same grounds the predicate above records.
+        assert!(!routes.is_token_guarded("GET", "/health"));
+        assert!(!routes.is_token_guarded("GET", "/admin/users"));
+        assert!(!routes.is_token_guarded("PUT", "/admin/requests"));
+    }
+
+    #[test]
+    fn a_moved_admin_prefix_moves_the_shell_exemption_with_it() {
+        let routes = ReservedRoutes::from_values(None, Some("/_mimic".to_string()), None);
+
+        assert!(!routes.is_token_guarded("GET", "/_mimic/dashboard"));
+        assert!(routes.is_token_guarded("GET", "/_mimic/requests"));
+        assert_eq!(
+            routes.reservation_for("GET", "/_mimic/dashboard"),
+            Some("Mimic's admin API")
+        );
+    }
+
+    #[test]
+    fn no_admin_prefix_guards_or_reserves_nothing() {
+        let routes = ReservedRoutes::from_values(None, None, Some("true".to_string()));
+
+        assert!(!routes.is_token_guarded("GET", "/admin/dashboard"));
+        assert!(!routes.is_token_guarded("GET", "/admin/requests"));
     }
 
     #[tokio::test]

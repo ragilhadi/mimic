@@ -1039,6 +1039,50 @@ mod tests {
         assert_eq!(json["source"], "mine");
     }
 
+    #[tokio::test]
+    async fn test_the_dashboard_shell_loads_even_when_a_token_is_set() {
+        // #113: the shell has to reach the browser before it can present a
+        // token. It is a compiled-in constant with no request-specific
+        // content, so serving it unauthenticated leaks nothing.
+        let (status, body) = call_with_auth(
+            create_router(token_state(vec![])),
+            "GET",
+            "/admin/dashboard",
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("Admin Dashboard"), "the real dashboard ships");
+        assert!(
+            html.contains("token-input"),
+            "the page carries the prompt it presents on 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_shell_is_the_only_route_a_401_frees_up() {
+        let app = create_router(token_state(vec![]));
+
+        // Every data answer stays behind the token...
+        let (status, _) = call_with_auth(app.clone(), "GET", "/admin/requests", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call_with_auth(app.clone(), "DELETE", "/admin/requests", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // ...including when the query string offers a token — that is a
+        // convenience for the page load only, and `?token=` in a URL is
+        // exactly what this feature strips from the address bar.
+        let (status, _) =
+            call_with_auth(app.clone(), "GET", "/admin/requests?token=s3cret", None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the query is not a credential"
+        );
+    }
+
     #[test]
     fn test_shadowed_mocks_names_the_file_and_what_claims_the_route() {
         let mut health = mock("GET", "/health", "down");

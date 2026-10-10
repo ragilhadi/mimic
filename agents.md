@@ -125,7 +125,12 @@ HTTP Request → Router Agent → Handler Agent → Matcher Agent
   what the client receives, what matching runs against, or what templating
   interpolates
 - `MIMIC_ADMIN_TOKEN` puts `/admin/*` behind a bearer token; `/health` stays
-  open because liveness probes carry no credentials
+  open because liveness probes carry no credentials, and so does the
+  dashboard's own page load — the shell is a data-free constant, and the page
+  prompts for the token (#113), keeping it in sessionStorage and sending it on
+  every data fetch. Data endpoints still 401 without it; a `?token=` query is
+  honored for the shell and stripped from the address bar, never accepted by
+  the API
 - Regular `cargo audit`
 
 ### Performance Targets
