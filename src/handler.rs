@@ -1853,7 +1853,7 @@ const OCTET_STREAM: &str = "application/octet-stream";
 
 /// The content type a `response_file` is served with when `response_headers`
 /// doesn't set one.
-fn content_type_for_file(declared: &str) -> &'static str {
+pub(crate) fn content_type_for_file(declared: &str) -> &'static str {
     let extension = Path::new(declared)
         .extension()
         .and_then(|e| e.to_str())
@@ -5733,7 +5733,7 @@ mod tests {
             // Simulate the hot-reload main.rs runs on an interval: load what
             // landed on disk into a fresh mock store.
             let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
-            assert_eq!(loaded.errors, 0);
+            assert_eq!(loaded.errors.len(), 0);
             {
                 let mut mocks = state.mocks.write().await;
                 *mocks = loaded.mocks;
@@ -7218,7 +7218,7 @@ mod response_file_tests {
     /// Load a mocks directory exactly as the server does and serve from it.
     fn state_from(dir: &FsPath) -> AppState {
         let result = crate::loader::load_mocks_map(dir.to_str().unwrap());
-        assert_eq!(result.errors, 0, "fixture set should load cleanly");
+        assert_eq!(result.errors.len(), 0, "fixture set should load cleanly");
         AppState::new(Arc::new(tokio::sync::RwLock::new(result.mocks)))
     }
 
@@ -7519,7 +7519,7 @@ mod response_file_tests {
 
         fs::write(dir.path().join("fixtures/report.csv"), b"id\n1\n2\n").unwrap();
         let reloaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(reloaded.errors, 0);
+        assert_eq!(reloaded.errors.len(), 0);
         *state.mocks.write().await = reloaded.mocks;
 
         let (_, _, body) = get(&state, "/export").await;

@@ -23,6 +23,7 @@
 - **File-Backed Responses** - Serve a PDF, PNG, CSV, or XML fixture from disk with `response_file`, bytes intact
 - **Faker Data Generators** - Fresh random values on every call with `{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int min=1 max=100}}`
 - **OpenAPI Import** - Generate a whole mocks directory from an OpenAPI 3.x spec with `mimic import-openapi ./spec.yaml`
+- **Mock Validation** - Check a mocks directory without starting a server: `mimic validate ./mocks` reports every problem the server would only warn about, with `--strict` for CI
 - **Scenario Tags** - Keep happy-path and error mocks side by side and switch between them with `MIMIC_ACTIVE_TAGS` or `POST /admin/scenario`
 - **Built-in CORS** - `MIMIC_CORS=true` answers `OPTIONS` preflights automatically and adds the allow-origin header to every mock — no per-endpoint CORS files
 - **Admin Dashboard** - Inspect loaded mocks, read *why* a request didn't match, and see the exact response served — at `/admin/dashboard`
@@ -1850,6 +1851,116 @@ When there's no example, the schema is walked recursively and each field gets a 
 
 ---
 
+## ✅ Validating Mocks
+
+Mock files are checked into repositories and edited by people who never run the server locally — and a bad mock currently surfaces as a failing integration test with no obvious link back to the file, or as a route that quietly serves `200` instead of the `503` it declares, or as a mock that loads and can never be reached. `mimic validate` loads a mocks directory **exactly as the server would** and reports everything questionable about it, before any of that happens:
+
+```bash
+mimic validate ./mocks
+```
+
+```
+mocks/checkout.json:  error   status 1000 is not a valid HTTP status code (100-599); requests would be answered 200 OK instead
+mocks/health.json:    error   GET /health is reserved by Mimic's health check and will never be served. Move it, or free the route (see MIMIC_HEALTH_PATH / MIMIC_ADMIN_PREFIX / MIMIC_DISABLE_ADMIN).
+mocks/order.json:     warning 1 step(s) can never serve: step 2 declares `repeat: true`, which pins the counter at it until the sequence is reset
+mocks/search.json:    warning query param `q` regex `[a-z` failed to compile; this matcher can never match
+mocks/users_v2.json:  warning duplicate GET /users (also: mocks/users.json) — ties are broken by file name, so this copy only serves when the first one is inactive
+5 problem(s) in 7 mock file(s): 2 error(s), 3 warning(s)
+```
+
+Each row is one problem in one file; the last line is always the summary, so a script can grep it without parsing anything.
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `<dir>` (positional) | what the server would read | A directory — or a single mock file — to validate. By default the same resolution the server performs: `MIMIC_MOCKS_DIR`, then `/app/mocks` (Docker), then `./mocks`, so validation and serving can never disagree about what's loaded. |
+| `--strict` | off | Warnings count as errors — the exit a CI job wants. |
+| `--format <fmt>` | `text` | `json` emits the machine-readable shape (below), so a tool can annotate a PR. |
+| `-h, --help` | | Show usage. |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | No problems (with `--strict`: also no warnings). |
+| `1` | At least one error — or at least one warning under `--strict`. |
+| `2` | Bad usage. |
+
+### What counts as an error or a warning
+
+An **error** means the mock cannot do what it says. A **warning** means it is suspicious but legal — Mimic would serve *something*, and no log line would ever say why. Both run through the same code the server itself uses (`is_valid_status`, the reservation table, the regex cache, the file-content-type rules), so a verdict can't drift from the behavior.
+
+- **Errors** — the mock is refused or serves differently than declared:
+  - the file is not parsable JSON/YAML (also: an unreadable file)
+  - both `response` and `response_file` are set
+  - a `response_file` is missing, not a regular file, outside the mocks root, or over the `MIMIC_MAX_RESPONSE_FILE` limit
+  - a status (mock-level or per sequence step) outside 100–599 — it would be served as `200 OK`
+  - a `path` that does not start with `/` — it registers under a key no request ever looks up
+  - a route Mimic reserves (`GET /health`, the `/admin/*` API), honoring `MIMIC_HEALTH_PATH`, `MIMIC_ADMIN_PREFIX`, and `MIMIC_DISABLE_ADMIN` exactly as the server does
+- **Warnings** — the mock loads, but it can never do what the author probably meant:
+  - duplicate `METHOD path` across files — ties are broken by file name, so all but one copy is dead unless scenarios switch them
+  - a regex in a query-param, header, or text-body matcher that fails to compile — that matcher answers "no" to every request
+  - sequence step(s) after a `repeat: true` step — the counter pins there until the sequence is reset
+  - a `{{…}}` expression naming an unknown source (or an unknown cast) — it renders as an empty string. Checked only where the server would actually render: a JSON `response` always; a `response_file` body only when the mock opted in with `"template": true` and the file's content type is textual
+  - a tag in `MIMIC_ACTIVE_TAGS` that no mock declares — the scenario serves nothing. (The reverse — a declared tag that isn't active right now — is *not* reported: scenarios are switched at runtime, so "inactive" is a state, not a bug.)
+
+The environment is respected throughout: `MIMIC_MOCKS_DIR`, `MIMIC_MAX_RESPONSE_FILE`, the route-reservation variables, and `MIMIC_ACTIVE_TAGS` are read the same way `serve` reads them.
+
+### `--format json`
+
+```json
+{
+  "directory": "mocks",
+  "files": 27,
+  "strict": false,
+  "errors": 2,
+  "warnings": 3,
+  "problems": [
+    {
+      "file": "mocks/checkout.json",
+      "severity": "error",
+      "kind": "invalid_status",
+      "message": "status 1000 is not a valid HTTP status code (100-599); requests would be answered 200 OK instead"
+    }
+  ]
+}
+```
+
+`kind` is a stable code (`load_error`, `invalid_status`, `reserved_route`, `path_without_slash`, `duplicate_route`, `invalid_regex`, `unreachable_sequence_step`, `unknown_template_source`, `unknown_active_tag`) — suitable for machine consumption; `message` is for humans.
+
+### In CI
+
+The check binds nothing, writes nothing, and takes milliseconds, so it belongs in the same pipeline that runs the mock server. In GitHub Actions, against the checked-in mock set:
+
+```yaml
+jobs:
+  mocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate mocks
+        # ENTRYPOINT is the binary, so args go straight to it; the image's
+        # MIMIC_MOCKS_DIR=/app/mocks matches the volume mount.
+        run: docker run --rm -v "$PWD/mocks:/app/mocks" ragilhadi/mimic:latest validate --strict
+```
+
+And in a pre-commit hook, locally:
+
+```bash
+mimic validate --strict ./mocks
+```
+
+### Semantics
+
+- **Validation and serving share the loader.** A mock the validator rejects as an error is one the server refuses to load or refuses to serve as declared; a test asserts exactly that, so the two cannot drift apart.
+- **`validate` never starts a server, binds a port, or writes anything** — it is the loader plus a report, in a process that exits.
+- **The summary line is always printed**, clean or not, so `grep "0 problem(s)"` is a valid (if redundant) CI check alongside the exit code.
+- **A warning is deliberately quiet about deliberately-dormant scenarios**: tags not currently selected by `MIMIC_ACTIVE_TAGS` are a runtime state, not a defect. Only an *activated* tag that no mock declares is reported.
+- Cross-key pattern-route shadowing (`/users/me` vs `/users/:id`) is not yet reported — exact duplicates are; scoring across different keys is planned.
+
+---
+
 ## 🔌 Proxy / Record-and-Replay
 
 Point Mimic at a real API once, and it grows a matching mock set for free. When `MIMIC_PROXY_UPSTREAM` is set, a request that matches no local mock is forwarded to that upstream instead of getting the usual `404 "mock not found"` — the real response is returned to the client. Add `MIMIC_RECORD_UPSTREAM=true` and that response is also saved as a new mock file, so the next identical request is served from disk with zero network calls.
@@ -2685,6 +2796,7 @@ Built with:
 - [x] Faker-style random data generators (`{{faker.uuid}}`, `{{faker.name}}`, `{{faker.int}}`, …)
 - [x] Typed template casts (`{{number:x}}`, `{{bool:x}}`, `{{json:x}}`)
 - [x] Built-in CORS with automatic `OPTIONS` preflight handling (`MIMIC_CORS=true`)
+- [x] `mimic validate` — a CI-friendly check over a mocks directory (#117)
 
 ---
 

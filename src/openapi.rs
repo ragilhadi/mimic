@@ -1699,7 +1699,7 @@ paths:
         // What the loader itself reads back must round-trip identically to
         // the JSON output for the same spec.
         let loaded = crate::loader::load_mocks_map(out.to_str().unwrap());
-        assert_eq!(loaded.errors, 0);
+        assert_eq!(loaded.errors.len(), 0);
         assert!(loaded.mocks.contains_key("GET:/users/:id"));
     }
 
@@ -1786,7 +1786,7 @@ paths:
         write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(loaded.errors, 0, "every generated file must parse");
+        assert_eq!(loaded.errors.len(), 0, "every generated file must parse");
 
         // A concrete request against the generated path-parameter mock.
         let context =

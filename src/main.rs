@@ -8,6 +8,7 @@ mod proxy;
 mod regex_cache;
 mod template;
 mod types;
+mod validate;
 
 use axum::{
     routing::{any, get, post},
@@ -28,17 +29,17 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Application entry point.
 ///
-/// Dispatches the one-off `import-openapi` subcommand if it was asked for,
-/// otherwise starts the mock server. The subcommand check happens before the
-/// async runtime spins up: importing a spec is plain blocking file I/O and
-/// has no business starting a server.
+/// Dispatches the one-off subcommands (`import-openapi`, `validate`) if one
+/// was asked for, otherwise starts the mock server. The subcommand checks
+/// happen before the async runtime spins up: both are plain blocking file
+/// I/O and have no business starting a server.
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.get(1).map(String::as_str) == Some("import-openapi") {
-        std::process::exit(run_import(&args[2..]));
+    match args.get(1).map(String::as_str) {
+        Some("import-openapi") => std::process::exit(run_import(&args[2..])),
+        Some("validate") => std::process::exit(validate::run_validate(&args[2..])),
+        _ => run_server(),
     }
-
-    run_server();
 }
 
 /// Run the `import-openapi` subcommand, returning the process exit code.
@@ -278,7 +279,11 @@ async fn run_server() {
                     loader::ReloadOutcome {
                         result: loader::LoadResult {
                             mocks: std::collections::HashMap::new(),
-                            errors: 1,
+                            errors: vec![(
+                                reload_dir.clone().into(),
+                                "hot-reload task panicked".to_string(),
+                            )],
+                            files: 0,
                         },
                         changed: true,
                     },
@@ -489,13 +494,11 @@ fn warn_empty_mock_set(dir: &loader::ResolvedMocksDir) {
 /// the previous map had that this cycle didn't produce. That last part keeps
 /// the broken file's own route serving its last-known-good response instead of
 /// disappearing and reappearing as the file is fixed.
-///
-/// `loader.rs` has already logged which files failed and why.
 fn apply_reload(
     current: &HashMap<String, Vec<types::MockConfig>>,
     result: loader::LoadResult,
 ) -> HashMap<String, Vec<types::MockConfig>> {
-    if result.errors == 0 {
+    if result.errors.is_empty() {
         return result.mocks;
     }
 
@@ -508,13 +511,23 @@ fn apply_reload(
         }
     }
 
+    // The loader no longer logs per-file failures itself — the result carries
+    // them — so this summary names each file and why it failed. A line saying
+    // "1 file failed" sent someone scrolling; name the file.
     warn!(
         "🔄 Hot reload: {} file(s) failed to load; applied {} endpoint(s) that parsed, \
          kept {} previously-registered endpoint(s)",
-        result.errors,
+        result.errors.len(),
         merged.len() - retained,
         retained
     );
+    for (file, message) in &result.errors {
+        warn!(
+            "🔄 Hot reload: failed to load {}: {}",
+            file.display(),
+            message
+        );
+    }
 
     merged
 }
@@ -1161,13 +1174,27 @@ mod tests {
         std::fs::write(dir.join(name), contents).unwrap();
     }
 
+    /// A [`LoadResult`] with `errors`/`files` filled in the way a load with
+    /// no fixture claims would produce them.
+    fn load_result(mocks: HashMap<String, Vec<types::MockConfig>>, failures: usize) -> LoadResult {
+        LoadResult {
+            mocks,
+            errors: (0..failures)
+                .map(|i| {
+                    (
+                        std::path::PathBuf::from(format!("broken-{i}.json")),
+                        "x".to_string(),
+                    )
+                })
+                .collect(),
+            files: 0,
+        }
+    }
+
     #[test]
     fn test_clean_reload_replaces_the_map() {
         let current = map(vec![mock("GET", "/old", "old")]);
-        let result = LoadResult {
-            mocks: map(vec![mock("GET", "/new", "new")]),
-            errors: 0,
-        };
+        let result = load_result(map(vec![mock("GET", "/new", "new")]), 0);
 
         let next = apply_reload(&current, result);
 
@@ -1183,10 +1210,7 @@ mod tests {
         // /a was already registered; /b is new and parsed fine this cycle;
         // some third file failed to parse.
         let current = map(vec![mock("GET", "/a", "a")]);
-        let result = LoadResult {
-            mocks: map(vec![mock("GET", "/a", "a"), mock("GET", "/b", "b")]),
-            errors: 1,
-        };
+        let result = load_result(map(vec![mock("GET", "/a", "a"), mock("GET", "/b", "b")]), 1);
 
         let next = apply_reload(&current, result);
 
@@ -1205,10 +1229,7 @@ mod tests {
             mock("GET", "/broken", "last-good"),
             mock("GET", "/ok", "ok"),
         ]);
-        let result = LoadResult {
-            mocks: map(vec![mock("GET", "/ok", "ok-updated")]),
-            errors: 1,
-        };
+        let result = load_result(map(vec![mock("GET", "/ok", "ok-updated")]), 1);
 
         let next = apply_reload(&current, result);
 
@@ -1394,7 +1415,7 @@ mod tests {
             r#"{"method":"GET","path":"/a","status":200,"response":{}}"#,
         );
         let current = loader::load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(current.errors, 0);
+        assert_eq!(current.errors.len(), 0);
         assert!(current.mocks.contains_key("GET:/a"));
 
         // A second valid mock lands at the same time as a file mid-save.
@@ -1406,7 +1427,7 @@ mod tests {
         write_mock(dir.path(), "c.json", "{invalid json");
 
         let result = loader::load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
 
         let next = apply_reload(&current.mocks, result);
 
@@ -1414,6 +1435,76 @@ mod tests {
         assert!(
             next.contains_key("GET:/b"),
             "/b is independently valid and must become available"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `mimic validate` shares one truth with the server (issue #117)
+    // ------------------------------------------------------------------
+
+    /// The validator's verdicts are the server's behavior, not an opinion:
+    /// a mock it calls a lie is one `handle_request` really cannot serve as
+    /// declared, and a file it refuses is one no request can reach.
+    #[tokio::test]
+    async fn the_validator_and_the_server_agree_on_what_a_mock_will_do() {
+        // A mock declaring status 1000: the validator — via `is_valid_status`,
+        // the same predicate the loader and dashboard consult — errors on it,
+        // and the server registers the mock but cannot put the status on the
+        // wire: it answers 200 OK.
+        let declared_wrong = map(vec![mock("GET", "/declared", "wrong-status")]);
+        assert!(
+            !types::is_valid_status(1000),
+            "the shared predicate rejects the range the handler cannot serve"
+        );
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(declared_wrong)));
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/declared")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the mock is registered, but its declared status never reaches the wire"
+        );
+
+        // A mock setting both `response` and `response_file`: the loader —
+        // i.e. server startup — refuses the file entirely, and no request
+        // reaches anything.
+        let dir = tempfile::tempdir().unwrap();
+        write_mock(
+            dir.path(),
+            "both.json",
+            r#"{"method":"GET","path":"/both","status":200,
+                "response":{"a":1},"response_file":"body.txt"}"#,
+        );
+        let result = loader::load_mocks_map_with_limit(
+            dir.path().to_str().unwrap(),
+            loader::DEFAULT_MAX_RESPONSE_FILE,
+        );
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "the loader refuses the file: {:?}",
+            result.errors
+        );
+        assert!(result.mocks.is_empty(), "nothing of it is registered");
+
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(result.mocks)));
+        let app = create_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/both").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a mock the loader refuses serves nothing"
         );
     }
 }
