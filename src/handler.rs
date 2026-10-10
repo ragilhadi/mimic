@@ -2348,10 +2348,8 @@ mod tests {
     /// tests: a `HEAD` request's outcome depends on `MIMIC_HEAD_FROM_GET`'s
     /// default, which the matcher test module's env test flips. See
     /// [`crate::types::env_lock`].
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::types::env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::types::env_lock().lock().await
     }
 
     /// The byte length of the body a GET to `method path` returns on `state`.
@@ -2375,7 +2373,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_head_answered_from_the_get_mock() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let state = create_test_state();
         let expected_len = get_body_length(&state, Method::GET, "/users").await;
 
@@ -2417,7 +2415,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_explicit_head_mock_is_unaffected() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let mut mocks = HashMap::new();
         mocks.insert(
             "HEAD:/users".to_string(),
@@ -2458,7 +2456,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_head_fallback_serves_a_pattern_route() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let mut mocks = HashMap::new();
         mocks.insert(
             "GET:/users/:id".to_string(),
@@ -2509,7 +2507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_head_fallback_bumps_the_get_mocks_state() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let mut mocks = HashMap::new();
         mocks.insert(
             "GET:/users".to_string(),
@@ -2588,7 +2586,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_head_fallback_is_recorded_as_a_head() {
-        let _env = env_guard();
+        let _env = env_guard().await;
         let state = create_test_state();
 
         let response = handle_request(

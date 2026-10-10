@@ -3072,11 +3072,11 @@ mod tests {
 
     /// Serialized access to the process environment: held by every test in
     /// this module that mutates an env var, and by every test whose behavior
-    /// depends on one's default. See [`crate::types::env_lock`].
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::types::env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    /// depends on one's default — through the same lock the async handler
+    /// tests await, so the two groups serialize against each other too. See
+    /// [`crate::types::env_lock`].
+    fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::types::env_lock().blocking_lock()
     }
 
     fn head_context(path: &str) -> RequestContext {

@@ -599,10 +599,18 @@ pub fn is_truthy(value: &str) -> bool {
 /// concurrently running test that relies on the enabled default. Holding this
 /// lock across both the mutating test and the tests that depend on the
 /// default serializes exactly that group.
+///
+/// The mutex is tokio's rather than [`std::sync::Mutex`] because the group
+/// mixes async tests, whose guards stay held across `.await` as the request
+/// runs, with plain sync tests, which take it via
+/// [`tokio::sync::Mutex::blocking_lock`] — a std guard held across an await
+/// is exactly what `clippy::await_holding_lock` rejects, and rightly: the
+/// guard the async tests keep is this one, a lock used only by tests, guarded
+/// here by an async-aware type instead of an allow-list.
 #[cfg(test)]
-pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+pub(crate) fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// True when `status` is a value Mimic can actually put on the wire as the
