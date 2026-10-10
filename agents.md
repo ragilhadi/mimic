@@ -53,9 +53,9 @@
 
 ### 6. **Importer Agent** (`src/openapi.rs`)
 - **Purpose:** Generate mock files from an OpenAPI 3.x spec
-- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--force] [--brace-params]`
+- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--base-path <path>] [--force] [--brace-params]`
 - **Outputs:** One `MockConfig` JSON file per operation + response status
-- **Responsibilities:** Parse JSON/YAML, resolve `$ref`, pick examples or build schema stubs, translate `{id}` path templates, refuse to clobber a non-empty output directory without `--force`
+- **Responsibilities:** Parse JSON/YAML, resolve `$ref`, pick examples or build schema stubs, translate `{id}` path templates, apply the base path from `servers[0]` (variable defaults resolved; `--base-path` overrides, `''` drops; the applied prefix is printed), refuse to clobber a non-empty output directory without `--force`
 - **Note:** Runs instead of the server (checked in `main` before the async runtime starts) and exits when done
 
 ### 7. **Logger Agent** (`src/main.rs`)

@@ -45,11 +45,19 @@ fn main() {
 /// Run the `import-openapi` subcommand, returning the process exit code.
 fn run_import(args: &[String]) -> i32 {
     match openapi::run_import(args) {
-        Ok(written) => {
+        Ok((written, base_path)) => {
             for path in &written {
                 println!("{}", path.display());
             }
-            println!("✅ Generated {} mock file(s)", written.len());
+            if base_path.is_empty() {
+                println!("✅ Generated {} mock file(s)", written.len());
+            } else {
+                // The prefix is never a surprise discovered at request time.
+                println!(
+                    "✅ Generated {} mock file(s) under {base_path}",
+                    written.len()
+                );
+            }
             if let Some(out_dir) = written.first().and_then(|p| p.parent()) {
                 print_serve_hint(out_dir);
             }
