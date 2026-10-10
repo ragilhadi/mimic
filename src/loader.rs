@@ -10,7 +10,15 @@ use tracing::{debug, error, warn};
 /// Result of loading mock configurations, including any errors encountered.
 pub struct LoadResult {
     pub mocks: HashMap<String, Vec<MockConfig>>,
-    pub errors: usize,
+    /// Per-file failures — the file and *why* it failed — in the walk's
+    /// sorted order. The loader only ever had a count of these; carrying the
+    /// messages is what lets a consumer log or report them without
+    /// re-deriving them (the hot-reload summary, `mimic validate`).
+    pub errors: Vec<(PathBuf, String)>,
+    /// How many candidate mock files the walk scanned: everything counted in
+    /// [`Self::errors`] and every mock in [`Self::mocks`], plus files skipped
+    /// as fixtures. The number a validator's summary line talks about.
+    pub files: usize,
 }
 
 // ============================================================================
@@ -281,7 +289,8 @@ fn load_mocks_map_core(
         return ReloadOutcome {
             result: LoadResult {
                 mocks: HashMap::new(),
-                errors: 1,
+                errors: vec![(PathBuf::from(path), "mock path does not exist".to_string())],
+                files: 0,
             },
             changed: was_populated,
         };
@@ -299,7 +308,7 @@ fn load_mocks_map_core(
     // Pass one: read every candidate file, in a fixed order — skipping
     // whatever `cache` says is unchanged since last time.
     let mut scanned: Vec<(PathBuf, Result<LoadedMock, String>)> = Vec::new();
-    let mut errors: usize = 0;
+    let mut errors: Vec<(PathBuf, String)> = Vec::new();
     let mut changed = false;
     // Every mock-candidate file seen this cycle, so a file that vanished
     // (deleted or renamed away) can be dropped from `cache` afterward instead
@@ -343,6 +352,7 @@ fn load_mocks_map_core(
 
     // Pass two: register what parsed, minus the fixtures.
     let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+    let mut fixture_files: usize = 0;
     for (file, outcome) in &scanned {
         // Only worth a `canonicalize` syscall per file when some mock actually
         // claims a fixture, which for most mock sets is never.
@@ -354,6 +364,7 @@ fn load_mocks_map_core(
                 "Skipping {}: it is served as a response_file by another mock",
                 file.display()
             );
+            fixture_files += 1;
             continue;
         }
 
@@ -375,20 +386,28 @@ fn load_mocks_map_core(
                 entry.push(mock);
             }
             Err(e) => {
-                warn!("Failed to load mock file {}: {}", file.display(), e);
-                errors += 1;
+                errors.push((file.clone(), e.clone()));
             }
         }
     }
 
+    // A file that fails to parse isn't cached (see
+    // `load_single_mock_maybe_cached`), so it's retried — and `errors`
+    // stays nonempty — every cycle until it's fixed or removed. Treating
+    // that as "changed" every time matches `apply_reload`'s existing
+    // carry-forward behavior, which already re-runs on every such cycle.
+    let changed = changed || !errors.is_empty();
+
     ReloadOutcome {
-        result: LoadResult { mocks, errors },
-        // A file that fails to parse isn't cached (see
-        // `load_single_mock_maybe_cached`), so it's retried — and `errors`
-        // stays nonzero — every cycle until it's fixed or removed. Treating
-        // that as "changed" every time matches `apply_reload`'s existing
-        // carry-forward behavior, which already re-runs on every such cycle.
-        changed: changed || errors > 0,
+        result: LoadResult {
+            mocks,
+            errors,
+            // The walk scanned every `.json`/`.yaml`/`.yml` in the tree, but
+            // a file claimed as a fixture is a body, not a mock definition —
+            // the summary counts mocks.
+            files: scanned.len() - fixture_files,
+        },
+        changed,
     }
 }
 
@@ -400,8 +419,17 @@ fn load_mocks_map_core(
 ///
 /// Returns:
 ///     MockStore: Thread-safe HashMap of mock configurations keyed by "METHOD:PATH".
+///
+/// Per-file load failures are logged here, one `warn!` each — the startup
+/// path discards the [`LoadResult`] behind a [`MockStore`], so this is the
+/// last chance anyone sees the messages. A caller that *does* keep the
+/// result (hot reload, `mimic validate`) doesn't come through here, and owns
+/// its own logging.
 pub fn load_mocks(path: &str) -> MockStore {
     let result = load_mocks_map(path);
+    for (file, message) in &result.errors {
+        warn!("Failed to load mock file {}: {}", file.display(), message);
+    }
     Arc::new(RwLock::new(result.mocks))
 }
 
@@ -445,7 +473,7 @@ const MAX_WALK_DEPTH: usize = 64;
 /// adding another positional parameter to every recursive call.
 struct ScanState<'a> {
     scanned: &'a mut Vec<(PathBuf, Result<LoadedMock, String>)>,
-    errors: &'a mut usize,
+    errors: &'a mut Vec<(PathBuf, String)>,
     visited: &'a mut HashSet<PathBuf>,
     cache: &'a mut LoaderCache,
     changed: &'a mut bool,
@@ -460,21 +488,23 @@ fn collect_mock_files(
     depth: usize,
 ) {
     if depth > MAX_WALK_DEPTH {
-        error!(
+        let message = format!(
             "Mocks directory walk exceeded {} levels at {}; stopping here \
              (an unresolvable symlink cycle?)",
             MAX_WALK_DEPTH,
             dir.display()
         );
-        *state.errors += 1;
+        error!("{}", message);
+        state.errors.push((dir.to_path_buf(), message));
         return;
     }
 
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            error!("Failed to read directory {}: {}", dir.display(), e);
-            *state.errors += 1;
+            let message = format!("Failed to read directory {}: {}", dir.display(), e);
+            error!("{}", message);
+            state.errors.push((dir.to_path_buf(), message));
             return;
         }
     };
@@ -891,7 +921,7 @@ mod tests {
             .unwrap();
 
         let result = load_mocks_map(dir_path.to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert_eq!(
             result.mocks["POST:/checkout"][0].tags,
             vec!["error-scenario"]
@@ -947,7 +977,7 @@ mod tests {
 
         let result = load_mocks_map(dir_path.to_str().unwrap());
 
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert!(result.mocks.contains_key("GET:/local"));
         assert!(result.mocks.contains_key("GET:/shared"));
     }
@@ -1111,7 +1141,7 @@ mod tests {
     fn test_load_mocks_nonexistent_directory() {
         let result = load_mocks_map("/nonexistent/path");
         assert_eq!(result.mocks.len(), 0);
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
     }
 
     #[test]
@@ -1119,7 +1149,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let result = load_mocks_map(temp_dir.path().to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
     }
 
     #[test]
@@ -1134,7 +1164,7 @@ mod tests {
 
         let result = load_mocks_map(dir_path.to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
     }
 
     #[test]
@@ -1147,7 +1177,7 @@ mod tests {
 
         let result = load_mocks_map(temp_dir.path().to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
     }
 
     #[test]
@@ -1167,7 +1197,7 @@ mod tests {
 
         let result = load_mocks_map(temp_dir.path().to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
     }
 
     #[test]
@@ -1224,7 +1254,7 @@ mod tests {
 
         let result = load_mocks_map(file_path.to_str().unwrap());
         assert_eq!(result.mocks.len(), 0);
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
     }
 
     #[test]
@@ -1375,7 +1405,7 @@ mod tests {
 
         // Reload mocks into the store (simulating hot reload)
         let result = load_mocks_map(dir_path.to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         {
             let mut mocks = store.write().await;
             *mocks = result.mocks;
@@ -1394,7 +1424,7 @@ mod tests {
 
         // Reload mocks again
         let result = load_mocks_map(dir_path.to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         {
             let mut mocks = store.write().await;
             *mocks = result.mocks;
@@ -1437,7 +1467,7 @@ mod tests {
 
         // Reload should report errors; caller should skip the swap
         let result = load_mocks_map(dir_path.to_str().unwrap());
-        assert!(result.errors > 0);
+        assert!(!result.errors.is_empty());
         // Do NOT swap — previous mock set is preserved
         {
             let mocks = store.read().await;
@@ -1569,7 +1599,7 @@ mod tests {
         .unwrap();
 
         let result = load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let mock = &result.mocks["GET:/users"][0];
         assert_eq!(mock.method, "GET");
         assert_eq!(mock.status, 200);
@@ -1586,7 +1616,7 @@ mod tests {
         .unwrap();
 
         let result = load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert!(result.mocks.contains_key("GET:/ping"));
     }
 
@@ -1613,7 +1643,7 @@ mod tests {
         .unwrap();
 
         let result = load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let order: Vec<&str> = result.mocks["GET:/dup"]
             .iter()
             .map(|mock| mock.response["from"].as_str().unwrap())
@@ -1636,7 +1666,7 @@ mod tests {
         fs::write(dir.path().join("broken.yaml"), "method: [GET\n").unwrap();
 
         let result = load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
         assert!(result.mocks.contains_key("GET:/users"));
     }
 
@@ -1660,7 +1690,7 @@ mod tests {
         .unwrap();
 
         let result = load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let mock = &result.mocks["GET:/page"][0];
         assert_eq!(
             mock.response["html"],
@@ -1682,7 +1712,7 @@ mod tests {
         .unwrap();
 
         let result = load_mocks_map(dir.path().to_str().unwrap());
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let mock = &result.mocks["GET:/download"][0];
         assert_eq!(
             mock.response_bytes.as_deref(),
@@ -1785,7 +1815,7 @@ mod tests {
         assert!(resolved.exists);
 
         let result = load_mocks_map(&resolved.path);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert!(result.mocks.contains_key("GET:/users"));
     }
 
@@ -1842,7 +1872,7 @@ mod tests {
         ]);
 
         let result = load(&dir);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let mock = &result.mocks["GET:/export"][0];
         assert_eq!(
             mock.response_bytes.as_deref(),
@@ -1870,7 +1900,7 @@ mod tests {
         ]);
 
         let result = load(&dir);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert_eq!(
             result.mocks["GET:/a"][0].response_bytes.as_deref(),
             Some(b"from a".as_slice())
@@ -1964,7 +1994,7 @@ mod tests {
         )]);
 
         let result = load(&dir);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let mock = &result.mocks["DELETE:/users/1"][0];
         assert!(mock.response.is_null());
         assert!(mock.response_bytes.is_none());
@@ -1998,7 +2028,7 @@ mod tests {
         ]);
 
         let result = load_mocks_map_with_limit(dir.path().to_str().unwrap(), 1024);
-        assert_eq!(result.errors, 1);
+        assert_eq!(result.errors.len(), 1);
         assert!(
             !result.mocks.contains_key("GET:/big"),
             "half a fixture is not a response"
@@ -2006,7 +2036,7 @@ mod tests {
 
         // The same set loads once the cap is raised past the file.
         let result = load_mocks_map_with_limit(dir.path().to_str().unwrap(), 8192);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert_eq!(
             result.mocks["GET:/big"][0]
                 .response_bytes
@@ -2029,7 +2059,7 @@ mod tests {
         ]);
 
         let result = load_mocks_map_with_limit(dir.path().to_str().unwrap(), 0);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert!(result.mocks.contains_key("GET:/big"));
     }
 
@@ -2048,7 +2078,11 @@ mod tests {
         ]);
 
         let result = load(&dir);
-        assert_eq!(result.errors, 0, "a claimed fixture is not a broken mock");
+        assert_eq!(
+            result.errors.len(),
+            0,
+            "a claimed fixture is not a broken mock"
+        );
         assert_eq!(result.mocks.len(), 1);
         assert!(result.mocks.contains_key("GET:/users"));
     }
@@ -2058,7 +2092,7 @@ mod tests {
         // The fixture exemption is narrow: only files some mock actually
         // names. A typo'd mock file must not disappear into it.
         let dir = mocks_dir(&[("stray.json", br#"{"users":[{"id":1}]}"#)]);
-        assert_eq!(load(&dir).errors, 1);
+        assert_eq!(load(&dir).errors.len(), 1);
     }
 
     #[test]
@@ -2076,7 +2110,7 @@ mod tests {
         ]);
 
         let result = load(&dir);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         let steps = result.mocks["GET:/flaky"][0].sequence.as_ref().unwrap();
         assert!(steps[0].response_bytes.is_none());
         assert_eq!(
@@ -2112,7 +2146,7 @@ mod tests {
         )]);
 
         let result = load(&dir);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert!(result.mocks["GET:/x"][0].response_bytes.is_none());
     }
 
@@ -2128,7 +2162,7 @@ mod tests {
 
         let file = dir.path().join("one.json");
         let result = load_mocks_map_with_limit(file.to_str().unwrap(), DEFAULT_MAX_RESPONSE_FILE);
-        assert_eq!(result.errors, 0);
+        assert_eq!(result.errors.len(), 0);
         assert_eq!(
             result.mocks["GET:/one"][0].response_bytes.as_deref(),
             Some(b"hello".as_slice())
@@ -2138,37 +2172,44 @@ mod tests {
     /// Load `dir`, expecting exactly one failing file, and return its message.
     fn load_error(dir: &TempDir) -> String {
         let result = load(dir);
-        assert_eq!(result.errors, 1, "expected exactly one load error");
+        let [(_, message)] = &result.errors[..] else {
+            panic!(
+                "expected exactly one load error, got {}: {:?}",
+                result.errors.len(),
+                result.errors
+            );
+        };
         assert!(
             result.mocks.is_empty(),
             "a mock that fails validation must not be registered"
         );
+        message.clone()
+    }
 
-        // The message the loader logs is the message `load_single_mock`
-        // returns, so assert on that rather than on captured log output.
-        let root = dir.path().canonicalize().unwrap();
-        let mut messages = Vec::new();
-        let mut scanned = Vec::new();
-        let mut errors = 0;
-        let mut visited = HashSet::new();
-        visited.insert(root.clone());
-        let mut cache = LoaderCache::new();
-        let mut changed = false;
-        let mut seen = HashSet::new();
-        let mut state = ScanState {
-            scanned: &mut scanned,
-            errors: &mut errors,
-            visited: &mut visited,
-            cache: &mut cache,
-            changed: &mut changed,
-            seen: &mut seen,
-        };
-        collect_mock_files(&root, &root, DEFAULT_MAX_RESPONSE_FILE, &mut state, 0);
-        for (_, outcome) in scanned {
-            if let Err(message) = outcome {
-                messages.push(message);
-            }
-        }
-        messages.join("\n")
+    #[test]
+    fn load_failures_carry_the_file_and_the_reason() {
+        let dir = mocks_dir(&[
+            ("broken.json", br#"{"method":"GET""#),
+            (
+                "good.json",
+                br#"{"method":"GET","path":"/good","status":200,"response":{}}"#,
+            ),
+        ]);
+
+        let result = load(&dir);
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.files, 2, "both candidates were scanned");
+        let (file, message) = &result.errors[0];
+        assert_eq!(
+            file.file_name().and_then(|f| f.to_str()),
+            Some("broken.json")
+        );
+        assert!(
+            message.contains("Failed to parse") && message.contains("broken.json"),
+            "the message names the rule and the file: {}",
+            message
+        );
+        assert!(result.mocks.contains_key("GET:/good"));
     }
 }

@@ -19,7 +19,7 @@ pub struct TemplateContext<'a> {
     pub body: Option<&'a ParsedBody>,
 }
 
-fn template_regex() -> &'static Regex {
+pub(crate) fn template_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Matches any `{{ [cast:]source.key }}` shape; unrecognized sources or
     // missing keys are resolved to an empty string rather than rejected here,
@@ -33,9 +33,21 @@ fn template_regex() -> &'static Regex {
     })
 }
 
+/// Names a template source `resolve` could ever fill in — the engine of
+/// record for "is this `{{source.…}}` a thing at all", exposed so
+/// `mimic validate` can flag an unknown source without keeping its own list.
+pub(crate) const KNOWN_SOURCES: &[&str] = &["path", "query", "header", "body", "faker"];
+
+/// [`KNOWN_SOURCES`]' membership, as a function — the gate `resolve` itself
+/// consults, so a name the list rejects resolves exactly like the `_ =>`
+/// wildcard used to and validator and engine cannot disagree.
+pub(crate) fn is_known_source(source: &str) -> bool {
+    KNOWN_SOURCES.contains(&source)
+}
+
 /// Casts recognized by the `{{cast:source.key}}` syntax. Anything else in the
 /// cast position is treated as an unrecognized/malformed template.
-const KNOWN_CASTS: &[&str] = &["number", "bool", "json"];
+pub(crate) const KNOWN_CASTS: &[&str] = &["number", "bool", "json"];
 
 /// Render `{{ }}` templates found anywhere in `value`, returning a new JSON value.
 /// If `value` contains no template expressions, it is cloned as-is without
@@ -183,6 +195,15 @@ fn parse_number(s: &str) -> Option<Value> {
 }
 
 fn resolve(source: &str, key: &str, ctx: &TemplateContext) -> Option<String> {
+    // The wildcard arm this replaces resolved an unknown source to `None` —
+    // and callers render `None` as the empty string. Gating on
+    // `KNOWN_SOURCES` here is what makes that verdict shared, engine-side:
+    // anything a template can actually reach is in the list, and a source
+    // added to the match below must be added there first or every template
+    // test exercising it fails loudly.
+    if !is_known_source(source) {
+        return None;
+    }
     match source {
         "path" => ctx.path_params.get(key).cloned(),
         "query" => ctx.query_params.get(key).cloned(),
