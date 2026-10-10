@@ -70,6 +70,9 @@ Options:
                        its file is the live one (default: 200)
   --format <fmt>       Output format for generated mock files: json or yaml
                        (default: json)
+  --base-path <path>   Prefix every generated mock's path instead of the one
+                       the spec's servers[0].url carries; an empty value ('')
+                       drops the prefix entirely (default: apply servers[0])
   --force              Write into a non-empty output directory, overwriting
                        files of the same name
   --brace-params       Emit path parameters as {id} instead of :id
@@ -159,6 +162,9 @@ pub struct ImportOptions {
     pub force: bool,
     pub path_style: PathStyle,
     pub format: OutputFormat,
+    /// `None`: derive the base path from the spec's `servers`. `Some("")`:
+    /// explicitly drop it. `Some(path)`: override.
+    pub base_path: Option<String>,
 }
 
 impl Default for ImportOptions {
@@ -170,6 +176,7 @@ impl Default for ImportOptions {
             force: false,
             path_style: PathStyle::Colon,
             format: OutputFormat::default(),
+            base_path: None,
         }
     }
 }
@@ -186,12 +193,13 @@ pub fn parse_args(args: &[String]) -> Result<ImportOptions, ImportError> {
             "-h" | "--help" => return Err(ImportError::Usage(String::new())),
             "--force" => options.force = true,
             "--brace-params" => options.path_style = PathStyle::Brace,
-            "--out" | "--status" | "--format" => {
+            "--out" | "--status" | "--format" | "--base-path" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| ImportError::Usage(format!("{} requires a value", arg)))?;
                 match arg {
                     "--out" => options.out_dir = PathBuf::from(value),
+                    "--base-path" => options.base_path = Some(normalize_base_path(value)),
                     "--status" => {
                         options.default_status = value.parse::<u16>().map_err(|_| {
                             ImportError::Usage(format!(
@@ -356,6 +364,71 @@ impl OpenApiSpec {
         target
     }
 
+    /// The base path a Server Object list contributes to every generated
+    /// mock's `path` field.
+    ///
+    /// A server's scheme, host, and port are irrelevant to a mock and
+    /// ignored; its path component is what a client built from the spec
+    /// prepends to every path, so that is what the mock must serve
+    /// (#118). The first entry wins — a spec usually lists several
+    /// deployment targets of the same API — with a warning naming the
+    /// others and pointing at `--base-path`. Server *variables* are
+    /// resolved from their `default` values; one inside the path without
+    /// a default is dropped with a warning rather than emitted literally.
+    fn base_path_from_servers(&self, servers: &Value, label: &str) -> Option<String> {
+        let list = self.resolve(servers).and_then(Value::as_array)?;
+        if list.is_empty() {
+            return None;
+        }
+        if list.len() > 1 {
+            warn(format!(
+                "{label} lists {} servers; using servers[0]; pass --base-path to use another",
+                list.len()
+            ));
+        }
+        let Some(server) = self.resolve(&list[0]).and_then(Value::as_object) else {
+            warn(format!(
+                "ignoring the base path of {label}: servers[0] is not a Server Object"
+            ));
+            return None;
+        };
+        let Some(url) = server.get("url").and_then(Value::as_str) else {
+            warn(format!(
+                "ignoring the base path of {label}: servers[0] has no url"
+            ));
+            return None;
+        };
+
+        let (url, missing) =
+            resolve_server_variables(url, server.get("variables").and_then(Value::as_object));
+        let mut base = server_path_component(&url)?;
+        for name in missing {
+            if base.contains(&format!("{{{name}}}")) {
+                warn(format!(
+                    "{label}: server variable '{name}' has no default; dropping it from the base path"
+                ));
+                base = collapse_slashes(
+                    base.replace(&format!("{{{name}}}"), "")
+                        .trim_end_matches('/'),
+                );
+            }
+        }
+        if base.is_empty() {
+            None
+        } else {
+            Some(base.to_string())
+        }
+    }
+
+    /// The document-level base path. Nothing here when the spec has no
+    /// `servers` — today's behavior for the vast majority of specs.
+    fn top_level_base_path(&self) -> Option<String> {
+        match self.root.get("servers") {
+            Some(servers) => self.base_path_from_servers(servers, "the spec's servers"),
+            None => None,
+        }
+    }
+
     /// Body for one Response Object: an explicit example if the spec has one,
     /// otherwise a stub built from the response schema.
     fn response_body(&self, response: &Value) -> Value {
@@ -510,6 +583,7 @@ pub fn generate_mocks(
     default_status: u16,
     path_style: PathStyle,
     format: OutputFormat,
+    base_path: &str,
 ) -> Vec<(String, MockConfig)> {
     let mut generated: Vec<(String, MockConfig)> = Vec::new();
     let mut used_names: HashSet<String> = HashSet::new();
@@ -524,7 +598,15 @@ pub fn generate_mocks(
             continue;
         };
 
-        let mock_path = translate_path(template, path_style);
+        // A path item may carry its own `servers`. OpenAPI says a non-empty
+        // path-level list replaces the document-level one, so it wins for
+        // every operation under it — including a path-level server with no
+        // path component, which means no prefix for this path where the
+        // global has one.
+        let path_servers = path_item
+            .get("servers")
+            .filter(|servers| servers.as_array().is_some_and(|list| !list.is_empty()));
+        let translated = translate_path(template, path_style);
 
         for method in HTTP_METHODS {
             let Some(operation) = path_item.get(method) else {
@@ -538,6 +620,23 @@ pub fn generate_mocks(
                 ));
                 continue;
             };
+
+            // `servers` may also live on the operation — the most specific
+            // non-empty list wins, operation over path item over document.
+            let (base, label) = match operation.get("servers") {
+                Some(servers) if servers.as_array().is_some_and(|list| !list.is_empty()) => (
+                    Some(servers),
+                    format!("the servers of {} {}", method.to_uppercase(), template),
+                ),
+                _ => (path_servers, format!("the servers of path `{}`", template)),
+            };
+            let base = match base {
+                Some(servers) => spec
+                    .base_path_from_servers(servers, &label)
+                    .unwrap_or_default(),
+                None => base_path.to_string(),
+            };
+            let mock_path = prepend_base(&base, &translated);
 
             let responses: Vec<GeneratedResponse> = match operation
                 .get("responses")
@@ -657,23 +756,55 @@ pub fn write_mocks(
 }
 
 /// Run the whole `import-openapi` subcommand: parse args, parse the spec,
-/// generate, write. Returns the files written.
-pub fn run_import(args: &[String]) -> Result<Vec<PathBuf>, ImportError> {
+/// resolve the base path, generate, write.
+///
+/// Returns the files written along with the base path actually applied
+/// (empty when none), so the summary line can say where the mocks live
+/// rather than leaving the prefix to be discovered at request time (:118).
+pub fn run_import(args: &[String]) -> Result<(Vec<PathBuf>, String), ImportError> {
     let options = parse_args(args)?;
     let spec = OpenApiSpec::from_path(&options.spec_path)?;
+    let from_servers = spec.top_level_base_path();
+    let base_path = match options.base_path.as_deref() {
+        // `--base-path ''`: drop the prefix, whatever the spec offered.
+        Some("") => {
+            if from_servers.is_some() {
+                println!("Dropping the spec's base path (--base-path '')");
+            }
+            String::new()
+        }
+        Some(flag) => {
+            if from_servers
+                .as_deref()
+                .is_some_and(|derived| derived != flag)
+            {
+                println!("Applying base path {flag} (--base-path overrides the spec's servers)");
+            }
+            flag.to_string()
+        }
+        None => match from_servers {
+            Some(derived) => {
+                println!("Applying base path {derived} from servers[0]");
+                derived
+            }
+            None => String::new(),
+        },
+    };
     let mocks = generate_mocks(
         &spec,
         options.default_status,
         options.path_style,
         options.format,
+        &base_path,
     );
 
     if mocks.is_empty() {
         warn("spec contained no importable operations; nothing was written");
-        return Ok(Vec::new());
+        return Ok((Vec::new(), base_path));
     }
 
-    write_mocks(&mocks, &options.out_dir, options.force, options.format)
+    let written = write_mocks(&mocks, &options.out_dir, options.force, options.format)?;
+    Ok((written, base_path))
 }
 
 // ============================================================================
@@ -757,6 +888,103 @@ fn translate_path(template: &str, style: PathStyle) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Normalize a `--base-path` value: `/api`, `api`, `/api/`, and `//api` all
+/// mean `/api`; emptiness and `/` both mean "no base path", which is how
+/// `--base-path ''` says "drop the spec's prefix".
+fn normalize_base_path(raw: &str) -> String {
+    let core = raw.trim_matches('/');
+    if core.is_empty() {
+        String::new()
+    } else {
+        format!("/{core}")
+    }
+}
+
+/// Collapse runs of slashes left behind by a dropped server variable, and
+/// trim the trailing one. Never eats the leading `/`.
+fn collapse_slashes(path: &str) -> String {
+    let mut collapsed = path.to_string();
+    while collapsed.contains("//") {
+        collapsed = collapsed.replace("//", "/");
+    }
+    collapsed
+}
+
+/// The path component of a Server Object's URL — the only part a mock cares
+/// about. Scheme, host, and port are ignored; a relative URL (legal in
+/// OpenAPI, resolved against the document) is its own path. Returns `None`
+/// for a server with no path, which is the no-op case and by far the most
+/// common.
+fn server_path_component(url: &str) -> Option<String> {
+    let rest = match url.find("://") {
+        Some(scheme_end) => {
+            let authority_and_path = &url[scheme_end + 3..];
+            let slash = authority_and_path.find('/')?;
+            &authority_and_path[slash..]
+        }
+        // Relative server URL: the whole string is the path.
+        None => url,
+    };
+    let path = collapse_slashes(rest.trim_end_matches('/'));
+    match path.as_str() {
+        "" | "/" => None,
+        other if other.starts_with('/') => Some(other.to_string()),
+        other => Some(format!("/{other}")),
+    }
+}
+
+/// Substitute `{name}` occurrences in a server URL with each variable's
+/// `default` from the Server Object's `variables`. Returns the resolved URL
+/// and the names that had no default — including names with no `variables`
+/// block at all — which the caller warns about and drops from the base path
+/// rather than emitting literally (#118).
+fn resolve_server_variables(
+    url: &str,
+    variables: Option<&Map<String, Value>>,
+) -> (String, Vec<String>) {
+    let mut resolved = url.to_string();
+    let mut missing: Vec<String> = Vec::new();
+    let mut start = 0;
+    while let Some(open_rel) = resolved[start..].find('{') {
+        let open = start + open_rel;
+        let Some(close_rel) = resolved[open..].find('}') else {
+            break;
+        };
+        let close = open + close_rel;
+        let name = &resolved[open + 1..close];
+        match variables
+            .and_then(|vars| vars.get(name))
+            .and_then(|v| v.get("default"))
+            .and_then(Value::as_str)
+        {
+            Some(value) => {
+                resolved.replace_range(open..close + 1, value);
+                start = open + value.len();
+            }
+            None => {
+                if !missing.iter().any(|n| n == name) {
+                    missing.push(name.to_string());
+                }
+                start = close + 1;
+            }
+        }
+    }
+    (resolved, missing)
+}
+
+/// Attach a base path to a translated (or raw) path template. Kept boring:
+/// no doubled slashes, and the document root `/` under a base stays just the
+/// base — `GET /` on a `/v1` deployment is `GET /v1`.
+fn prepend_base(base: &str, path: &str) -> String {
+    if base.is_empty() {
+        return path.to_string();
+    }
+    if path == "/" {
+        return base.to_string();
+    }
+    format!("{}{}", base.trim_end_matches('/'), path)
 }
 
 /// `GET /users/{id}` primary -> `get_users_id.json`;
@@ -1012,7 +1240,13 @@ components:
     }
 
     fn generate(spec: &OpenApiSpec) -> Vec<(String, MockConfig)> {
-        generate_mocks(spec, DEFAULT_STATUS, PathStyle::Colon, OutputFormat::Json)
+        generate_mocks(
+            spec,
+            DEFAULT_STATUS,
+            PathStyle::Colon,
+            OutputFormat::Json,
+            "",
+        )
     }
 
     fn find<'a>(mocks: &'a [(String, MockConfig)], name: &str) -> &'a MockConfig {
@@ -1144,6 +1378,7 @@ components:
             DEFAULT_STATUS,
             PathStyle::Brace,
             OutputFormat::Json,
+            "",
         );
         assert_eq!(find(&mocks, "get_users_id.json").path, "/users/{id}");
     }
@@ -1166,7 +1401,7 @@ components:
 
     #[test]
     fn test_status_option_picks_the_primary_when_the_operation_declares_it() {
-        let mocks = generate_mocks(&fixture(), 201, PathStyle::Colon, OutputFormat::Json);
+        let mocks = generate_mocks(&fixture(), 201, PathStyle::Colon, OutputFormat::Json, "");
 
         // POST /users declares 201, so --status 201 makes it the live file.
         assert_eq!(find(&mocks, "post_users.json").status, 201);
@@ -1519,6 +1754,443 @@ components:
         assert_eq!(translate_path("/a/{}", PathStyle::Colon), "/a/{}");
     }
 
+    // ------------------------------------------------------------------
+    // Base paths from `servers` (#118)
+    // ------------------------------------------------------------------
+
+    const SERVERS_FIXTURE: &str = r#"
+openapi: 3.0.3
+info:
+  title: Versioned API
+  version: "1.0.0"
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /users/{id}:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"id": 1, "name": "Ada"}
+"#;
+
+    fn generate_with_base(spec: &OpenApiSpec, base: &str) -> Vec<(String, MockConfig)> {
+        generate_mocks(
+            spec,
+            DEFAULT_STATUS,
+            PathStyle::Colon,
+            OutputFormat::Json,
+            base,
+        )
+    }
+
+    fn generate_servers(yaml: &str) -> Vec<(String, MockConfig)> {
+        // Mirrors how `run_import` wires the pieces: derive the base from
+        // the spec's `servers` (nothing → empty), then hand it to
+        // `generate_mocks`, which is a pure function of its arguments.
+        let spec = OpenApiSpec::parse(yaml).expect("spec should parse");
+        let base = spec.top_level_base_path().unwrap_or_default();
+        generate_with_base(&spec, &base)
+    }
+
+    #[test]
+    fn test_servers_url_path_becomes_the_base_path() {
+        let mocks = generate_servers(SERVERS_FIXTURE);
+        assert_eq!(find(&mocks, "get_users_id.json").path, "/v1/users/:id");
+    }
+
+    #[test]
+    fn test_a_server_without_a_path_changes_nothing() {
+        let yaml = SERVERS_FIXTURE.replace(
+            "servers:\n  - url: https://api.example.com/v1",
+            "servers:\n  - url: https://api.example.com",
+        );
+        let with_pathless_server = generate_servers(&yaml);
+
+        // The claim is precisely that a server with no path component
+        // contributes nothing to any generated path.
+        for (name, mock) in &with_pathless_server {
+            assert!(
+                !mock.path.contains("/v1"),
+                "{} must not grow a base path: {}",
+                name,
+                mock.path
+            );
+        }
+        assert_eq!(
+            find(&with_pathless_server, "get_users_id.json").path,
+            "/users/:id"
+        );
+    }
+
+    #[test]
+    fn test_trailing_slash_on_the_server_url_is_trimmed() {
+        let yaml = SERVERS_FIXTURE.replace(
+            "- url: https://api.example.com/v1",
+            "- url: https://api.example.com/v1/",
+        );
+        assert_eq!(
+            find(&generate_servers(&yaml), "get_users_id.json").path,
+            "/v1/users/:id"
+        );
+    }
+
+    #[test]
+    fn test_a_relative_server_url_uses_its_path() {
+        let yaml = SERVERS_FIXTURE.replace("- url: https://api.example.com/v1", "- url: /v1");
+        assert_eq!(
+            find(&generate_servers(&yaml), "get_users_id.json").path,
+            "/v1/users/:id"
+        );
+    }
+
+    #[test]
+    fn test_server_variables_resolve_from_their_defaults() {
+        let yaml = r#"
+openapi: 3.0.3
+info: {title: Variables, version: "1.0"}
+servers:
+  - url: "https://{host}/v1"
+    variables:
+      host:
+        default: api.example.com
+paths:
+  /users:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"ok": true}
+"#;
+        assert_eq!(
+            find(&generate_servers(yaml), "get_users.json").path,
+            "/v1/users"
+        );
+    }
+
+    #[test]
+    fn test_a_path_variable_without_a_default_is_dropped_not_emitted() {
+        // `tenant` has no default, so `{tenant}` must not land in the mock's
+        // path — the empty segments it leaves collapse away. The warning is
+        // the point of the behavior; the path assertion pins the mechanics.
+        let yaml = SERVERS_FIXTURE.replace(
+            "- url: https://api.example.com/v1",
+            "- url: https://api.example.com/{tenant}/v1",
+        );
+        assert_eq!(
+            find(&generate_servers(&yaml), "get_users_id.json").path,
+            "/v1/users/:id"
+        );
+    }
+
+    #[test]
+    fn test_a_host_variable_without_a_default_does_not_break_the_path() {
+        // The variable sits in the host, which a mock ignores anyway — the
+        // path component must still be extracted, warning or not.
+        let yaml = SERVERS_FIXTURE.replace(
+            "- url: https://api.example.com/v1",
+            "- url: https://{host}/v1",
+        );
+        assert_eq!(
+            find(&generate_servers(&yaml), "get_users_id.json").path,
+            "/v1/users/:id"
+        );
+    }
+
+    #[test]
+    fn test_multiple_servers_use_the_first() {
+        let yaml = SERVERS_FIXTURE.replace(
+            "servers:\n  - url: https://api.example.com/v1",
+            "servers:\n  - url: https://api.example.com/v1\n  - url: https://staging.example.com/v2",
+        );
+        // First entry wins; the warning names `--base-path` for the rest.
+        assert_eq!(
+            find(&generate_servers(&yaml), "get_users_id.json").path,
+            "/v1/users/:id"
+        );
+    }
+
+    #[test]
+    fn test_path_level_servers_override_the_global_for_that_path() {
+        let yaml = r#"
+openapi: 3.0.3
+info: {title: Mixed, version: "1.0"}
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /users:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"ok": true}
+  /admin/status:
+    servers:
+      - url: https://api.example.com/v2
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"ok": true}
+"#;
+        let mocks = generate_servers(yaml);
+        assert_eq!(find(&mocks, "get_users.json").path, "/v1/users");
+        // OpenAPI semantics: a non-empty path-level `servers` replaces the
+        // global list, not augments it.
+        assert_eq!(
+            find(&mocks, "get_admin_status.json").path,
+            "/v2/admin/status"
+        );
+    }
+
+    #[test]
+    fn test_an_empty_path_level_servers_list_falls_back_to_the_global() {
+        let yaml = r#"
+openapi: 3.0.3
+info: {title: Fallback, version: "1.0"}
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /users:
+    get:
+      servers: []
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"ok": true}
+"#;
+        // `servers: []` is not an override — the document-level list applies.
+        assert_eq!(
+            find(&generate_servers(yaml), "get_users.json").path,
+            "/v1/users"
+        );
+    }
+
+    #[test]
+    fn test_operation_level_servers_override_the_path_level() {
+        let yaml = r#"
+openapi: 3.0.3
+info: {title: Operation level, version: "1.0"}
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /admin/status:
+    servers:
+      - url: https://api.example.com/v2
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"ok": true}
+    post:
+      servers:
+        - url: https://api.example.com/v3
+      responses:
+        '201': {}
+"#;
+        let mocks = generate_servers(yaml);
+        // Most specific non-empty list wins: operation over path item.
+        assert_eq!(
+            find(&mocks, "get_admin_status.json").path,
+            "/v2/admin/status"
+        );
+        assert_eq!(
+            find(&mocks, "post_admin_status.json").path,
+            "/v3/admin/status"
+        );
+    }
+
+    #[test]
+    fn test_base_filename_ignores_the_base_path() {
+        // 40 operations under a base path would otherwise lengthen every
+        // generated file name for no benefit — the prefix lives in `path`
+        // only. (The fixture's names are the same as the no-servers case.)
+        let mocks = generate_servers(SERVERS_FIXTURE);
+        assert!(mocks.iter().any(|(name, _)| name == "get_users_id.json"));
+    }
+
+    #[test]
+    fn test_explicit_base_path_beats_the_spec() {
+        let base = "/api";
+        let mocks = generate_with_base(&OpenApiSpec::parse(SERVERS_FIXTURE).unwrap(), base);
+        assert_eq!(find(&mocks, "get_users_id.json").path, "/api/users/:id");
+    }
+
+    #[test]
+    fn test_the_document_root_template_sits_directly_under_the_base() {
+        let yaml = r#"
+openapi: 3.0.3
+info: {title: Root, version: "1.0"}
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              example: {"ok": true}
+"#;
+        // `GET /` on a /v1 deployment is `GET /v1` — not a doubled slash.
+        let mocks = generate_servers(yaml);
+        assert!(mocks.iter().any(|(_, m)| m.path == "/v1"));
+    }
+
+    #[test]
+    fn test_base_path_brace_style_keeps_the_prefix_and_template() {
+        let mocks = generate_mocks(
+            &OpenApiSpec::parse(SERVERS_FIXTURE).unwrap(),
+            DEFAULT_STATUS,
+            PathStyle::Brace,
+            OutputFormat::Json,
+            "/v1",
+        );
+        assert_eq!(find(&mocks, "get_users_id.json").path, "/v1/users/{id}");
+    }
+
+    #[test]
+    fn test_url_path_component_extracts_the_path_only() {
+        assert_eq!(
+            server_path_component("https://api.example.com/v1"),
+            Some("/v1".into())
+        );
+        assert_eq!(server_path_component("https://api.example.com"), None);
+        assert_eq!(server_path_component("https://api.example.com/"), None);
+        assert_eq!(
+            server_path_component("http://localhost:8080/api/v2"),
+            Some("/api/v2".into())
+        );
+        assert_eq!(server_path_component("/v1"), Some("/v1".into()));
+        assert_eq!(
+            server_path_component("https://api.example.com/v1/"),
+            Some("/v1".into())
+        );
+        assert_eq!(
+            server_path_component("https://api.example.com/a//b"),
+            Some("/a/b".into())
+        );
+        assert_eq!(server_path_component(""), None);
+        assert_eq!(
+            server_path_component("https://{host}:{port}/v1"),
+            Some("/v1".into())
+        );
+    }
+
+    #[test]
+    fn test_base_path_values_are_normalized() {
+        assert_eq!(
+            parse_args(&args(&["spec.yaml", "--base-path", "/api"]))
+                .unwrap()
+                .base_path,
+            Some("/api".to_string())
+        );
+        assert_eq!(
+            parse_args(&args(&["spec.yaml", "--base-path", "api"]))
+                .unwrap()
+                .base_path,
+            Some("/api".to_string())
+        );
+        assert_eq!(
+            parse_args(&args(&["spec.yaml", "--base-path", "/api/"]))
+                .unwrap()
+                .base_path,
+            Some("/api".to_string())
+        );
+        assert_eq!(
+            parse_args(&args(&["spec.yaml", "--base-path", "//api"]))
+                .unwrap()
+                .base_path,
+            Some("/api".to_string())
+        );
+        // An empty value is the explicit drop, not a missing one — the flag
+        // is present, and `None` means "derive from the spec" instead.
+        assert_eq!(
+            parse_args(&args(&["spec.yaml", "--base-path", ""]))
+                .unwrap()
+                .base_path,
+            Some(String::new())
+        );
+        assert_eq!(
+            parse_args(&args(&["spec.yaml", "--base-path", "/"]))
+                .unwrap()
+                .base_path,
+            Some(String::new())
+        );
+        assert_eq!(parse_args(&args(&["spec.yaml"])).unwrap().base_path, None);
+    }
+
+    #[test]
+    fn test_run_import_applies_the_base_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("spec.yaml");
+        fs::write(&spec_path, SERVERS_FIXTURE).unwrap();
+        let out = dir.path().join("generated");
+
+        let (written, base_path) = run_import(&args(&[
+            spec_path.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert_eq!(base_path, "/v1");
+        assert!(out.join("get_users_id.json").exists());
+        let on_disk = fs::read_to_string(out.join("get_users_id.json")).unwrap();
+        assert!(on_disk.contains("\"/v1/users/:id\""));
+        let _ = written;
+    }
+
+    #[test]
+    fn test_run_import_base_path_flag_overrides_the_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("spec.yaml");
+        fs::write(&spec_path, SERVERS_FIXTURE).unwrap();
+        let out = dir.path().join("generated");
+
+        let (_, base_path) = run_import(&args(&[
+            spec_path.to_str().unwrap(),
+            "--base-path",
+            "/gateway",
+            "--out",
+            out.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert_eq!(base_path, "/gateway");
+        let on_disk = fs::read_to_string(out.join("get_users_id.json")).unwrap();
+        assert!(on_disk.contains("\"/gateway/users/:id\""));
+    }
+
+    #[test]
+    fn test_run_import_base_path_empty_flag_drops_the_spec_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("spec.yaml");
+        fs::write(&spec_path, SERVERS_FIXTURE).unwrap();
+        let out = dir.path().join("generated");
+
+        let (_, base_path) = run_import(&args(&[
+            spec_path.to_str().unwrap(),
+            // A gateway strips /v1 in front of the mock server, so the
+            // operator asks for no prefix at all.
+            "--base-path",
+            "",
+            "--out",
+            out.to_str().unwrap(),
+        ]))
+        .unwrap();
+
+        assert_eq!(base_path, "");
+        let on_disk = fs::read_to_string(out.join("get_users_id.json")).unwrap();
+        assert!(on_disk.contains("\"/users/:id\""));
+    }
+
     #[test]
     fn test_status_code_keys() {
         assert_eq!(status_code("200", 200), Some(200));
@@ -1684,6 +2356,7 @@ paths:
             DEFAULT_STATUS,
             PathStyle::Colon,
             OutputFormat::Yaml,
+            "",
         );
 
         let written = write_mocks(&mocks, &out, false, OutputFormat::Yaml).unwrap();
@@ -1710,6 +2383,7 @@ paths:
             DEFAULT_STATUS,
             PathStyle::Colon,
             OutputFormat::Yaml,
+            "",
         );
         let names: Vec<&str> = mocks.iter().map(|(name, _)| name.as_str()).collect();
 
@@ -1759,7 +2433,7 @@ paths:
         fs::write(&spec_path, FIXTURE).unwrap();
         let out = dir.path().join("generated");
 
-        let written = run_import(&args(&[
+        let (written, base_path) = run_import(&args(&[
             spec_path.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
@@ -1768,6 +2442,9 @@ paths:
 
         assert!(!written.is_empty());
         assert!(out.join("get_users_id.json").exists());
+        // The fixture has no `servers` block, so the applied base path is
+        // none — the summary says so by being empty.
+        assert_eq!(base_path, "");
     }
 
     #[test]
@@ -1871,6 +2548,7 @@ paths:
             DEFAULT_STATUS,
             PathStyle::Brace,
             OutputFormat::Json,
+            "",
         );
         write_mocks(&mocks, dir.path(), false, OutputFormat::Json).unwrap();
 

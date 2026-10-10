@@ -53,9 +53,9 @@
 
 ### 6. **Importer Agent** (`src/openapi.rs`)
 - **Purpose:** Generate mock files from an OpenAPI 3.x spec
-- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--force] [--brace-params]`
+- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--base-path <path>] [--force] [--brace-params]`
 - **Outputs:** One `MockConfig` JSON file per operation + response status
-- **Responsibilities:** Parse JSON/YAML, resolve `$ref`, pick examples or build schema stubs, translate `{id}` path templates, refuse to clobber a non-empty output directory without `--force`
+- **Responsibilities:** Parse JSON/YAML, resolve `$ref`, pick examples or build schema stubs, translate `{id}` path templates, apply the base path from `servers[0]` (variable defaults resolved; `--base-path` overrides, `''` drops; the applied prefix is printed), refuse to clobber a non-empty output directory without `--force`
 - **Note:** Runs instead of the server (checked in `main` before the async runtime starts) and exits when done
 
 ### 7. **Logger Agent** (`src/main.rs`)
@@ -125,7 +125,12 @@ HTTP Request → Router Agent → Handler Agent → Matcher Agent
   what the client receives, what matching runs against, or what templating
   interpolates
 - `MIMIC_ADMIN_TOKEN` puts `/admin/*` behind a bearer token; `/health` stays
-  open because liveness probes carry no credentials
+  open because liveness probes carry no credentials, and so does the
+  dashboard's own page load — the shell is a data-free constant, and the page
+  prompts for the token (#113), keeping it in sessionStorage and sending it on
+  every data fetch. Data endpoints still 401 without it; a `?token=` query is
+  honored for the shell and stripped from the address bar, never accepted by
+  the API
 - Regular `cargo audit`
 
 ### Performance Targets

@@ -82,6 +82,20 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
 .load-more{text-align:center;margin-top:.75rem}
 .toast{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:.5rem 1rem;border-radius:6px;font-size:.82rem;opacity:0;pointer-events:none;transition:opacity .2s}
 .toast.visible{opacity:1}
+/* The token prompt (#113): shown when an admin fetch comes back 401. The
+   shell itself ships unguarded — it has no data to protect — so this overlay
+   is the only thing between a browser and a working dashboard when
+   MIMIC_ADMIN_TOKEN is set. */
+.auth-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50}
+.auth-overlay[hidden]{display:none}
+.auth-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.5rem;width:min(420px,90vw);display:flex;flex-direction:column;gap:.65rem}
+.auth-card h2{font-size:1.05rem;font-weight:600}
+.auth-card p{font-size:.8rem;color:var(--muted)}
+.auth-card code{color:var(--accent)}
+.auth-card input{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.45rem .7rem;border-radius:6px;font-size:.85rem;font-family:inherit}
+.auth-card input:focus{outline:none;border-color:var(--accent)}
+.auth-error{color:var(--red)}
+.auth-actions{display:flex;gap:.5rem}
 @media(max-width:900px){
   header{flex-direction:column;align-items:stretch}
   main,nav.tabs,header{padding-left:1rem;padding-right:1rem}
@@ -100,6 +114,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     <span>Version <b id="sum-version">–</b></span>
   </div>
   <button class="btn btn-outline" id="theme-toggle" title="Toggle colour theme">🌗 Theme</button>
+  <button class="btn btn-outline" id="btn-logout" title="Forget the admin token for this tab" hidden>🚪 Log out</button>
 </header>
 
 <nav class="tabs">
@@ -171,6 +186,22 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   </section>
 </main>
 
+<!-- Shown when an admin fetch is rejected 401 (#113): the token lives in
+     sessionStorage and goes out as `Authorization: Bearer …` on every admin
+     fetch, so the guarded API stays guarded and the browser gets a way in. -->
+<div class="auth-overlay" id="auth-overlay" hidden>
+  <form class="auth-card" id="auth-form">
+    <h2>🧩 <span style="color:var(--accent)">Mimic</span> Admin</h2>
+    <p>This Mimic's admin API is protected by <code>MIMIC_ADMIN_TOKEN</code>. Paste the token to load the dashboard — it is kept in <code>sessionStorage</code>, so it dies with this tab.</p>
+    <input type="password" id="token-input" placeholder="Bearer token" autocomplete="off">
+    <p class="auth-error" id="auth-error" hidden>Wrong token — the server answered 401.</p>
+    <div class="auth-actions">
+      <button class="btn btn-primary" type="submit">Log in</button>
+      <button class="btn btn-outline" type="button" id="auth-forget" hidden>Forget token</button>
+    </div>
+  </form>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -183,6 +214,104 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   var API_RESET     = '/admin/sequences/reset';
   var API_HEALTH    = '/health';
   var REFRESH_INTERVAL_MS = 3000;
+
+  // ── admin token (#113) ───────────────────────────────────────────────
+  // MIMIC_ADMIN_TOKEN guards every data endpoint; the page itself ships
+  // unguarded, because it carries no data. Here it earns that pass: any
+  // admin fetch answered 401 opens the prompt instead of rendering empty
+  // tables, and every subsequent fetch carries `Authorization: Bearer …`.
+  // The token lives in sessionStorage — it dies with the tab — seeded once
+  // from `?token=`, which is scrubbed from the address bar immediately.
+  var TOKEN_KEY = 'mimic-admin-token';
+
+  function storedToken(){
+    try{ return sessionStorage.getItem(TOKEN_KEY) || ''; }catch(e){ return ''; }
+  }
+  function saveToken(token){
+    try{ sessionStorage.setItem(TOKEN_KEY, token); }catch(e){ /* private mode: retype next load */ }
+  }
+  function clearToken(){
+    try{ sessionStorage.removeItem(TOKEN_KEY); }catch(e){ }
+  }
+  function hasToken(){ return !!storedToken(); }
+
+  (function seedTokenFromUrl(){
+    var token = new URLSearchParams(location.search).get('token');
+    if(token === null) return;
+    if(token) saveToken(token);
+    history.replaceState(null, '', location.pathname + location.hash);
+  })();
+
+  // The one fetch everything goes through: attaches the stored token as a
+  // bearer header, and on 401 opens the prompt and throws so a caller's
+  // `.then(function(r){ return r.json(); })` never tries to render the 401.
+  function authFetch(url, options){
+    options = options || {};
+    var token = storedToken();
+    options.headers = token
+      ? Object.assign({'Authorization': 'Bearer ' + token}, options.headers)
+      : (options.headers || {});
+    return fetch(url, options).then(function(res){
+      if(res.status === 401){
+        openAuthPrompt();
+        throw new Error('unauthorized');
+      }
+      return res;
+    });
+  }
+
+  // Whether the refresh timer was running when the prompt opened — a wrong
+  // token would otherwise 401 through a live refresh every few seconds.
+  var autoRefreshBeforePrompt = false;
+  function openAuthPrompt(){
+    var overlay = qs('auth-overlay');
+    if(!overlay.hidden) return;
+    autoRefreshBeforePrompt = qs('auto-refresh').checked;
+    stopAutoRefresh();
+    qs('token-input').value = storedToken();
+    qs('auth-error').hidden = true;
+    qs('auth-forget').hidden = !hasToken();
+    overlay.hidden = false;
+    qs('token-input').focus();
+  }
+  function closeAuthPrompt(){
+    qs('auth-overlay').hidden = true;
+    qs('auth-error').hidden = true;
+    if(autoRefreshBeforePrompt) startAutoRefresh();
+    autoRefreshBeforePrompt = false;
+  }
+
+  function syncAuthButtons(){ qs('btn-logout').hidden = !hasToken(); }
+
+  qs('auth-form').addEventListener('submit', function(ev){
+    ev.preventDefault();
+    var token = qs('token-input').value.trim();
+    if(!token) return;
+    saveToken(token);
+    syncAuthButtons();
+    // Prove the token before trusting it: a wrong one comes back 401, the
+    // prompt stays open, and the error shows what happened.
+    authFetch(API_REQUESTS + '?limit=1')
+      .then(function(){ closeAuthPrompt(); })
+      .catch(function(){
+        clearToken();
+        syncAuthButtons();
+        qs('auth-error').hidden = false;
+      });
+  });
+  qs('auth-forget').addEventListener('click', function(){
+    clearToken();
+    syncAuthButtons();
+    qs('token-input').value = '';
+    qs('auth-forget').hidden = true;
+    qs('token-input').focus();
+  });
+  qs('btn-logout').addEventListener('click', function(){
+    clearToken();
+    syncAuthButtons();
+    openAuthPrompt();
+  });
+  syncAuthButtons();
   // The page size /admin/requests defaults to server-side (#111) — kept in
   // sync here so "Load older" grows by the same increment the first page
   // already used.
@@ -307,7 +436,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
 
   // ── header summary (from /health) ────────────────────────────────────
   function fetchHealth(){
-    fetch(API_HEALTH).then(function(r){ return r.json(); }).then(function(h){
+    authFetch(API_HEALTH).then(function(r){ return r.json(); }).then(function(h){
       qs('sum-mocks').textContent   = (h.mock_count !== undefined ? h.mock_count : h.mocks_loaded);
       qs('sum-uptime').textContent  = formatDuration(h.uptime_seconds);
       qs('sum-port').textContent    = h.port !== undefined ? h.port : '–';
@@ -548,7 +677,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
       qs('new-banner').classList.remove('visible');
       qs('requests-container').innerHTML = '';
     }
-    return fetch(buildRequestsUrl())
+    return authFetch(buildRequestsUrl())
       .then(function(res){ return res.json(); })
       .then(function(data){
         var records = data.requests || [];
@@ -583,7 +712,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
 
   function clearHistory(){
     if(!confirm('Clear all recorded requests?')) return;
-    fetch(API_REQUESTS,{method:'DELETE'})
+    authFetch(API_REQUESTS,{method:'DELETE'})
       .then(function(){
         expanded = {};
         rows = {};
@@ -600,7 +729,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   // with limit=0, independent of whatever pageLimit the table is currently
   // showing.
   function exportLog(){
-    fetch(buildRequestsUrl(0))
+    authFetch(buildRequestsUrl(0))
       .then(function(res){ return res.json(); })
       .then(function(data){ downloadLog(data.requests || []); })
       .catch(function(err){
@@ -711,7 +840,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   }
 
   function fetchMocks(){
-    return fetch(API_MOCKS)
+    return authFetch(API_MOCKS)
       .then(function(r){ return r.json(); })
       .then(function(data){ mocksCache = data.mocks || []; renderMocks(); })
       .catch(function(err){ console.error('Failed to fetch mocks:', err); });
@@ -719,7 +848,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
 
   // ── sequences tab ───────────────────────────────────────────────────
   function fetchSequences(){
-    return fetch(API_SEQUENCES)
+    return authFetch(API_SEQUENCES)
       .then(function(r){ return r.json(); })
       .then(function(data){
         var list = data.sequences || [];
@@ -752,7 +881,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
 
   function resetSequence(path){
     var url = API_RESET + (path ? '?path=' + encodeURIComponent(path) : '');
-    fetch(url, {method:'POST'})
+    authFetch(url, {method:'POST'})
       .then(function(r){ return r.json(); })
       .then(function(data){
         toast('Reset ' + data.reset + ' sequence counter(s)');
