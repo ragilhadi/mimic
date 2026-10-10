@@ -590,6 +590,21 @@ pub fn is_truthy(value: &str) -> bool {
     )
 }
 
+/// A lock test threads hold while mutating, or asserting against, a process
+/// environment variable.
+///
+/// `cargo test` runs a binary's tests on parallel threads in one process, and
+/// [`std::env::set_var`] mutates state every other test sees. A test that
+/// flips `MIMIC_HEAD_FROM_GET` to `false`, say, would otherwise race any
+/// concurrently running test that relies on the enabled default. Holding this
+/// lock across both the mutating test and the tests that depend on the
+/// default serializes exactly that group.
+#[cfg(test)]
+pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// True when `status` is a value Mimic can actually put on the wire as the
 /// HTTP status line: 100–599, the range `StatusCode::from_u16` accepts *and*
 /// that a real HTTP response can carry. A mock outside it is served as

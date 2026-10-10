@@ -168,6 +168,10 @@ MIMIC_DISABLE_BODY_LOG=false
 # (default: 10485760 = 10 MB, 0 = no limit). See "File-Backed Responses" below.
 MIMIC_MAX_RESPONSE_FILE=10485760
 
+# Answer a HEAD from the matching GET mock (default: true). See "HEAD
+# Requests Answered from the GET Mock" below.
+MIMIC_HEAD_FROM_GET=true
+
 # Built-in CORS (default: off — no response gains a header, OPTIONS still 404s).
 # See "Built-in CORS" below.
 MIMIC_CORS=false
@@ -997,6 +1001,55 @@ curl http://localhost:8080/things/   # 200 too — falls back, no redirect
   "does this request need its body read" check, and CORS preflight detection
   all use the same fallback, so a preflight for `/things/` is answered
   exactly when a real `GET /things/` would be.
+
+### HEAD Requests Answered from the GET Mock
+
+`HEAD` isn't an exotic method you'd think to mock — it's one clients issue on
+their own initiative: HTTP libraries and CDNs probe with it before a `GET`,
+health checkers and load balancers default to it, and `curl -I` is the reflex
+when you want to see the headers a mock returns. RFC 9110 defines `HEAD` as
+`GET` without the body, so whenever a `HEAD` matches no mock of its own,
+Mimic answers it from the mock `GET` would have matched:
+
+```bash
+# Only GET /users is registered...
+curl -sI -o /dev/null -w '%{http_code}\n' http://localhost:8080/users  # 200
+curl -s  -o /dev/null -w '%{http_code}\n' http://localhost:8080/users  # 200
+```
+
+- **Automatic, no configuration** — and an explicit `HEAD` mock always wins,
+  exactly the way an explicit `OPTIONS` mock wins over the CORS preflight
+  gap-filler. If you're mocking a deliberately broken `HEAD`, it serves.
+- **Empty body, GET's headers.** Status, `response_headers`, `content-type`
+  and any CORS headers are the `GET`'s. `Content-Length` reports the size of
+  the body the `GET` would have sent — per RFC 9110, so a client sizing a
+  download gets the right answer.
+- **The GET mock's matchers apply as usual.** Query, header and body matchers
+  are evaluated against the incoming `HEAD` request, so a `GET` mock that
+  requires `?page=1` requires it of the `HEAD` too. The fallback also works
+  for pattern routes: `HEAD /users/42` is answered by `GET /users/:id`.
+- **A HEAD is a call.** Since the GET mock really did serve the request, its
+  semantics follow: `delay_ms` applies, the hit count increments, and a
+  `sequence` advances. A `HEAD` between two `GET`s on a 503-then-200 sequence
+  consumes the 503 step — worth keeping in mind when a client probes with
+  `HEAD` before its real request.
+- **The fallback is visible, not magic.** The request log records the request
+  as a `HEAD`, under the path actually requested, with an explanation naming
+  the GET mock that answered it:
+
+  ```
+  matched mocks/users.json (score 1000: method+path 1000, HEAD answered from the GET mock at `GET:/users`)
+  ```
+
+  The response body is stored as a descriptor (`<N bytes of … — body
+  withheld for HEAD>`), since the client never received one.
+- **Composes with the trailing-slash fallback**: `HEAD /things/` reaches a
+  mock registered at `GET /things`, and a CORS preflight for
+  `Access-Control-Request-Method: HEAD` is answered exactly when the actual
+  `HEAD` would be.
+- **Opt out with `MIMIC_HEAD_FROM_GET=false`** to restore the pre-#112
+  behavior — a `HEAD` is answered only by an explicit `HEAD` mock, 404
+  otherwise.
 
 ---
 
