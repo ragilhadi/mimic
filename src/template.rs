@@ -73,14 +73,72 @@ pub fn references_body(value: &Value) -> bool {
     }
 }
 
+/// How an interpolated value is made safe for the document it is spliced into.
+///
+/// A value placed inside a JSON string must not close it; one placed in markup
+/// must not open a tag. Inline `response` templates need neither — they replace
+/// whole JSON string *values*, which serde escapes on the way out — but a
+/// `response_file` is raw text, so its templates are escaped to match its
+/// content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escape {
+    None,
+    /// Escape for the inside of a JSON string literal.
+    Json,
+    /// Escape for XML/HTML text and attribute values.
+    Xml,
+}
+
+impl Escape {
+    /// The escaping a body of `content_type` calls for.
+    pub fn for_content_type(content_type: &str) -> Self {
+        let ct = content_type.to_ascii_lowercase();
+        if ct.contains("json") {
+            Escape::Json
+        } else if ct.contains("xml") || ct.contains("html") {
+            Escape::Xml
+        } else {
+            Escape::None
+        }
+    }
+
+    fn apply(self, value: String) -> String {
+        match self {
+            Escape::None => value,
+            Escape::Json => {
+                let quoted = serde_json::to_string(&value).unwrap_or_default();
+                quoted
+                    .get(1..quoted.len().saturating_sub(1))
+                    .unwrap_or_default()
+                    .to_string()
+            }
+            Escape::Xml => {
+                let mut out = String::with_capacity(value.len());
+                for c in value.chars() {
+                    match c {
+                        '&' => out.push_str("&amp;"),
+                        '<' => out.push_str("&lt;"),
+                        '>' => out.push_str("&gt;"),
+                        '"' => out.push_str("&quot;"),
+                        '\'' => out.push_str("&#39;"),
+                        other => out.push(other),
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
 /// Render `{{ }}` templates in a plain string — the text of a `response_file`
-/// body rather than a JSON `response`.
+/// body rather than a JSON `response` — escaping each interpolated value for the
+/// document it lands in.
 ///
 /// Same expressions, same resolution rules, same "unknown source resolves to
 /// empty" behavior as [`render_response`]; a string with no `{{` is returned
 /// untouched without the regex engine seeing it.
-pub fn render_text(text: &str, ctx: &TemplateContext) -> String {
-    interpolate(text, ctx)
+pub fn render_text_escaped(text: &str, ctx: &TemplateContext, escape: Escape) -> String {
+    interpolate(text, ctx, escape)
 }
 
 /// True if `text` uses a `{{body.…}}` expression — the string-level counterpart
@@ -127,7 +185,7 @@ fn render_string(s: &str, ctx: &TemplateContext) -> Value {
             return resolve_typed(source, key, cast.as_str(), ctx);
         }
     }
-    Value::String(interpolate(s, ctx))
+    Value::String(interpolate(s, ctx, Escape::None))
 }
 
 /// If `s` is made up of a single template expression spanning its entire
@@ -138,7 +196,7 @@ fn whole_string_template(s: &str) -> Option<regex::Captures<'_>> {
     (m.start() == 0 && m.end() == s.len()).then_some(caps)
 }
 
-fn interpolate(s: &str, ctx: &TemplateContext) -> String {
+fn interpolate(s: &str, ctx: &TemplateContext, escape: Escape) -> String {
     if !s.contains("{{") {
         return s.to_string();
     }
@@ -150,7 +208,7 @@ fn interpolate(s: &str, ctx: &TemplateContext) -> String {
             // it would unprefixed — except an unrecognized cast word, which
             // (like an unrecognized source) resolves to empty.
             Some(cast) if !KNOWN_CASTS.contains(&cast.as_str()) => String::new(),
-            _ => resolve(&caps[2], caps[3].trim(), ctx).unwrap_or_default(),
+            _ => escape.apply(resolve(&caps[2], caps[3].trim(), ctx).unwrap_or_default()),
         })
         .into_owned()
 }
@@ -307,6 +365,27 @@ fn value_to_template_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_applies_the_right_rules_per_document_type() {
+        assert_eq!(Escape::Json.apply("a\"b\\c\n".into()), "a\\\"b\\\\c\\n");
+        assert_eq!(
+            Escape::Xml.apply("<a href='x'>&\"".into()),
+            "&lt;a href=&#39;x&#39;&gt;&amp;&quot;"
+        );
+        assert_eq!(Escape::None.apply("<\"&".into()), "<\"&");
+        assert_eq!(
+            Escape::for_content_type("application/vnd.api+json"),
+            Escape::Json
+        );
+        assert_eq!(Escape::for_content_type("image/svg+xml"), Escape::Xml);
+        assert_eq!(
+            Escape::for_content_type("TEXT/HTML; charset=utf-8"),
+            Escape::Xml
+        );
+        assert_eq!(Escape::for_content_type("text/csv"), Escape::None);
+    }
+
     use serde_json::json;
 
     fn ctx<'a>(

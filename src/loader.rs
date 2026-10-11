@@ -1376,6 +1376,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let key = create_mock_key(&mock.method, &mock.path);

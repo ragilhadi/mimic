@@ -628,6 +628,7 @@ fn build_recorded_mock(
         response_file: None,
         template: None,
         response_bytes: None,
+        template_escape: None,
         consume_body: false,
         query_params: build_query_matcher(&context.query_params),
         headers: build_header_matcher(&context.headers),

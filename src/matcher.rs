@@ -353,6 +353,56 @@ pub(crate) fn decode_component(raw: &str) -> String {
         .into_owned()
 }
 
+/// Percent-decode a request path, one segment at a time.
+///
+/// Unlike a query string, a path has no `+`-means-space rule, so only `%XX`
+/// escapes are decoded. Decoding happens per segment, after splitting on `/`,
+/// and an encoded slash (`%2F`) is left encoded: `/files/a%2Fb` is one segment
+/// named `a%2Fb`, and must not turn into the two-segment path `/files/a/b`. A
+/// segment whose escapes don't decode to valid UTF-8 is kept as the client sent
+/// it rather than guessed at.
+pub(crate) fn decode_path(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_string();
+    }
+
+    raw.split('/')
+        .map(decode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn decode_path_segment(segment: &str) -> String {
+    if !segment.contains('%') {
+        return segment.to_string();
+    }
+
+    // Split around `%2F`/`%2f` so the slash survives decoding.
+    let mut pieces: Vec<String> = Vec::new();
+    let mut rest = segment;
+    loop {
+        match rest.to_ascii_lowercase().find("%2f") {
+            Some(at) => {
+                pieces.push(rest[..at].to_string());
+                rest = &rest[at + 3..];
+            }
+            None => {
+                pieces.push(rest.to_string());
+                break;
+            }
+        }
+    }
+
+    let mut decoded = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        match urlencoding::decode(piece) {
+            Ok(text) => decoded.push(text.into_owned()),
+            Err(_) => return segment.to_string(),
+        }
+    }
+    decoded.join("%2F")
+}
+
 /// Parse a query string into every value each key carried, in the order the
 /// client sent them.
 /// Example: "tag=a&tag=b" -> {"tag": ["a", "b"]}
@@ -521,14 +571,32 @@ fn match_query_param_value(
 // ============================================================================
 
 /// Parse HTTP headers into HashMap (normalized to lowercase)
+///
+/// A header sent more than once — `X-Tag: a` and `X-Tag: b`, or the several
+/// `Cookie` lines an HTTP/2 client splits one into — keeps every value, joined
+/// with `, ` in the order received (RFC 9110 §5.3), instead of letting the last
+/// one overwrite the rest. A value that isn't valid UTF-8 is kept lossily rather
+/// than dropped: a matcher on a header the client really sent should see it,
+/// not report it absent.
 pub fn parse_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
-    let mut parsed = HashMap::new();
+    let mut parsed: HashMap<String, String> = HashMap::new();
 
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
+        let value_str = match value.to_str() {
+            Ok(text) => Cow::Borrowed(text),
+            Err(_) => String::from_utf8_lossy(value.as_bytes()),
+        };
 
-        if let Ok(value_str) = value.to_str() {
-            parsed.insert(name_str, value_str.to_string());
+        match parsed.entry(name_str) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                let joined = existing.get_mut();
+                joined.push_str(", ");
+                joined.push_str(&value_str);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(value_str.into_owned());
+            }
         }
     }
 
@@ -726,6 +794,25 @@ pub enum ParsedBody {
     Empty,
 }
 
+/// The media type of a `Content-Type` value: parameters dropped, trimmed,
+/// lowercased. Media types are case-insensitive (RFC 9110 §8.3.1), so
+/// `Application/JSON; charset=UTF-8` and `application/json` are the same type.
+pub(crate) fn media_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// True for `application/json` and any structured-syntax `+json` type
+/// (`application/vnd.api+json`, `application/problem+json`, `application/ld+json`).
+pub(crate) fn is_json_media_type(content_type: &str) -> bool {
+    let media = media_type(content_type);
+    media == "application/json" || media.ends_with("+json")
+}
+
 /// Parse request body based on content type
 pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
     if bytes.is_empty() {
@@ -733,7 +820,7 @@ pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
     }
 
     match content_type {
-        Some(ct) if ct.contains("application/json") => {
+        Some(ct) if is_json_media_type(ct) => {
             match serde_json::from_slice(bytes) {
                 Ok(json) => ParsedBody::Json(json),
                 Err(e) => {
@@ -744,13 +831,13 @@ pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
             }
         }
 
-        Some(ct) if ct.contains("application/x-www-form-urlencoded") => {
+        Some(ct) if media_type(ct) == "application/x-www-form-urlencoded" => {
             let text = String::from_utf8_lossy(bytes);
             let form = parse_form_data(&text);
             ParsedBody::Form(form)
         }
 
-        Some(ct) if ct.starts_with("text/") => {
+        Some(ct) if media_type(ct).starts_with("text/") => {
             ParsedBody::Text(String::from_utf8_lossy(bytes).to_string())
         }
 
@@ -2630,6 +2717,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let mocks = HashMap::from([(
@@ -2758,6 +2846,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -3281,6 +3370,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -3655,6 +3745,7 @@ mod benches {
                     response_file: None,
                     template: None,
                     response_bytes: None,
+                    template_escape: None,
                 }],
             );
         }
@@ -3677,6 +3768,7 @@ mod benches {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3744,6 +3836,7 @@ mod explanation_tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -4402,6 +4495,7 @@ mod scenario_tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -4605,5 +4699,64 @@ mod scenario_tests {
 
         assert!(!explanation.contains("inactive tags"), "{}", explanation);
         assert!(explanation.contains("POST"), "{}", explanation);
+    }
+}
+
+/// Parsing helpers fixed in #138.
+#[cfg(test)]
+mod request_parsing_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn decode_path_decodes_each_segment_but_keeps_encoded_slashes() {
+        assert_eq!(decode_path("/plain/path"), "/plain/path");
+        assert_eq!(decode_path("/a%20b/c%C3%A9"), "/a b/cé");
+        assert_eq!(decode_path("/a%2Fb"), "/a%2Fb");
+        assert_eq!(decode_path("/a%2fb%20c"), "/a%2Fb c");
+        // `+` is a space only in query strings and forms.
+        assert_eq!(decode_path("/a+b"), "/a+b");
+        // A literal percent that isn't an escape is left alone.
+        assert_eq!(decode_path("/100%"), "/100%");
+    }
+
+    #[test]
+    fn decode_path_keeps_a_segment_that_is_not_valid_utf8() {
+        assert_eq!(decode_path("/x/%FF%FE/y"), "/x/%FF%FE/y");
+    }
+
+    #[test]
+    fn media_type_ignores_case_parameters_and_whitespace() {
+        assert_eq!(
+            media_type(" Application/JSON ; charset=UTF-8"),
+            "application/json"
+        );
+        assert!(is_json_media_type("application/vnd.api+json"));
+        assert!(is_json_media_type("APPLICATION/Problem+JSON"));
+        assert!(!is_json_media_type("application/jsonp"));
+        assert!(!is_json_media_type("text/plain"));
+    }
+
+    #[test]
+    fn parse_headers_joins_repeated_headers_in_arrival_order() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-tag", HeaderValue::from_static("a"));
+        headers.append("x-other", HeaderValue::from_static("1"));
+        headers.append("x-tag", HeaderValue::from_static("b"));
+
+        let parsed = parse_headers(&headers);
+
+        assert_eq!(parsed["x-tag"], "a, b");
+        assert_eq!(parsed["x-other"], "1");
+    }
+
+    #[test]
+    fn parse_headers_keeps_a_non_utf8_value_lossily() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-raw", HeaderValue::from_bytes(b"caf\xe9").unwrap());
+
+        let parsed = parse_headers(&headers);
+
+        assert_eq!(parsed["x-raw"], "caf\u{fffd}");
     }
 }

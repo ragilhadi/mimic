@@ -293,6 +293,7 @@ INFO mimic: Loaded 31 mock(s)
 - `response` - JSON response body (can be object, array, or null)
 - `response_file` - (Optional) Serve the body from a file next to the mock instead of `response`; see [File-Backed Responses](#-file-backed-responses-response_file)
 - `template` - (Optional) Boolean enabling `{{...}}` templating inside a `response_file` body (default: `false`)
+- `template_escape` - (Optional) Set `false` to interpolate raw values into a templated `response_file` instead of escaping them for its content type (default: `true`)
 - `consume_body` - (Optional) Boolean to control request body consumption (default: `false`)
   - `true` - Consume request body (required for file uploads, multipart/form-data)
   - `false` - Skip body consumption (faster, default behavior)
@@ -704,7 +705,11 @@ and templating.
 
 ### Header Matching
 
-Match requests based on HTTP headers:
+Match requests based on HTTP headers. Header names are case-insensitive. A header
+the client sends more than once (`X-Tag: a` and `X-Tag: b`) is seen as the values
+joined with `, ` in the order received (`a, b`), by matchers and by
+`{{header.x-tag}}` alike — use `contains`/`regex` rather than an exact match for
+those.
 
 **File**: `mocks/get_protected.json`
 
@@ -1213,6 +1218,14 @@ expressions a `response` supports:
 
 Templating is **off by default** and never runs on a binary content type, so a
 PNG that happens to contain the bytes `{{` is still a PNG.
+
+Interpolated values are **escaped for the document they land in**: JSON string
+escaping for a JSON body (so a name containing `"` can't break the document),
+entity escaping (`& < > " '`) for XML/HTML, and none for anything else (CSV,
+plain text). The content type is the one the response is served with, including
+one set in `response_headers`. A fixture that deliberately splices in pre-formed
+JSON or markup can opt out with `"template_escape": false` (on the mock or on a
+sequence step).
 
 ### Sequences
 
