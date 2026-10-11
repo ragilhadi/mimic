@@ -27,7 +27,8 @@ curl http://localhost:8080/v1/charges/ch_123
 |---|---|---|
 | `MIMIC_PROXY_UPSTREAM` | unset | Upstream base URL. Unset means unchanged 404 behavior. |
 | `MIMIC_RECORD_UPSTREAM` | `false` | Opt-in recording of proxied responses as new mock files. |
-| `MIMIC_PROXY_TIMEOUT_MS` | `5000` | How long to wait for the upstream before falling back to a 404. |
+| `MIMIC_PROXY_TIMEOUT_MS` | `5000` | How long to wait for the upstream before falling back to a 404. Bounds connecting and each wait for the upstream to send something (headers, then every chunk) — not the whole exchange. |
+| `MIMIC_PROXY_BUFFER_LIMIT` | `10485760` (10 MB) | Bytes of an upstream response held in memory for the request log and for recording. A bigger response, and any `text/event-stream`, is streamed to the client instead. `0` = always buffer. |
 | `MIMIC_RECORD_MATCH_HEADERS` | unset | Extra request headers to pin as matchers on a recording (comma-separated). |
 
 ## What gets recorded
@@ -49,7 +50,9 @@ Files land at `mocks/_recorded/<method>_<sanitized-path>_<n>.json` — e.g. `moc
 - **A repeat of the same request doesn't re-record.** Once a given request shape has been recorded this run, later identical proxy calls are skipped rather than rewritten.
 - **What Mimic reserves for itself is never proxied.** The health check and the admin API's own endpoints — see [Reserved Endpoints](/reference/reserved-endpoints/) — are excluded even with no local mock behind them. A path that merely starts with `/admin/` but isn't one Mimic answers (a typo, or an endpoint you're mocking) is an ordinary request and proxies like any other.
 - **Self-referential upstreams are rejected at startup.** An upstream that resolves to Mimic's own listening address (e.g. `MIMIC_PROXY_UPSTREAM=http://localhost:8080` while Mimic itself listens on `8080`) disables proxying with a warning, instead of looping forever.
-- **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`.
+- **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`, which bounds connecting and each wait for the upstream to send something — a response that is large or slow but keeps arriving is not cut off.
+- **Redirects are passed through, not followed.** An upstream `301`/`302`/`307`… reaches the client as it is (status and `Location`), and a recording keeps the redirect rather than the page it points to.
+- **Large and streaming responses are streamed.** Up to `MIMIC_PROXY_BUFFER_LIMIT` of a response is buffered so it can be logged and recorded; past that, and for `text/event-stream` from the first byte, the body is passed to the client as it arrives. Such a response is logged as `<streamed response of …>` and never recorded. Binary responses are logged as `<N bytes of type>`, like mock responses.
 - **A gzip/deflate/brotli-compressed upstream response is decoded** before it's forwarded or recorded — both the live response the client gets and the recorded mock's `response` are plain text/JSON, never raw compressed bytes. An encoding Mimic doesn't recognize is forwarded to the client unchanged and skipped from recording, rather than written as a corrupt mock.
 
 <Aside type="tip">

@@ -1,0 +1,121 @@
+---
+title: Validating Mocks
+description: mimic validate — a CI-friendly check that loads a mocks directory exactly as the server would and reports every problem.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Mock files are checked into repositories and edited by people who never run the server locally. A bad mock otherwise surfaces as a failing integration test with no obvious link back to the file, as a route that quietly serves `200` instead of the `503` it declares, or as a mock that loads and can never be reached. `mimic validate` loads a mocks directory **exactly as the server would** and reports everything questionable about it, before any of that happens:
+
+```bash
+mimic validate ./mocks
+```
+
+```
+mocks/checkout.json:  error   status 1000 is not a valid HTTP status code (100-599); requests would be answered 200 OK instead
+mocks/health.json:    error   GET /health is reserved by Mimic's health check and will never be served. Move it, or free the route (see MIMIC_HEALTH_PATH / MIMIC_ADMIN_PREFIX / MIMIC_DISABLE_ADMIN).
+mocks/order.json:     warning 1 step(s) can never serve: step 2 declares `repeat: true`, which pins the counter at it until the sequence is reset
+mocks/search.json:    warning query param `q` regex `[a-z` failed to compile; this matcher can never match
+mocks/users_v2.json:  warning duplicate GET /users (also: mocks/users.json) — ties are broken by file name, so this copy only serves when the first one is inactive
+5 problem(s) in 7 mock file(s): 2 error(s), 3 warning(s)
+```
+
+Each row is one problem in one file. The last line is always the summary, so a script can grep it without parsing anything.
+
+## Options
+
+| Option | Default | Description |
+|---|---|---|
+| `<dir>` (positional) | what the server would read | A directory — or a single mock file — to validate. By default it uses the server's own resolution: `MIMIC_MOCKS_DIR`, then `/app/mocks` (Docker), then `./mocks`, so validation and serving can never disagree about what's loaded. |
+| `--strict` | off | Warnings count as errors — the exit a CI job wants. |
+| `--format <fmt>` | `text` | `json` emits the machine-readable shape (below), so a tool can annotate a PR. |
+| `-h`, `--help` | | Show usage. |
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | No problems (with `--strict`: also no warnings). |
+| `1` | At least one error — or at least one warning under `--strict`. |
+| `2` | Bad usage. |
+
+## Errors and warnings
+
+An **error** means the mock cannot do what it says. A **warning** means it is suspicious but legal — Mimic would serve *something*, and no log line would ever say why. Both run through the same code the server itself uses, so a verdict can't drift from the behavior.
+
+**Errors** — the mock is refused or served differently than declared:
+
+- the file is not parsable JSON/YAML (or is unreadable)
+- both `response` and `response_file` are set
+- a `response_file` is missing, not a regular file, outside the mocks root, or over the `MIMIC_MAX_RESPONSE_FILE` limit
+- a status (mock-level or per sequence step) outside 100–599 — it would be served as `200 OK`
+- a `path` that does not start with `/` — it registers under a key no request ever looks up
+- a route Mimic reserves (`GET /health`, the `/admin/*` API), honoring `MIMIC_HEALTH_PATH`, `MIMIC_ADMIN_PREFIX`, and `MIMIC_DISABLE_ADMIN` exactly as the server does
+
+**Warnings** — the mock loads, but it can never do what the author probably meant:
+
+- duplicate `METHOD path` across files — ties are broken by file name, so all but one copy is dead unless [scenarios](/guides/scenarios/) switch them
+- a regex in a query-param, header, or text-body matcher that fails to compile — that matcher answers "no" to every request
+- [sequence](/dynamic-responses/sequences/) step(s) after a `repeat: true` step — the counter pins there until the sequence is reset
+- a `{{…}}` expression naming an unknown source or cast — it renders as an empty string. Checked only where the server would actually render: a JSON `response` always, and a `response_file` body only when the mock opted in with `"template": true` and the file's content type is textual
+- a tag in `MIMIC_ACTIVE_TAGS` that no mock declares — the scenario serves nothing. The reverse (a declared tag that isn't active right now) is *not* reported: scenarios are switched at runtime, so "inactive" is a state, not a bug
+
+The environment is respected throughout: `MIMIC_MOCKS_DIR`, `MIMIC_MAX_RESPONSE_FILE`, the route-reservation variables, and `MIMIC_ACTIVE_TAGS` are read the same way the server reads them.
+
+## JSON output
+
+```bash
+mimic validate --format json ./mocks
+```
+
+```json
+{
+  "directory": "mocks",
+  "files": 27,
+  "strict": false,
+  "errors": 2,
+  "warnings": 3,
+  "problems": [
+    {
+      "file": "mocks/checkout.json",
+      "severity": "error",
+      "kind": "invalid_status",
+      "message": "status 1000 is not a valid HTTP status code (100-599); requests would be answered 200 OK instead"
+    }
+  ]
+}
+```
+
+`kind` is a stable code for machine consumption; `message` is for humans. The codes are `load_error`, `invalid_status`, `reserved_route`, `path_without_slash`, `duplicate_route`, `invalid_regex`, `unreachable_sequence_step`, `unknown_template_source` and `unknown_active_tag`.
+
+## In CI
+
+The check binds nothing, writes nothing, and takes milliseconds, so it belongs in the same pipeline that runs the mock server. In GitHub Actions, against the checked-in mock set:
+
+```yaml
+jobs:
+  mocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate mocks
+        # ENTRYPOINT is the binary, so args go straight to it; the image's
+        # MIMIC_MOCKS_DIR=/app/mocks matches the volume mount.
+        run: docker run --rm -v "$PWD/mocks:/app/mocks" ragilhadi/mimic:latest validate --strict
+```
+
+And in a pre-commit hook, locally:
+
+```bash
+mimic validate --strict ./mocks
+```
+
+## Semantics
+
+- **Validation and serving share the loader.** A mock the validator rejects as an error is one the server refuses to load or refuses to serve as declared.
+- **`validate` never starts a server, binds a port, or writes anything** — it is the loader plus a report, in a process that exits.
+- **The summary line is always printed**, clean or not.
+
+<Aside type="note">
+Cross-key pattern-route shadowing (`/users/me` vs `/users/:id`) is not yet reported — exact duplicates are.
+</Aside>

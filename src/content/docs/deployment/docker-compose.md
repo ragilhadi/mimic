@@ -52,14 +52,17 @@ services:
       - RUST_LOG=info
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
-      interval: 10s
+      # bash /dev/tcp probe -- bash ships in the image, wget does not
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/$${PORT:-8080} && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 ' || exit 1"]
+      interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 ```
 
-`start_period: 5s` gives Mimic time to scan the mocks folder before health checks begin failing.
+The image deliberately ships without `wget` or `curl` (it keeps the CVE surface small), so the probe uses bash's built-in `/dev/tcp`. The `$${PORT:-8080}` follows whatever `PORT` you set.
+
+`start_period: 10s` gives Mimic time to scan the mocks folder before health checks begin failing.
 
 ## Alongside a frontend app
 

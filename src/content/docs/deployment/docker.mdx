@@ -73,14 +73,14 @@ docker run -d \
   --name mimic \
   -p 8080:8080 \
   -v $(pwd)/mocks:/app/mocks:ro \
-  --health-cmd="wget --spider -q http://localhost:8080/health || exit 1" \
+  --health-cmd="bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf \"GET /health HTTP/1.0\\r\\n\\r\\n\" >&3 && head -1 <&3 | grep -q \" 200 \" || exit 1'" \
   --health-interval=10s \
   --health-timeout=3s \
   --health-retries=3 \
   ragilhadi/mimic:latest
 ```
 
-`wget` is included in the image specifically so the health check can run inside the container without extra installs.
+The image is based on Debian Trixie Slim with only the base package set plus the TLS trust bundle, so `wget` and `curl` are **not** installed. `bash` is, which is why the probe uses its built-in `/dev/tcp` instead. If you change `PORT`, change it in the probe too.
 
 ## Managing the container
 
