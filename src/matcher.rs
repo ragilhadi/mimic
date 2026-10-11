@@ -1194,10 +1194,17 @@ fn form_body_reject_reason(
 pub struct CompiledPathPattern {
     pub regex: Regex,
     pub param_names: Vec<String>,
+    /// How many `/` the template contains — and so any path it can match.
+    slashes: usize,
 }
 
 /// True if any path segment uses `:name` or `{name}` parameter syntax.
 pub fn is_pattern_path(path: &str) -> bool {
+    // Every parameter syntax contains `:` or `{`; most routes contain neither,
+    // and this runs once per registered route per unmatched-exact request.
+    if !path.contains([':', '{']) {
+        return false;
+    }
     path.split('/').any(|segment| {
         (segment.starts_with(':') && segment.len() > 1)
             || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
@@ -1253,12 +1260,49 @@ fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
 
     let pattern = format!("^{}$", regex_parts.join("/"));
     match Regex::new(&pattern) {
-        Ok(regex) => Some(CompiledPathPattern { regex, param_names }),
+        Ok(regex) => Some(CompiledPathPattern {
+            regex,
+            param_names,
+            slashes: path.bytes().filter(|&b| b == b'/').count(),
+        }),
         Err(e) => {
             warn!("Invalid path parameter pattern '{}': {}", path, e);
             None
         }
     }
+}
+
+/// A cheap necessary condition for `template` (a declared pattern path) to
+/// match `request_path`: the same number of segments, and the same first segment
+/// whenever the template's first segment is a literal.
+///
+/// A request is checked against every pattern route registered for its method,
+/// so this runs once per route; rejecting the great majority here keeps the cache
+/// lookup and the regex off that loop. It never rejects a path the template
+/// would match.
+fn template_may_match(template: &str, request_path: &str) -> bool {
+    let slashes = |s: &str| s.bytes().filter(|&b| b == b'/').count();
+    if slashes(template) != slashes(request_path) {
+        return false;
+    }
+    let template_first = template
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let is_param = |seg: &str| {
+        (seg.starts_with(':') && seg.len() > 1)
+            || (seg.starts_with('{') && seg.ends_with('}') && seg.len() > 2)
+    };
+    if is_param(template_first) {
+        return true;
+    }
+    request_path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        == template_first
 }
 
 /// Match a concrete request path against a compiled pattern, returning the
@@ -1267,6 +1311,13 @@ pub fn match_path_pattern(
     pattern: &CompiledPathPattern,
     request_path: &str,
 ) -> Option<HashMap<String, String>> {
+    // A template matches only paths with the same number of segments, so the
+    // vast majority of non-matching routes are rejected by counting slashes —
+    // cheaper than running the regex, and a request is checked against every
+    // pattern route registered for its method.
+    if request_path.bytes().filter(|&b| b == b'/').count() != pattern.slashes {
+        return None;
+    }
     let caps = pattern.regex.captures(request_path)?;
     let mut params = HashMap::with_capacity(pattern.param_names.len());
     for (i, name) in pattern.param_names.iter().enumerate() {
@@ -1350,9 +1401,6 @@ pub struct MatchResult {
     /// mock's declared path (which may be a pattern like `/users/:id`),
     /// not necessarily the concrete request path
     pub matched_key: String,
-    /// Number of literal (non-parameter) segments in the mock's declared
-    /// path, used to break score ties in favor of the more specific route
-    pub specificity: u32,
     /// The components `score` was assembled from, so the win can be explained
     /// without re-running the matchers
     pub breakdown: ScoreBreakdown,
@@ -1553,6 +1601,9 @@ fn scan_candidates_at(
         if !is_pattern_path(path_part) {
             continue;
         }
+        if !template_may_match(path_part, path) {
+            continue;
+        }
         let Some(pattern) = compile_path_pattern(path_part) else {
             continue;
         };
@@ -1660,7 +1711,19 @@ fn find_matching_mock_at(
         base_key
     );
 
-    let mut candidates: Vec<MatchResult> = Vec::new();
+    // Candidates borrow their mock. A deep copy of a mock (its whole response
+    // body) used to be made for every candidate that matched, to be thrown away
+    // for every one but the winner; only the winner is cloned now.
+    struct Candidate<'a> {
+        mock: &'a MockConfig,
+        score: u32,
+        index: usize,
+        path_params: HashMap<String, String>,
+        matched_key: String,
+        specificity: u32,
+        breakdown: ScoreBreakdown,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     // Exact match: O(1) lookup, no path params, full score.
     if let Some(mock_list) = mocks.get(&base_key) {
@@ -1672,16 +1735,14 @@ fn find_matching_mock_at(
                 continue;
             }
             if let Some(breakdown) = calculate_match_score(context, mock) {
-                candidates.push(MatchResult {
-                    mock: mock.clone(),
+                candidates.push(Candidate {
+                    mock,
                     score: breakdown.total(),
                     index,
                     path_params: HashMap::new(),
                     matched_key: base_key.clone(),
                     specificity: path_specificity(lookup_path),
                     breakdown,
-                    trailing_slash_normalized: false,
-                    head_from_get: false,
                 });
             }
         }
@@ -1703,6 +1764,9 @@ fn find_matching_mock_at(
             if !is_pattern_path(path_part) {
                 continue;
             }
+            if !template_may_match(path_part, lookup_path) {
+                continue;
+            }
             let Some(pattern) = compile_path_pattern(path_part) else {
                 continue;
             };
@@ -1715,16 +1779,14 @@ fn find_matching_mock_at(
                     continue;
                 }
                 if let Some(breakdown) = calculate_match_score(context, mock) {
-                    candidates.push(MatchResult {
-                        mock: mock.clone(),
+                    candidates.push(Candidate {
+                        mock,
                         score: breakdown.total().saturating_sub(PATTERN_MATCH_PENALTY),
                         index,
                         path_params: params.clone(),
                         matched_key: key.clone(),
                         specificity: path_specificity(path_part),
                         breakdown,
-                        trailing_slash_normalized: false,
-                        head_from_get: false,
                     });
                 }
             }
@@ -1750,7 +1812,16 @@ fn find_matching_mock_at(
 
     if let Some(best) = candidates.into_iter().next() {
         debug!("Found matching mock with score {}", best.score);
-        Some(best)
+        Some(MatchResult {
+            mock: best.mock.clone(),
+            score: best.score,
+            index: best.index,
+            path_params: best.path_params,
+            matched_key: best.matched_key,
+            breakdown: best.breakdown,
+            trailing_slash_normalized: false,
+            head_from_get: false,
+        })
     } else {
         debug!("No matching mock found");
         None
@@ -1958,6 +2029,9 @@ fn accumulate_candidates_for(
             continue;
         };
         if !is_pattern_path(path_part) {
+            continue;
+        }
+        if !template_may_match(path_part, lookup_path) {
             continue;
         }
         let Some(pattern) = compile_path_pattern(path_part) else {
@@ -4758,5 +4832,115 @@ mod request_parsing_tests {
         let parsed = parse_headers(&headers);
 
         assert_eq!(parsed["x-raw"], "caf\u{fffd}");
+    }
+}
+
+/// Timing probe for per-request matching cost (#139). Ignored by default; run
+/// with `cargo test --release -- --ignored --nocapture matching_cost`.
+#[cfg(test)]
+mod matching_cost {
+    use super::*;
+    use crate::types::MockConfig;
+    use std::time::Instant;
+
+    fn big_mock(method: &str, path: &str) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            // A response with some weight, so a per-candidate clone shows up.
+            response: serde_json::json!({
+                "items": (0..40).map(|i| serde_json::json!({"id": i, "name": format!("item {i}"), "tags": ["a","b","c"]})).collect::<Vec<_>>()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn matching_cost() {
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for i in 0..500 {
+            let m = big_mock("GET", &format!("/exact/{i}"));
+            mocks
+                .entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+            let m = big_mock("GET", &format!("/p{i}/:id"));
+            mocks
+                .entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+        }
+        // Several competing mocks on one path: the per-candidate clone case.
+        for _ in 0..10 {
+            let m = big_mock("GET", "/shared");
+            mocks
+                .entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+        }
+
+        let time = |label: &str, path: &str| {
+            let ctx = RequestContext::new("GET".into(), path.into());
+            let n = 5000;
+            let start = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(find_matching_mock(&ctx, &mocks, None));
+            }
+            println!(
+                "{label:<28} {:>8.1} µs/request",
+                start.elapsed().as_secs_f64() * 1e6 / n as f64
+            );
+        };
+        time("exact hit", "/exact/250");
+        time("shared path (10 candidates)", "/shared");
+        time("pattern hit (500 patterns)", "/p499/7");
+        time("miss (scans every key)", "/nothing/here");
+    }
+}
+
+#[cfg(test)]
+mod pattern_prefilter_tests {
+    use super::*;
+
+    /// The prefilter is only a shortcut: it must never turn away a path the
+    /// compiled template would have matched.
+    #[test]
+    fn template_may_match_never_rejects_a_path_the_pattern_matches() {
+        let cases = [
+            ("/users/:id", "/users/42"),
+            ("/users/{id}", "/users/42"),
+            ("/:resource/:id", "/orders/7"),
+            ("/{a}/x/{b}", "/anything/x/else"),
+            ("/api/v1/users/:id/posts/:post", "/api/v1/users/3/posts/9"),
+            ("/users/:id/", "/users/42/"),
+            ("/:id", "/42"),
+        ];
+        for (template, path) in cases {
+            let pattern = compile_path_pattern(template).expect(template);
+            assert!(
+                match_path_pattern(&pattern, path).is_some(),
+                "{template} should match {path}"
+            );
+            assert!(template_may_match(template, path), "{template} vs {path}");
+        }
+    }
+
+    #[test]
+    fn template_may_match_rejects_the_obvious_misses() {
+        assert!(!template_may_match("/users/:id", "/users/42/extra"));
+        assert!(!template_may_match("/users/:id", "/orders/42"));
+        assert!(!template_may_match("/users/:id", "/users"));
+        assert!(template_may_match("/:any/:id", "/orders/42"));
+    }
+
+    #[test]
+    fn is_pattern_path_still_recognises_every_parameter_syntax() {
+        assert!(is_pattern_path("/users/:id"));
+        assert!(is_pattern_path("/users/{id}"));
+        assert!(!is_pattern_path("/users/42"));
+        assert!(!is_pattern_path("/users/:"));
+        assert!(!is_pattern_path("/users/{}"));
     }
 }

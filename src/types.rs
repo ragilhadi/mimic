@@ -558,7 +558,10 @@ pub struct RequestRecord {
     pub match_explanation: Option<String>,
 }
 
-pub type RequestLog = Arc<tokio::sync::RwLock<Vec<RequestRecord>>>;
+/// The in-memory request log. A deque, because the bounded log drops its oldest
+/// entry on nearly every request once full; from the front of a `Vec` that
+/// meant moving every other record, under the write lock, per request.
+pub type RequestLog = Arc<tokio::sync::RwLock<std::collections::VecDeque<RequestRecord>>>;
 
 /// Accepts either shape `RequestRecord::query_params` has ever had on disk:
 /// the pre-#108 `{"page": "1"}` (one value per key, the last one the client

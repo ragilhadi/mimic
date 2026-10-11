@@ -7,6 +7,7 @@ use crate::matcher::ParsedBody;
 use crate::types::is_sensitive_header;
 use regex::Regex;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use tracing::debug;
@@ -50,13 +51,20 @@ pub(crate) fn is_known_source(source: &str) -> bool {
 pub(crate) const KNOWN_CASTS: &[&str] = &["number", "bool", "json"];
 
 /// Render `{{ }}` templates found anywhere in `value`, returning a new JSON value.
-/// If `value` contains no template expressions, it is cloned as-is without
-/// touching the regex engine.
-pub fn render_response(value: &Value, ctx: &TemplateContext) -> Value {
+/// If `value` contains no template expressions, it is returned as-is without
+/// touching the regex engine — and without copying it: a static response, the
+/// common case, is borrowed all the way to the serializer.
+pub fn render_response_ref<'a>(value: &'a Value, ctx: &TemplateContext) -> Cow<'a, Value> {
     if !contains_template(value) {
-        return value.clone();
+        return Cow::Borrowed(value);
     }
-    render_value(value, ctx)
+    Cow::Owned(render_value(value, ctx))
+}
+
+/// [`render_response_ref`], owned.
+#[cfg(test)]
+pub fn render_response(value: &Value, ctx: &TemplateContext) -> Value {
+    render_response_ref(value, ctx).into_owned()
 }
 
 /// True if any template inside `value` reads from the request body, i.e. uses
