@@ -29,8 +29,45 @@ use tracing::{debug, info, warn};
 pub const PROXY_UPSTREAM_ENV: &str = "MIMIC_PROXY_UPSTREAM";
 pub const RECORD_UPSTREAM_ENV: &str = "MIMIC_RECORD_UPSTREAM";
 pub const PROXY_TIMEOUT_MS_ENV: &str = "MIMIC_PROXY_TIMEOUT_MS";
+pub const PROXY_BUFFER_LIMIT_ENV: &str = "MIMIC_PROXY_BUFFER_LIMIT";
 
 const DEFAULT_PROXY_TIMEOUT_MS: u64 = 5000;
+
+/// How much of an upstream response is held in memory by default (10 MiB),
+/// matching `MIMIC_MAX_RESPONSE_FILE`. Anything past it is streamed through.
+const DEFAULT_PROXY_BUFFER_LIMIT: usize = 10 * 1024 * 1024;
+
+/// Build the upstream client.
+///
+/// `timeout_ms` bounds connecting and each wait for the upstream to say
+/// something — the response headers, then every chunk of the body — rather than
+/// the whole exchange. A single total timeout cut off any response that was
+/// merely large or slow while still making progress, which is exactly what a
+/// download or a stream is. Redirects are never followed: a proxy hands the
+/// client the upstream's 3xx as it is, and a recording keeps the 3xx.
+fn build_client(timeout_ms: u64) -> reqwest::Result<reqwest::Client> {
+    let timeout = Duration::from_millis(timeout_ms);
+    reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// `MIMIC_PROXY_BUFFER_LIMIT` in bytes. `0` means "never stream", i.e. buffer
+/// whatever arrives, which restores the earlier unbounded behaviour.
+fn configured_buffer_limit() -> usize {
+    match std::env::var(PROXY_BUFFER_LIMIT_ENV) {
+        Ok(raw) => raw.trim().parse::<usize>().unwrap_or_else(|_| {
+            warn!(
+                "Invalid {}='{}', falling back to {} bytes",
+                PROXY_BUFFER_LIMIT_ENV, raw, DEFAULT_PROXY_BUFFER_LIMIT
+            );
+            DEFAULT_PROXY_BUFFER_LIMIT
+        }),
+        Err(_) => DEFAULT_PROXY_BUFFER_LIMIT,
+    }
+}
 
 /// Everything the proxy path needs, resolved once at startup.
 #[derive(Clone)]
@@ -38,6 +75,9 @@ pub struct ProxyConfig {
     pub upstream: String,
     pub record: bool,
     pub timeout_ms: u64,
+    /// Upstream bytes held in memory (for the request log and for recording);
+    /// a response beyond this is streamed to the client instead.
+    pub buffer_limit: usize,
     client: reqwest::Client,
 }
 
@@ -97,10 +137,7 @@ pub fn configured_proxy_config(own_port: u16) -> Option<ProxyConfig> {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_PROXY_TIMEOUT_MS);
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-    {
+    let client = match build_client(timeout_ms) {
         Ok(client) => client,
         Err(e) => {
             warn!(
@@ -115,6 +152,7 @@ pub fn configured_proxy_config(own_port: u16) -> Option<ProxyConfig> {
         upstream,
         record,
         timeout_ms,
+        buffer_limit: configured_buffer_limit(),
         client,
     })
 }
@@ -131,10 +169,8 @@ impl ProxyConfig {
             upstream,
             record,
             timeout_ms,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_millis(timeout_ms))
-                .build()
-                .expect("client should build with a plain timeout"),
+            buffer_limit: DEFAULT_PROXY_BUFFER_LIMIT,
+            client: build_client(timeout_ms).expect("client should build with plain timeouts"),
         }
     }
 }
@@ -184,7 +220,59 @@ fn is_transparently_decoded_encoding(value: &axum::http::HeaderValue) -> bool {
 pub struct ProxyResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
-    pub body: Bytes,
+    pub body: ProxyBody,
+}
+
+/// An upstream response body.
+pub enum ProxyBody {
+    /// The whole body, read within the buffer limit — loggable and recordable.
+    Buffered(Bytes),
+    /// Bigger than the buffer limit, or an event stream: what has been read so
+    /// far, and the rest of the response, to be passed through unread.
+    Streaming {
+        head: Bytes,
+        rest: Box<reqwest::Response>,
+    },
+}
+
+impl ProxyBody {
+    /// The body when it was read in full.
+    pub fn buffered(&self) -> Option<&Bytes> {
+        match self {
+            ProxyBody::Buffered(bytes) => Some(bytes),
+            ProxyBody::Streaming { .. } => None,
+        }
+    }
+
+    /// An axum body that sends the response on to the client.
+    pub fn into_body(self) -> axum::body::Body {
+        use futures_util::StreamExt;
+        match self {
+            ProxyBody::Buffered(bytes) => axum::body::Body::from(bytes),
+            // Nothing read ahead: don't send the client an empty first frame.
+            ProxyBody::Streaming { head, rest } if head.is_empty() => {
+                axum::body::Body::from_stream(rest.bytes_stream())
+            }
+            ProxyBody::Streaming { head, rest } => {
+                let head = futures_util::stream::once(futures_util::future::ready(Ok::<
+                    Bytes,
+                    reqwest::Error,
+                >(
+                    head
+                )));
+                axum::body::Body::from_stream(head.chain(rest.bytes_stream()))
+            }
+        }
+    }
+}
+
+/// True for `text/event-stream`, which never ends on its own and so must reach
+/// the client as it arrives rather than after a buffer fills.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| crate::matcher::media_type(ct) == "text/event-stream")
 }
 
 #[derive(Debug)]
@@ -267,15 +355,49 @@ pub async fn forward(
         out_headers.insert(name.clone(), value.clone());
     }
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| ProxyError::Request(e.to_string()))?;
+    let to_error = |e: reqwest::Error| {
+        if e.is_timeout() {
+            ProxyError::Timeout
+        } else {
+            ProxyError::Request(e.to_string())
+        }
+    };
+
+    if is_event_stream(&out_headers) {
+        return Ok(ProxyResponse {
+            status,
+            headers: out_headers,
+            body: ProxyBody::Streaming {
+                head: Bytes::new(),
+                rest: Box::new(response),
+            },
+        });
+    }
+
+    // Read up to the buffer limit. A response that fits is returned whole, for
+    // the log and for recording; one that doesn't is handed over with what was
+    // read so far plus the unread remainder, so neither memory nor the
+    // client's wait grows with its size.
+    let mut response = response;
+    let mut buffered: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(to_error)? {
+        buffered.extend_from_slice(&chunk);
+        if cfg.buffer_limit > 0 && buffered.len() > cfg.buffer_limit {
+            return Ok(ProxyResponse {
+                status,
+                headers: out_headers,
+                body: ProxyBody::Streaming {
+                    head: Bytes::from(buffered),
+                    rest: Box::new(response),
+                },
+            });
+        }
+    }
 
     Ok(ProxyResponse {
         status,
         headers: out_headers,
-        body,
+        body: ProxyBody::Buffered(Bytes::from(buffered)),
     })
 }
 
@@ -628,6 +750,7 @@ fn build_recorded_mock(
         response_file: None,
         template: None,
         response_bytes: None,
+        template_escape: None,
         consume_body: false,
         query_params: build_query_matcher(&context.query_params),
         headers: build_header_matcher(&context.headers),

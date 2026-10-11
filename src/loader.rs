@@ -342,6 +342,17 @@ fn load_mocks_map_core(
         changed = true;
     }
 
+    // Drop cached fixture bytes no mock claims any more. `cache.files` is
+    // pruned against `seen` above; this map is keyed by fixture path, so a
+    // deleted or renamed fixture would otherwise stay in memory for the life of
+    // the process.
+    let claimed: HashSet<&PathBuf> = scanned
+        .iter()
+        .filter_map(|(_, outcome)| outcome.as_ref().ok())
+        .flat_map(|loaded| loaded.fixtures.iter())
+        .collect();
+    cache.fixtures.retain(|path, _| claimed.contains(path));
+
     // Every file claimed as a fixture by a mock that loaded. A fixture is
     // served, never registered — including when it is itself valid JSON.
     let fixtures: HashSet<&PathBuf> = scanned
@@ -852,6 +863,35 @@ fn read_response_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #137: `cache.fixtures` is keyed by fixture path and was never pruned, so
+    /// a deleted fixture's bytes stayed in memory for the life of the process.
+    #[test]
+    fn hot_reload_evicts_cached_fixtures_nobody_claims_any_more() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("body.txt"), "hello").unwrap();
+        std::fs::write(
+            dir.path().join("m.json"),
+            r#"{"method":"GET","path":"/f","status":200,"response_file":"body.txt"}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut cache = LoaderCache::new();
+
+        let first = load_mocks_map_hot_reload(path, &mut cache);
+        assert!(first.result.errors.is_empty(), "{:?}", first.result.errors);
+        assert_eq!(cache.fixtures.len(), 1);
+
+        std::fs::remove_file(dir.path().join("m.json")).unwrap();
+        std::fs::remove_file(dir.path().join("body.txt")).unwrap();
+        let second = load_mocks_map_hot_reload(path, &mut cache);
+        assert!(second.changed);
+        assert!(
+            cache.fixtures.is_empty(),
+            "a fixture no mock claims must not stay cached"
+        );
+    }
+
     use serde_json::json;
     use std::fs::{self, File};
     use std::io::Write;
@@ -1336,6 +1376,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let key = create_mock_key(&mock.method, &mock.path);

@@ -215,6 +215,14 @@ pub struct MockConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<bool>,
 
+    /// Whether values interpolated into a templated `response_file` are escaped
+    /// for the body's content type: JSON string escaping for JSON, entity
+    /// escaping for XML/HTML, none for anything else. On unless set to `false`,
+    /// which restores raw interpolation for a fixture that deliberately splices
+    /// in pre-formed JSON or markup. Ignored without `"template": true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_escape: Option<bool>,
+
     /// The bytes of [`MockConfig::response_file`], read at load time.
     ///
     /// Loader-owned and skipped by serde in both directions: a mock file can't
@@ -311,6 +319,11 @@ pub struct SequenceStep {
     /// Whether templates inside this step's file body are rendered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<bool>,
+
+    /// Escaping switch for this step's templated file body; see
+    /// [`MockConfig::template_escape`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_escape: Option<bool>,
 
     /// The bytes of this step's `response_file`, read at load time.
     #[serde(skip)]
@@ -545,7 +558,10 @@ pub struct RequestRecord {
     pub match_explanation: Option<String>,
 }
 
-pub type RequestLog = Arc<tokio::sync::RwLock<Vec<RequestRecord>>>;
+/// The in-memory request log. A deque, because the bounded log drops its oldest
+/// entry on nearly every request once full; from the front of a `Vec` that
+/// meant moving every other record, under the write lock, per request.
+pub type RequestLog = Arc<tokio::sync::RwLock<std::collections::VecDeque<RequestRecord>>>;
 
 /// Accepts either shape `RequestRecord::query_params` has ever had on disk:
 /// the pre-#108 `{"page": "1"}` (one value per key, the last one the client
@@ -702,6 +718,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -783,6 +800,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let cloned = config.clone();
@@ -813,6 +831,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -893,6 +912,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -984,6 +1004,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
         assert!(!simple.has_advanced_matchers());
 
@@ -1004,6 +1025,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
         assert!(with_query.has_advanced_matchers());
     }
@@ -1313,6 +1335,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 

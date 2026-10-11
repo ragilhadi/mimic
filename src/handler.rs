@@ -4,7 +4,7 @@ use crate::matcher::{
     parse_headers, parse_query_string, parse_query_string_multi, requires_body, route_exists,
     MatchResult, RequestContext,
 };
-use crate::template::{render_response, TemplateContext};
+use crate::template::{render_response_ref, TemplateContext};
 use crate::types::{
     is_sensitive_header, is_truthy, parse_active_tags, ActiveTags, MockConfig, MockIdentity,
     MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
@@ -470,9 +470,8 @@ pub async fn require_admin_token(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .is_some_and(|token| token == expected.as_str());
+        .and_then(bearer_token)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()));
 
     if authorized {
         next.run(request).await
@@ -488,6 +487,31 @@ pub async fn require_admin_token(
             .and_then(|v| v.to_str().ok());
         unauthorized(state.cors.as_deref(), origin)
     }
+}
+
+/// The credentials of an `Authorization: Bearer <token>` value.
+///
+/// The scheme is case-insensitive (RFC 9110 §11.1), so `bearer` and `BEARER`
+/// are accepted; the token itself is compared exactly.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim().split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|token| !token.is_empty())
+}
+
+/// Equality that doesn't stop at the first differing byte, so how long a
+/// rejected token took says nothing about how much of it was right. A length
+/// mismatch is folded into the result rather than returned early.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
 }
 
 /// Normalize a configured route path: trimmed, with a leading slash and no
@@ -565,7 +589,7 @@ impl AppState {
     pub fn with_active_tags(mocks: MockStore, active_tags: Option<HashSet<String>>) -> Self {
         Self {
             mocks,
-            request_log: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            request_log: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
             sequence_counters: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             mock_hits: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -740,22 +764,49 @@ pub fn truncate_body(body: String, limit: usize) -> String {
 
 /// Append `record` to `log`, dropping the oldest entries once `cap` is
 /// exceeded. A `cap` of 0 leaves the log unbounded.
-fn push_bounded(log: &mut Vec<RequestRecord>, record: RequestRecord, cap: usize) {
-    log.push(record);
+fn push_bounded(
+    log: &mut std::collections::VecDeque<RequestRecord>,
+    record: RequestRecord,
+    cap: usize,
+) {
+    log.push_back(record);
     if cap > 0 && log.len() > cap {
-        log.drain(..log.len() - cap);
+        let excess = log.len() - cap;
+        log.drain(..excess);
     }
 }
 
 /// The port the server is configured to listen on.
 ///
 /// Lives here so `/health` reports the same number `main` binds to rather than
-/// re-deriving it and risking disagreement.
+/// re-deriving it and risking disagreement. An unusable value reads as the
+/// default; startup goes through [`configured_port_checked`] first, so by the
+/// time anything serves a request the value is known to be valid.
 pub fn configured_port() -> u16 {
-    std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080)
+    configured_port_checked().unwrap_or(DEFAULT_PORT)
+}
+
+/// Port used when `PORT` is unset or empty.
+const DEFAULT_PORT: u16 = 8080;
+
+/// [`configured_port`] that reports a `PORT` that is set but unusable instead
+/// of quietly serving on another port — the same policy as
+/// [`configured_bind_address`]: a listener that isn't where the operator said
+/// it would be is worse than one that refuses to start.
+pub fn configured_port_checked() -> Result<u16, String> {
+    parse_port(std::env::var("PORT").ok())
+}
+
+fn parse_port(value: Option<String>) -> Result<u16, String> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(DEFAULT_PORT),
+        Some(raw) => raw.parse::<u16>().map_err(|_| {
+            format!(
+                "PORT is set to '{}', which is not a valid port number (0-65535)",
+                raw
+            )
+        }),
+    }
 }
 
 /// Environment variable overriding the address Mimic binds to.
@@ -804,7 +855,11 @@ pub async fn handle_request(
     State(state): State<AppState>,
     body: Body,
 ) -> Response {
-    let path = uri.path().to_string();
+    // The request path as the client sent it, for forwarding upstream untouched;
+    // everything else — matching, `{{path.x}}`, the request log — sees it
+    // percent-decoded per segment, the way query strings and forms already are.
+    let raw_path = uri.path().to_string();
+    let path = crate::matcher::decode_path(&raw_path);
     let method_str = method.as_str().to_string();
 
     debug!("Incoming request: {} {}", method_str, uri);
@@ -906,7 +961,7 @@ pub async fn handle_request(
             // destructure, like the score and explanation above.
             let head_fallback = result.head_from_get;
             let MatchResult {
-                mock,
+                mut mock,
                 index,
                 path_params,
                 matched_key: mock_key,
@@ -937,10 +992,13 @@ pub async fn handle_request(
                 }
                 _ => ResolvedResponse {
                     status: mock.status,
-                    response: mock.response.clone(),
+                    // Moved, not cloned: nothing below reads `mock.response`
+                    // again, and it can be the bulk of the mock.
+                    response: std::mem::take(&mut mock.response),
                     file: mock.response_file.clone(),
                     bytes: mock.response_bytes.clone(),
                     template: mock.template.unwrap_or(false),
+                    template_escape: mock.template_escape.unwrap_or(true),
                     delay_ms: None,
                 },
             };
@@ -950,6 +1008,7 @@ pub async fn handle_request(
                 file: response_file,
                 bytes: response_bytes,
                 template,
+                template_escape,
                 delay_ms,
             } = resolved;
 
@@ -968,7 +1027,7 @@ pub async fn handle_request(
                 headers: &context.headers,
                 body: parsed_body.as_ref(),
             };
-            let response = render_response(&response, &template_ctx);
+            let response = render_response_ref(&response, &template_ctx);
 
             let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::OK);
             let matched_key = format!("{}:{}", method_str, path);
@@ -988,6 +1047,7 @@ pub async fn handle_request(
                 declared: response_file.as_deref().unwrap_or("(response_file)"),
                 bytes,
                 template,
+                escape: template_escape,
             });
             let (mut header_map, built_body) = build_response_parts(
                 &response,
@@ -1220,34 +1280,59 @@ async fn handle_proxy_fallback(
     let path = context.path.clone();
     let body = context.body.clone().unwrap_or_default();
 
-    match crate::proxy::forward(proxy_cfg, method, &path, uri.query(), headers, body).await {
+    match crate::proxy::forward(proxy_cfg, method, uri.path(), uri.query(), headers, body).await {
         Ok(upstream) => {
             info!(
                 "Proxied {} {} -> {} ({})",
                 method_str, path, proxy_cfg.upstream, upstream.status
             );
 
+            // Only a response read in full can be recorded; one that was
+            // streamed past the buffer limit is forwarded but not written.
             if proxy_cfg.record {
-                let record_state = state.record_state.clone();
-                let mocks_dir = std::path::PathBuf::from(&state.mocks_dir).join("_recorded");
-                let record_ctx = context.clone();
-                let status = upstream.status.as_u16();
-                let resp_headers = upstream.headers.clone();
-                let resp_body = upstream.body.clone();
-                tokio::spawn(async move {
-                    crate::proxy::record_exchange(
-                        record_state,
-                        mocks_dir,
-                        record_ctx,
-                        status,
-                        resp_headers,
-                        resp_body,
-                    )
-                    .await;
-                });
+                match upstream.body.buffered() {
+                    Some(resp_body) => {
+                        let record_state = state.record_state.clone();
+                        let mocks_dir =
+                            std::path::PathBuf::from(&state.mocks_dir).join("_recorded");
+                        let record_ctx = context.clone();
+                        let status = upstream.status.as_u16();
+                        let resp_headers = upstream.headers.clone();
+                        let resp_body = resp_body.clone();
+                        tokio::spawn(async move {
+                            crate::proxy::record_exchange(
+                                record_state,
+                                mocks_dir,
+                                record_ctx,
+                                status,
+                                resp_headers,
+                                resp_body,
+                            )
+                            .await;
+                        });
+                    }
+                    None => info!(
+                        "Not recording {} {}: the response is larger than the {}-byte proxy buffer",
+                        method_str, path, proxy_cfg.buffer_limit
+                    ),
+                }
             }
 
-            let response_body_string = String::from_utf8_lossy(&upstream.body).to_string();
+            // Text is logged as text; a binary or streamed body as a
+            // descriptor, the way mock responses are — not as replacement
+            // characters, and not as a second full copy of a large download.
+            let upstream_content_type = declared_content_type(&upstream.headers).to_string();
+            let response_body_string = match upstream.body.buffered() {
+                Some(bytes) => recorded_response_body(bytes, &upstream_content_type, None),
+                None => format!(
+                    "<streamed response of {}, not logged>",
+                    if upstream_content_type.is_empty() {
+                        "unknown content type"
+                    } else {
+                        &upstream_content_type
+                    }
+                ),
+            };
             let response_headers_for_log = recorded_response_headers(&upstream.headers);
             let path_params = context.path_params.clone();
             record_request(
@@ -1265,7 +1350,7 @@ async fn handle_proxy_fallback(
             )
             .await;
 
-            let mut res = Response::new(Body::from(upstream.body));
+            let mut res = Response::new(upstream.body.into_body());
             *res.status_mut() = upstream.status;
             *res.headers_mut() = upstream.headers;
             cors_wrap(
@@ -1446,7 +1531,19 @@ async fn record_request(state: &AppState, context: RequestContext, outcome: Requ
         headers: redacted_headers,
         body: context
             .body
-            .and_then(|b| String::from_utf8(b.to_vec()).ok())
+            .filter(|b| !b.is_empty())
+            .map(|b| match std::str::from_utf8(&b) {
+                Ok(text) => text.to_string(),
+                // A body that isn't text is recorded as a descriptor rather
+                // than left out — an empty log entry reads as "no body sent".
+                Err(_) => format!(
+                    "<{} bytes of {}>",
+                    b.len(),
+                    request_content_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream")
+                ),
+            })
             .and_then(|b| redaction.apply(b, request_content_type.as_deref()))
             .map(|b| truncate_body(b, body_limit)),
         matched_mock: outcome.matched_mock,
@@ -1889,6 +1986,8 @@ struct FileBody<'a> {
     bytes: &'a Bytes,
     /// Whether `{{...}}` inside the file should be rendered.
     template: bool,
+    /// Whether rendered values are escaped for the content type.
+    escape: bool,
 }
 
 /// Content types inferred from a `response_file` extension, lowercased.
@@ -2027,7 +2126,18 @@ fn build_response_parts(
     if let Some(file) = file {
         let textual = is_textual_content_type(&content_type);
         let bytes = match (file.template && textual, std::str::from_utf8(file.bytes)) {
-            (true, Ok(text)) => Bytes::from(crate::template::render_text(text, template_ctx)),
+            (true, Ok(text)) => {
+                let escape = if file.escape {
+                    crate::template::Escape::for_content_type(&content_type)
+                } else {
+                    crate::template::Escape::None
+                };
+                Bytes::from(crate::template::render_text_escaped(
+                    text,
+                    template_ctx,
+                    escape,
+                ))
+            }
             // Not templated, not text, or not valid UTF-8: the bytes as read.
             _ => file.bytes.clone(),
         };
@@ -2094,6 +2204,7 @@ struct ResolvedResponse {
     /// Its bytes, read at load time. `None` for an ordinary JSON response.
     bytes: Option<Bytes>,
     template: bool,
+    template_escape: bool,
     delay_ms: Option<u64>,
 }
 
@@ -2118,6 +2229,7 @@ async fn advance_sequence(
         file: step.response_file.clone(),
         bytes: step.response_bytes.clone(),
         template: step.template.unwrap_or(false),
+        template_escape: step.template_escape.unwrap_or(true),
         delay_ms: step.delay_ms,
     }
 }
@@ -2186,6 +2298,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2208,6 +2321,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2230,6 +2344,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2465,6 +2580,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
         let response = handle_request(
@@ -2506,6 +2622,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
         let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
@@ -2560,6 +2677,7 @@ mod tests {
                         response_file: None,
                         template: None,
                         response_bytes: None,
+                        template_escape: None,
                         repeat: false,
                     },
                     SequenceStep {
@@ -2569,6 +2687,7 @@ mod tests {
                         response_file: None,
                         template: None,
                         response_bytes: None,
+                        template_escape: None,
                         repeat: true,
                     },
                 ]),
@@ -2576,6 +2695,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
         let state = AppState::new(Arc::new(tokio::sync::RwLock::new(mocks)));
@@ -2634,7 +2754,7 @@ mod tests {
             .len();
 
         let log = state.request_log.read().await;
-        let record = log.last().unwrap();
+        let record = log.back().unwrap();
         assert_eq!(
             record.method, "HEAD",
             "the log records the request as it came in"
@@ -2696,6 +2816,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2744,6 +2865,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2802,6 +2924,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2858,6 +2981,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2915,6 +3039,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -2963,6 +3088,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3028,6 +3154,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3084,6 +3211,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3131,6 +3259,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3185,6 +3314,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3242,6 +3372,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3281,6 +3412,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3339,12 +3471,14 @@ mod tests {
                     response_file: None,
                     template: None,
                     response_bytes: None,
+                    template_escape: None,
                     repeat: true,
                 }]),
                 tags: Vec::new(),
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3389,6 +3523,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3447,12 +3582,14 @@ mod tests {
                     response_file: None,
                     template: None,
                     response_bytes: None,
+                    template_escape: None,
                     repeat: true,
                 }]),
                 tags: Vec::new(),
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3505,6 +3642,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3561,6 +3699,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3604,6 +3743,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3643,6 +3783,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
         mocks.insert(
@@ -3664,6 +3805,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3723,6 +3865,7 @@ mod tests {
                         response_file: None,
                         template: None,
                         response_bytes: None,
+                        template_escape: None,
                         repeat: false,
                     },
                     SequenceStep {
@@ -3732,6 +3875,7 @@ mod tests {
                         response_file: None,
                         template: None,
                         response_bytes: None,
+                        template_escape: None,
                         repeat: true,
                     },
                 ]),
@@ -3739,6 +3883,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3793,6 +3938,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3843,6 +3989,7 @@ mod tests {
                     response_file: None,
                     template: None,
                     response_bytes: None,
+                    template_escape: None,
                 },
                 MockConfig {
                     method: "POST".to_string(),
@@ -3865,6 +4012,7 @@ mod tests {
                     response_file: None,
                     template: None,
                     response_bytes: None,
+                    template_escape: None,
                 },
             ],
         );
@@ -4147,6 +4295,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -4158,6 +4307,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
             repeat: false,
         }
     }
@@ -4310,6 +4460,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
         let mocks = HashMap::from([(
             "POST:/login".to_string(),
@@ -4821,6 +4972,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -4942,6 +5094,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -5128,6 +5281,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
                 repeat: false,
             },
             SequenceStep {
@@ -5137,6 +5291,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
                 repeat: false,
             },
             SequenceStep {
@@ -5146,6 +5301,7 @@ mod tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
                 repeat: true,
             },
         ]);
@@ -5780,7 +5936,7 @@ mod tests {
 
     #[test]
     fn test_push_bounded_drops_the_oldest() {
-        let mut log: Vec<RequestRecord> = Vec::new();
+        let mut log: std::collections::VecDeque<RequestRecord> = Default::default();
         for id in 1..=10 {
             let record = RequestRecord {
                 id,
@@ -5795,7 +5951,7 @@ mod tests {
 
     #[test]
     fn test_push_bounded_with_no_cap() {
-        let mut log: Vec<RequestRecord> = Vec::new();
+        let mut log: std::collections::VecDeque<RequestRecord> = Default::default();
         for id in 1..=50 {
             push_bounded(
                 &mut log,
@@ -6266,6 +6422,7 @@ mod scenario_tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -6457,6 +6614,7 @@ mod scenario_tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
                 repeat: false,
             },
             SequenceStep {
@@ -6466,6 +6624,7 @@ mod scenario_tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
                 repeat: false,
             },
             SequenceStep {
@@ -6475,6 +6634,7 @@ mod scenario_tests {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
                 repeat: true,
             },
         ]);
@@ -6565,6 +6725,20 @@ mod scenario_tests {
             parse_bind_address(None),
             Ok(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         );
+    }
+
+    #[test]
+    fn parse_port_defaults_when_unset_or_empty_and_rejects_garbage() {
+        assert_eq!(parse_port(None), Ok(8080));
+        assert_eq!(parse_port(Some("".to_string())), Ok(8080));
+        assert_eq!(parse_port(Some("  ".to_string())), Ok(8080));
+        assert_eq!(parse_port(Some(" 9090 ".to_string())), Ok(9090));
+        // Previously an unparsable PORT silently became 8080 while an
+        // unparsable MIMIC_BIND_ADDRESS aborted; both abort now.
+        for bad in ["abc", "70000", "-1", "80.5"] {
+            let err = parse_port(Some(bad.to_string())).unwrap_err();
+            assert!(err.contains("PORT") && err.contains(bad), "{err}");
+        }
     }
 
     #[test]
@@ -7174,6 +7348,7 @@ mod cors_tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -7998,5 +8173,715 @@ mod response_file_tests {
         ] {
             assert!(!is_textual_content_type(binary), "{} is not text", binary);
         }
+    }
+}
+
+/// Request parsing and fixture escaping (#138): what the matcher and the
+/// templater see of a path, a header, a content type, and a templated body.
+#[cfg(test)]
+mod parsing_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn mocks_dir(files: &[(&str, &str)]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for (name, contents) in files {
+            fs::write(dir.path().join(name), contents).unwrap();
+        }
+        dir
+    }
+
+    fn state_from(dir: &std::path::Path) -> AppState {
+        let result = crate::loader::load_mocks_map(dir.to_str().unwrap());
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        AppState::new(Arc::new(tokio::sync::RwLock::new(result.mocks)))
+    }
+
+    async fn call(
+        state: &AppState,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        let response = handle_request(
+            method,
+            path.parse().unwrap(),
+            map,
+            State(state.clone()),
+            Body::from(body.to_string()),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (parts.status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    // ── Percent-encoded paths ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_percent_encoded_path_parameter_is_decoded() {
+        let dir = mocks_dir(&[(
+            "u.json",
+            r#"{"method":"GET","path":"/users/:name","status":200,
+                "response":{"name":"{{path.name}}"}}"#,
+        )]);
+        let state = state_from(dir.path());
+
+        let (_, body) = call(&state, Method::GET, "/users/john%20doe", &[], "").await;
+        assert_eq!(body, r#"{"name":"john doe"}"#);
+
+        let (_, body) = call(&state, Method::GET, "/users/caf%C3%A9", &[], "").await;
+        assert_eq!(body, r#"{"name":"café"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_mock_declared_with_a_decoded_path_matches_the_encoded_request() {
+        let dir = mocks_dir(&[
+            (
+                "a.json",
+                r#"{"method":"GET","path":"/files/a b.txt","status":200,"response":"space"}"#,
+            ),
+            (
+                "b.json",
+                r#"{"method":"GET","path":"/café","status":200,"response":"accent"}"#,
+            ),
+        ]);
+        let state = state_from(dir.path());
+
+        let (status, body) = call(&state, Method::GET, "/files/a%20b.txt", &[], "").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"space\""));
+        let (status, body) = call(&state, Method::GET, "/caf%C3%A9", &[], "").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "\"accent\""));
+    }
+
+    #[tokio::test]
+    async fn an_encoded_slash_stays_inside_one_segment() {
+        let dir = mocks_dir(&[(
+            "f.json",
+            r#"{"method":"GET","path":"/files/:name","status":200,
+                "response":{"name":"{{path.name}}"}}"#,
+        )]);
+        let state = state_from(dir.path());
+
+        let (status, body) = call(&state, Method::GET, "/files/a%2Fb", &[], "").await;
+        assert_eq!(status, StatusCode::OK, "%2F must not split the segment");
+        assert_eq!(body, r#"{"name":"a%2Fb"}"#);
+
+        let (status, _) = call(&state, Method::GET, "/files/a/b", &[], "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_request_log_records_the_decoded_path() {
+        let dir = mocks_dir(&[(
+            "u.json",
+            r#"{"method":"GET","path":"/users/:name","status":200,"response":{}}"#,
+        )]);
+        let state = state_from(dir.path());
+        call(&state, Method::GET, "/users/john%20doe", &[], "").await;
+
+        assert_eq!(state.request_log.read().await[0].path, "/users/john doe");
+    }
+
+    #[tokio::test]
+    async fn the_proxy_forwards_the_path_exactly_as_the_client_sent_it() {
+        use axum::routing::get;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(get(move |uri: Uri| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(uri.path().to_string());
+                "ok"
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut state = AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+        state.proxy_config = Some(Arc::new(crate::proxy::ProxyConfig::for_test(
+            format!("http://{}", addr),
+            false,
+            2000,
+        )));
+
+        let (status, _) = call(&state, Method::GET, "/users/john%20doe/a%2Fb", &[], "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.lock().unwrap()[0], "/users/john%20doe/a%2Fb");
+    }
+
+    // ── Repeated headers ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_repeated_request_header_keeps_every_value() {
+        let dir = mocks_dir(&[(
+            "h.json",
+            r#"{"method":"GET","path":"/h","status":200,
+                "response":{"tag":"{{header.x-tag}}"}}"#,
+        )]);
+        let state = state_from(dir.path());
+
+        let (_, body) = call(
+            &state,
+            Method::GET,
+            "/h",
+            &[("x-tag", "a"), ("x-tag", "b")],
+            "",
+        )
+        .await;
+
+        assert_eq!(body, r#"{"tag":"a, b"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_header_matcher_can_see_a_value_sent_on_an_earlier_line() {
+        let dir = mocks_dir(&[(
+            "h.json",
+            r#"{"method":"GET","path":"/h","status":200,"response":"hit",
+                "headers":{"required":{"x-tag":{"contains":"a"}}}}"#,
+        )]);
+        let state = state_from(dir.path());
+
+        let (status, _) = call(
+            &state,
+            Method::GET,
+            "/h",
+            &[("x-tag", "a"), ("x-tag", "b")],
+            "",
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the first line used to be overwritten"
+        );
+    }
+
+    // ── Content types ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn json_bodies_are_templated_whatever_the_content_type_spelling() {
+        let dir = mocks_dir(&[(
+            "e.json",
+            r#"{"method":"POST","path":"/echo","status":200,
+                "response":{"n":"{{body.name}}"}}"#,
+        )]);
+        let state = state_from(dir.path());
+
+        for content_type in [
+            "application/json",
+            "Application/JSON",
+            "application/json; charset=UTF-8",
+            "application/vnd.api+json",
+            "application/problem+json",
+            "application/ld+json; profile=x",
+        ] {
+            let (_, body) = call(
+                &state,
+                Method::POST,
+                "/echo",
+                &[("content-type", content_type)],
+                r#"{"name":"bob"}"#,
+            )
+            .await;
+            assert_eq!(body, r#"{"n":"bob"}"#, "content-type: {content_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn form_bodies_are_templated_whatever_the_content_type_case() {
+        let dir = mocks_dir(&[(
+            "f.json",
+            r#"{"method":"POST","path":"/f","status":200,
+                "response":{"n":"{{body.name}}"}}"#,
+        )]);
+        let state = state_from(dir.path());
+
+        let (_, body) = call(
+            &state,
+            Method::POST,
+            "/f",
+            &[(
+                "content-type",
+                "Application/X-WWW-Form-Urlencoded; charset=utf-8",
+            )],
+            "name=bob",
+        )
+        .await;
+
+        assert_eq!(body, r#"{"n":"bob"}"#);
+    }
+
+    // ── Escaping in templated fixtures ──────────────────────────────────
+
+    const JSON_NAME: &str = r#"{"name":"a\"b\\c"}"#;
+
+    fn fixture_dir(fixture: &str, mock_extra: &str, headers: &str) -> TempDir {
+        mocks_dir(&[
+            (
+                "t.json",
+                &format!(
+                    r#"{{"method":"POST","path":"/t","status":200,"template":true,
+                        "response_file":"{fixture}"{mock_extra}{headers}}}"#,
+                ),
+            ),
+            (
+                fixture,
+                match fixture {
+                    "body.json" => r#"{"n":"{{body.name}}"}"#,
+                    "body.xml" => "<n a='{{body.name}}'>{{body.name}}</n>",
+                    _ => "{{body.name}}",
+                },
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_templated_json_fixture_stays_valid_json() {
+        let dir = fixture_dir("body.json", "", "");
+        let (_, body) = call(
+            &state_from(dir.path()),
+            Method::POST,
+            "/t",
+            &[("content-type", "application/json")],
+            JSON_NAME,
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect(&body);
+        assert_eq!(parsed["n"], r#"a"b\c"#);
+    }
+
+    #[tokio::test]
+    async fn a_templated_xml_fixture_escapes_markup() {
+        let dir = fixture_dir("body.xml", "", "");
+        let (_, body) = call(
+            &state_from(dir.path()),
+            Method::POST,
+            "/t",
+            &[("content-type", "application/json")],
+            r#"{"name":"<b>&'\"x"}"#,
+        )
+        .await;
+
+        assert_eq!(
+            body,
+            "<n a='&lt;b&gt;&amp;&#39;&quot;x'>&lt;b&gt;&amp;&#39;&quot;x</n>"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_templated_csv_fixture_is_not_escaped() {
+        let dir = fixture_dir("body.csv", "", "");
+        let (_, body) = call(
+            &state_from(dir.path()),
+            Method::POST,
+            "/t",
+            &[("content-type", "application/json")],
+            JSON_NAME,
+        )
+        .await;
+
+        assert_eq!(body, r#"a"b\c"#);
+    }
+
+    #[tokio::test]
+    async fn template_escape_false_restores_raw_interpolation() {
+        let dir = fixture_dir("body.json", r#","template_escape":false"#, "");
+        let (_, body) = call(
+            &state_from(dir.path()),
+            Method::POST,
+            "/t",
+            &[("content-type", "application/json")],
+            r#"{"name":"1,\"x\":2"}"#,
+        )
+        .await;
+
+        assert_eq!(
+            body, r#"{"n":"1,"x":2"}"#,
+            "pre-formed JSON is spliced in as is"
+        );
+    }
+
+    #[tokio::test]
+    async fn escaping_follows_a_content_type_set_by_response_headers() {
+        let dir = fixture_dir(
+            "body.csv",
+            "",
+            r#","response_headers":{"Content-Type":"application/json"}"#,
+        );
+        let (_, body) = call(
+            &state_from(dir.path()),
+            Method::POST,
+            "/t",
+            &[("content-type", "application/json")],
+            JSON_NAME,
+        )
+        .await;
+
+        assert_eq!(body, r#"a\"b\\c"#);
+    }
+}
+
+/// Proxy passthrough behaviour and the request log's handling of proxied and
+/// binary bodies (#139).
+#[cfg(test)]
+mod proxy_passthrough_tests {
+    use super::*;
+    use crate::proxy::ProxyConfig;
+    use axum::routing::get;
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpListener;
+
+    async fn spawn(app: axum::Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    fn proxy_state(
+        upstream: &str,
+        record_dir: Option<&std::path::Path>,
+        buffer: usize,
+    ) -> AppState {
+        let mut state = AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+        let mut cfg = ProxyConfig::for_test(upstream.to_string(), record_dir.is_some(), 2000);
+        cfg.buffer_limit = buffer;
+        state.proxy_config = Some(Arc::new(cfg));
+        if let Some(dir) = record_dir {
+            state.mocks_dir = dir.to_str().unwrap().to_string();
+        }
+        state
+    }
+
+    async fn request(state: &AppState, path: &str) -> Response {
+        handle_request(
+            Method::GET,
+            path.parse().unwrap(),
+            HeaderMap::new(),
+            State(state.clone()),
+            Body::empty(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_upstream_redirect_reaches_the_client_unfollowed() {
+        let upstream = spawn(axum::Router::new().route(
+            "/old",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/new")],
+                    "",
+                )
+            }),
+        ))
+        .await;
+        let state = proxy_state(&upstream, None, 1024);
+
+        let response = request(&state, "/old").await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()["location"], "/new");
+        assert_eq!(state.request_log.read().await[0].response_status, 302);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_recorded_as_a_redirect() {
+        let upstream = spawn(axum::Router::new().route(
+            "/old",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(axum::http::header::LOCATION, "/new")],
+                    "",
+                )
+            }),
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxy_state(&upstream, Some(dir.path()), 1024);
+
+        request(&state, "/old").await;
+        // Recording runs detached.
+        let recorded = dir.path().join("_recorded");
+        for _ in 0..50 {
+            if recorded.exists() && std::fs::read_dir(&recorded).unwrap().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let file = std::fs::read_dir(&recorded)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let mock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(mock["status"], 301);
+        assert_eq!(mock["response_headers"]["location"], "/new");
+    }
+
+    #[tokio::test]
+    async fn a_response_past_the_buffer_limit_is_streamed_intact_and_not_recorded() {
+        let big: String = "0123456789abcdef".repeat(4096); // 64 KiB
+        let served = big.clone();
+        let upstream = spawn(axum::Router::new().route(
+            "/big",
+            get(move || {
+                let served = served.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "text/plain")], served) }
+            }),
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxy_state(&upstream, Some(dir.path()), 1024);
+
+        let response = request(&state, "/big").await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(body.len(), big.len());
+        assert_eq!(body, Bytes::from(big));
+        let logged = state.request_log.read().await[0]
+            .response_body
+            .clone()
+            .unwrap();
+        assert!(
+            logged.starts_with("<streamed response of text/plain"),
+            "{logged}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !dir.path().join("_recorded").exists(),
+            "a streamed response must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_within_the_limit_is_buffered_logged_and_recorded() {
+        let upstream = spawn(axum::Router::new().route(
+            "/small",
+            get(|| async { ([(axum::http::header::CONTENT_TYPE, "text/plain")], "hello") }),
+        ))
+        .await;
+        let state = proxy_state(&upstream, None, 1024);
+
+        let response = request(&state, "/small").await;
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from("hello")
+        );
+        assert_eq!(
+            state.request_log.read().await[0].response_body.as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_reaches_the_client_as_it_is_produced() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<&'static str>(4);
+        let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let upstream = spawn(axum::Router::new().route(
+            "/events",
+            get(move || {
+                let rx = rx.clone();
+                async move {
+                    let rx = rx.lock().await.take().unwrap();
+                    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                        rx.recv()
+                            .await
+                            .map(|chunk| (Ok::<_, std::io::Error>(Bytes::from(chunk)), rx))
+                    });
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = proxy_state(&upstream, None, 10 * 1024 * 1024);
+
+        tx.send("data: one\n\n").await.unwrap();
+        let started = Instant::now();
+        let response = request(&state, "/events").await;
+        let mut body = response.into_body();
+
+        // The first event has to arrive while the upstream is still open;
+        // buffering to the limit (or to the end) would hang here.
+        let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("the first event should not wait for the stream to end")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.into_data().unwrap(), Bytes::from("data: one\n\n"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        tx.send("data: two\n\n").await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.into_data().unwrap(), Bytes::from("data: two\n\n"));
+    }
+
+    #[tokio::test]
+    async fn a_slow_body_that_keeps_making_progress_outlives_the_timeout() {
+        // Five chunks 150 ms apart: 750 ms in all, against a 300 ms timeout
+        // that now applies to each wait rather than to the whole exchange.
+        let upstream = spawn(axum::Router::new().route(
+            "/slow",
+            get(|| async {
+                let stream = futures_util::stream::unfold(0u8, |n| async move {
+                    if n == 5 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Some((Ok::<_, std::io::Error>(Bytes::from(format!("{n};"))), n + 1))
+                });
+                Body::from_stream(stream)
+            }),
+        ))
+        .await;
+        let mut state = proxy_state(&upstream, None, 10 * 1024 * 1024);
+        state.proxy_config = Some(Arc::new(ProxyConfig::for_test(
+            upstream.clone(),
+            false,
+            300,
+        )));
+
+        let response = request(&state, "/slow").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from("0;1;2;3;4;")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_upstream_body_is_logged_as_a_descriptor() {
+        let upstream = spawn(axum::Router::new().route(
+            "/bin",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                    vec![0xffu8, 0xfe, 0x00, 0x01],
+                )
+            }),
+        ))
+        .await;
+        let state = proxy_state(&upstream, None, 1024);
+
+        let response = request(&state, "/bin").await;
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(&[0xff, 0xfe, 0x00, 0x01])
+        );
+        assert_eq!(
+            state.request_log.read().await[0].response_body.as_deref(),
+            Some("<4 bytes of application/octet-stream>")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_request_body_is_logged_as_a_descriptor_not_dropped() {
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "image/png".parse().unwrap());
+
+        handle_request(
+            Method::POST,
+            "/upload".parse().unwrap(),
+            headers,
+            State(state.clone()),
+            Body::from(vec![0x89u8, 0x50, 0x4e, 0x47, 0xff, 0xfe]),
+        )
+        .await;
+
+        assert_eq!(
+            state.request_log.read().await[0].body.as_deref(),
+            Some("<6 bytes of image/png>")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_request_body_is_still_logged_as_none() {
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+        request(&state, "/nothing").await;
+        assert_eq!(state.request_log.read().await[0].body, None);
+    }
+
+    // ── Admin token ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bearer_token_accepts_any_case_of_the_scheme() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER   abc "), Some("abc"));
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer   "), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("abc"), None);
+    }
+
+    #[test]
+    fn constant_time_eq_agrees_with_equality() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"secre", b"secret"));
+        assert!(!constant_time_eq(b"secret", b""));
+    }
+
+    #[tokio::test]
+    async fn the_admin_token_is_accepted_with_a_lowercase_scheme() {
+        let state = AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())))
+            .with_admin_token(Some("tok".to_string()));
+        let app = axum::Router::new()
+            .route("/admin/mocks", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_token,
+            ));
+
+        let status = |auth: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                use tower::ServiceExt;
+                let mut req = axum::http::Request::builder().uri("/admin/mocks");
+                if let Some(value) = auth {
+                    req = req.header("authorization", value);
+                }
+                app.oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        assert_eq!(status(Some("Bearer tok")).await, StatusCode::OK);
+        assert_eq!(status(Some("bearer tok")).await, StatusCode::OK);
+        assert_eq!(status(Some("BEARER tok")).await, StatusCode::OK);
+        assert_eq!(status(Some("Bearer tok2")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(Some("Bearer to")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(Some("Basic tok")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(None).await, StatusCode::UNAUTHORIZED);
     }
 }
