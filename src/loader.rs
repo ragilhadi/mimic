@@ -458,6 +458,27 @@ fn is_mock_file(path: &Path) -> bool {
         .is_some_and(|ext| MOCK_EXTENSIONS.contains(&ext))
 }
 
+/// How many directory levels the walk follows before giving up and reporting
+/// a cycle rather than continuing silently.
+///
+/// This is a backstop for whatever `visited` can't catch — a dangling or
+/// otherwise uncanonicalizable symlink — not a limit any real mocks tree
+/// should come near. `visited`, keyed by canonical path, is what actually
+/// stops an ordinary symlink cycle after one extra level.
+const MAX_WALK_DEPTH: usize = 64;
+
+/// Everything one level of [`collect_mock_files`]'s recursion needs, bundled
+/// so adding a cross-cycle concern (the cache, the change flag) doesn't mean
+/// adding another positional parameter to every recursive call.
+struct ScanState<'a> {
+    scanned: &'a mut Vec<(PathBuf, Result<LoadedMock, String>)>,
+    errors: &'a mut Vec<(PathBuf, String)>,
+    visited: &'a mut HashSet<PathBuf>,
+    cache: &'a mut LoaderCache,
+    changed: &'a mut bool,
+    seen: &'a mut HashSet<PathBuf>,
+}
+
 /// Recursively collects and loads all `.json`/`.yaml`/`.yml` mock files from a
 /// directory tree.
 ///
@@ -470,27 +491,6 @@ fn is_mock_file(path: &Path) -> bool {
 /// counter. Sorting makes bucket order a pure function of the file names:
 /// depth-first, alphabetical by full path, with a subdirectory visited at the
 /// point its own name sorts in.
-/// How many directory levels the walk follows before giving up and reporting
-/// a cycle rather than continuing silently.
-///
-/// This is a backstop for whatever `visited` can't catch — a dangling or
-/// otherwise uncanonicalizable symlink — not a limit any real mocks tree
-/// should come near. `visited`, keyed by canonical path, is what actually
-/// stops an ordinary symlink cycle after one extra level.
-const MAX_WALK_DEPTH: usize = 64;
-
-/// Everything one level of [`collect_json_files`]'s recursion needs, bundled
-/// so adding a cross-cycle concern (the cache, the change flag) doesn't mean
-/// adding another positional parameter to every recursive call.
-struct ScanState<'a> {
-    scanned: &'a mut Vec<(PathBuf, Result<LoadedMock, String>)>,
-    errors: &'a mut Vec<(PathBuf, String)>,
-    visited: &'a mut HashSet<PathBuf>,
-    cache: &'a mut LoaderCache,
-    changed: &'a mut bool,
-    seen: &'a mut HashSet<PathBuf>,
-}
-
 fn collect_mock_files(
     dir: &Path,
     root: &Path,
