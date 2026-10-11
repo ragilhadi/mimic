@@ -190,8 +190,16 @@ MIMIC_PROXY_UPSTREAM=https://api.example.com
 MIMIC_RECORD_UPSTREAM=true
 
 # How long to wait for the upstream before falling back to a 404, in
-# milliseconds (default: 5000)
+# milliseconds (default: 5000). Applies to connecting and to each wait for the
+# upstream to send something (headers, then every chunk) — not to the whole
+# exchange, so a large or slow response that keeps making progress is fine.
 MIMIC_PROXY_TIMEOUT_MS=5000
+
+# How much of an upstream response is held in memory for the request log and for
+# recording, in bytes (default: 10485760). A bigger response, and any
+# text/event-stream, is streamed to the client as it arrives instead — logged as
+# a descriptor and not recorded. 0 = always buffer.
+MIMIC_PROXY_BUFFER_LIMIT=10485760
 ```
 
 **Log Levels**:
@@ -293,6 +301,7 @@ INFO mimic: Loaded 31 mock(s)
 - `response` - JSON response body (can be object, array, or null)
 - `response_file` - (Optional) Serve the body from a file next to the mock instead of `response`; see [File-Backed Responses](#-file-backed-responses-response_file)
 - `template` - (Optional) Boolean enabling `{{...}}` templating inside a `response_file` body (default: `false`)
+- `template_escape` - (Optional) Set `false` to interpolate raw values into a templated `response_file` instead of escaping them for its content type (default: `true`)
 - `consume_body` - (Optional) Boolean to control request body consumption (default: `false`)
   - `true` - Consume request body (required for file uploads, multipart/form-data)
   - `false` - Skip body consumption (faster, default behavior)
@@ -704,7 +713,11 @@ and templating.
 
 ### Header Matching
 
-Match requests based on HTTP headers:
+Match requests based on HTTP headers. Header names are case-insensitive. A header
+the client sends more than once (`X-Tag: a` and `X-Tag: b`) is seen as the values
+joined with `, ` in the order received (`a, b`), by matchers and by
+`{{header.x-tag}}` alike — use `contains`/`regex` rather than an exact match for
+those.
 
 **File**: `mocks/get_protected.json`
 
@@ -1213,6 +1226,14 @@ expressions a `response` supports:
 
 Templating is **off by default** and never runs on a binary content type, so a
 PNG that happens to contain the bytes `{{` is still a PNG.
+
+Interpolated values are **escaped for the document they land in**: JSON string
+escaping for a JSON body (so a name containing `"` can't break the document),
+entity escaping (`& < > " '`) for XML/HTML, and none for anything else (CSV,
+plain text). The content type is the one the response is served with, including
+one set in `response_headers`. A fixture that deliberately splices in pre-formed
+JSON or markup can opt out with `"template_escape": false` (on the mock or on a
+sequence step).
 
 ### Sequences
 
@@ -2039,7 +2060,8 @@ curl http://localhost:8080/v1/charges/ch_123
 ```bash
 MIMIC_PROXY_UPSTREAM=https://api.example.com   # unset (default) = unchanged 404 behavior
 MIMIC_RECORD_UPSTREAM=false                     # opt-in recording of proxied responses
-MIMIC_PROXY_TIMEOUT_MS=5000                     # how long to wait for the upstream
+MIMIC_PROXY_TIMEOUT_MS=5000                     # connect / per-read wait for the upstream
+MIMIC_PROXY_BUFFER_LIMIT=10485760               # bytes buffered for the log + recording; more is streamed
 MIMIC_RECORD_MATCH_HEADERS=                     # extra request headers to pin as matchers (comma-separated)
 ```
 
@@ -2073,7 +2095,9 @@ Files land at `mocks/_recorded/<method>_<sanitized-path>_<n>.json` — e.g. `moc
 - **A repeat of the same request doesn't re-record.** Once a given request shape has been recorded this run, later identical proxy calls (before the file has been hot-reloaded in, or if recording is on but nothing changed) are skipped rather than rewritten.
 - **What Mimic reserves for itself is never proxied.** The health check and the admin API's own endpoints — see [Reserved endpoints](#reserved-endpoints) — are excluded even with no local mock behind them, so `MIMIC_PROXY_UPSTREAM` can't leak them onto the upstream. A path that merely starts with `/admin/` but isn't one Mimic answers (a typo, or an endpoint you're mocking) is an ordinary request and proxies like any other.
 - **Self-referential upstreams are rejected at startup.** An upstream that resolves to Mimic's own listening address (e.g. `MIMIC_PROXY_UPSTREAM=http://localhost:8080` while Mimic itself listens on `8080`) disables proxying with a warning, instead of looping forever.
-- **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`.
+- **A slow or unreachable upstream falls back to the usual 404**, with an added `"upstream_error"` field explaining why — never an indefinitely hanging request. The wait is capped by `MIMIC_PROXY_TIMEOUT_MS`, which bounds connecting and each wait for the upstream to send something — a response that is large or slow but keeps arriving is not cut off.
+- **Redirects are passed through, not followed.** An upstream `301`/`302`/`307`… reaches the client as it is (status and `Location`), and a recording keeps the redirect rather than the page it points to.
+- **Large and streaming responses are streamed.** Up to `MIMIC_PROXY_BUFFER_LIMIT` of a response is buffered so it can be logged and recorded; past that, and for `text/event-stream` from the first byte, the body is passed to the client as it arrives. Such a response is logged as `<streamed response of …>` and never recorded. Binary responses are logged as `<N bytes of type>`, like mock responses.
 - **A gzip/deflate/brotli-compressed upstream response is decoded before it's forwarded or recorded** (#106) — Mimic's HTTP client decompresses these automatically, so both the live response the client gets and the recorded mock's `response` are plain text/JSON, never the raw compressed bytes a previous version could silently mangle into mojibake. This costs a modestly larger binary (three extra decompression codecs statically linked in); worth it for a proxy whose whole job is to be transparent about what an upstream actually said. An encoding this build doesn't recognize (anything outside gzip/deflate/brotli) is left exactly as the upstream sent it — forwarded to the client unchanged, and skipped from recording (with a `warn!`) rather than written as a corrupt mock.
 
 ---
@@ -2216,7 +2240,7 @@ MIMIC_ADMIN_TOKEN=s3cret mimic
 curl -H 'Authorization: Bearer s3cret' http://localhost:8080/admin/requests
 ```
 
-Without the header, those endpoints answer `401 {"error": "unauthorized"}`.
+Without the header, those endpoints answer `401 {"error": "unauthorized"}`. The `Bearer` scheme is case-insensitive (`bearer s3cret` works); the token is compared in constant time.
 Two things stay open on purpose: `/health`, because liveness probes call it
 and carry no credentials, and any path under the admin prefix that Mimic
 doesn't itself answer (`GET /admin/users`), because that's an ordinary mock.

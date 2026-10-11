@@ -1362,6 +1362,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 

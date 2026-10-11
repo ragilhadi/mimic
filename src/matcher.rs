@@ -353,6 +353,56 @@ pub(crate) fn decode_component(raw: &str) -> String {
         .into_owned()
 }
 
+/// Percent-decode a request path, one segment at a time.
+///
+/// Unlike a query string, a path has no `+`-means-space rule, so only `%XX`
+/// escapes are decoded. Decoding happens per segment, after splitting on `/`,
+/// and an encoded slash (`%2F`) is left encoded: `/files/a%2Fb` is one segment
+/// named `a%2Fb`, and must not turn into the two-segment path `/files/a/b`. A
+/// segment whose escapes don't decode to valid UTF-8 is kept as the client sent
+/// it rather than guessed at.
+pub(crate) fn decode_path(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_string();
+    }
+
+    raw.split('/')
+        .map(decode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn decode_path_segment(segment: &str) -> String {
+    if !segment.contains('%') {
+        return segment.to_string();
+    }
+
+    // Split around `%2F`/`%2f` so the slash survives decoding.
+    let mut pieces: Vec<String> = Vec::new();
+    let mut rest = segment;
+    loop {
+        match rest.to_ascii_lowercase().find("%2f") {
+            Some(at) => {
+                pieces.push(rest[..at].to_string());
+                rest = &rest[at + 3..];
+            }
+            None => {
+                pieces.push(rest.to_string());
+                break;
+            }
+        }
+    }
+
+    let mut decoded = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        match urlencoding::decode(piece) {
+            Ok(text) => decoded.push(text.into_owned()),
+            Err(_) => return segment.to_string(),
+        }
+    }
+    decoded.join("%2F")
+}
+
 /// Parse a query string into every value each key carried, in the order the
 /// client sent them.
 /// Example: "tag=a&tag=b" -> {"tag": ["a", "b"]}
@@ -521,14 +571,32 @@ fn match_query_param_value(
 // ============================================================================
 
 /// Parse HTTP headers into HashMap (normalized to lowercase)
+///
+/// A header sent more than once — `X-Tag: a` and `X-Tag: b`, or the several
+/// `Cookie` lines an HTTP/2 client splits one into — keeps every value, joined
+/// with `, ` in the order received (RFC 9110 §5.3), instead of letting the last
+/// one overwrite the rest. A value that isn't valid UTF-8 is kept lossily rather
+/// than dropped: a matcher on a header the client really sent should see it,
+/// not report it absent.
 pub fn parse_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
-    let mut parsed = HashMap::new();
+    let mut parsed: HashMap<String, String> = HashMap::new();
 
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
+        let value_str = match value.to_str() {
+            Ok(text) => Cow::Borrowed(text),
+            Err(_) => String::from_utf8_lossy(value.as_bytes()),
+        };
 
-        if let Ok(value_str) = value.to_str() {
-            parsed.insert(name_str, value_str.to_string());
+        match parsed.entry(name_str) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                let joined = existing.get_mut();
+                joined.push_str(", ");
+                joined.push_str(&value_str);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(value_str.into_owned());
+            }
         }
     }
 
@@ -726,6 +794,25 @@ pub enum ParsedBody {
     Empty,
 }
 
+/// The media type of a `Content-Type` value: parameters dropped, trimmed,
+/// lowercased. Media types are case-insensitive (RFC 9110 §8.3.1), so
+/// `Application/JSON; charset=UTF-8` and `application/json` are the same type.
+pub(crate) fn media_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// True for `application/json` and any structured-syntax `+json` type
+/// (`application/vnd.api+json`, `application/problem+json`, `application/ld+json`).
+pub(crate) fn is_json_media_type(content_type: &str) -> bool {
+    let media = media_type(content_type);
+    media == "application/json" || media.ends_with("+json")
+}
+
 /// Parse request body based on content type
 pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
     if bytes.is_empty() {
@@ -733,7 +820,7 @@ pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
     }
 
     match content_type {
-        Some(ct) if ct.contains("application/json") => {
+        Some(ct) if is_json_media_type(ct) => {
             match serde_json::from_slice(bytes) {
                 Ok(json) => ParsedBody::Json(json),
                 Err(e) => {
@@ -744,13 +831,13 @@ pub fn parse_body(bytes: &Bytes, content_type: Option<&str>) -> ParsedBody {
             }
         }
 
-        Some(ct) if ct.contains("application/x-www-form-urlencoded") => {
+        Some(ct) if media_type(ct) == "application/x-www-form-urlencoded" => {
             let text = String::from_utf8_lossy(bytes);
             let form = parse_form_data(&text);
             ParsedBody::Form(form)
         }
 
-        Some(ct) if ct.starts_with("text/") => {
+        Some(ct) if media_type(ct).starts_with("text/") => {
             ParsedBody::Text(String::from_utf8_lossy(bytes).to_string())
         }
 
@@ -1107,10 +1194,17 @@ fn form_body_reject_reason(
 pub struct CompiledPathPattern {
     pub regex: Regex,
     pub param_names: Vec<String>,
+    /// How many `/` the template contains — and so any path it can match.
+    slashes: usize,
 }
 
 /// True if any path segment uses `:name` or `{name}` parameter syntax.
 pub fn is_pattern_path(path: &str) -> bool {
+    // Every parameter syntax contains `:` or `{`; most routes contain neither,
+    // and this runs once per registered route per unmatched-exact request.
+    if !path.contains([':', '{']) {
+        return false;
+    }
     path.split('/').any(|segment| {
         (segment.starts_with(':') && segment.len() > 1)
             || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
@@ -1166,12 +1260,49 @@ fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
 
     let pattern = format!("^{}$", regex_parts.join("/"));
     match Regex::new(&pattern) {
-        Ok(regex) => Some(CompiledPathPattern { regex, param_names }),
+        Ok(regex) => Some(CompiledPathPattern {
+            regex,
+            param_names,
+            slashes: path.bytes().filter(|&b| b == b'/').count(),
+        }),
         Err(e) => {
             warn!("Invalid path parameter pattern '{}': {}", path, e);
             None
         }
     }
+}
+
+/// A cheap necessary condition for `template` (a declared pattern path) to
+/// match `request_path`: the same number of segments, and the same first segment
+/// whenever the template's first segment is a literal.
+///
+/// A request is checked against every pattern route registered for its method,
+/// so this runs once per route; rejecting the great majority here keeps the cache
+/// lookup and the regex off that loop. It never rejects a path the template
+/// would match.
+fn template_may_match(template: &str, request_path: &str) -> bool {
+    let slashes = |s: &str| s.bytes().filter(|&b| b == b'/').count();
+    if slashes(template) != slashes(request_path) {
+        return false;
+    }
+    let template_first = template
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let is_param = |seg: &str| {
+        (seg.starts_with(':') && seg.len() > 1)
+            || (seg.starts_with('{') && seg.ends_with('}') && seg.len() > 2)
+    };
+    if is_param(template_first) {
+        return true;
+    }
+    request_path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        == template_first
 }
 
 /// Match a concrete request path against a compiled pattern, returning the
@@ -1180,6 +1311,13 @@ pub fn match_path_pattern(
     pattern: &CompiledPathPattern,
     request_path: &str,
 ) -> Option<HashMap<String, String>> {
+    // A template matches only paths with the same number of segments, so the
+    // vast majority of non-matching routes are rejected by counting slashes —
+    // cheaper than running the regex, and a request is checked against every
+    // pattern route registered for its method.
+    if request_path.bytes().filter(|&b| b == b'/').count() != pattern.slashes {
+        return None;
+    }
     let caps = pattern.regex.captures(request_path)?;
     let mut params = HashMap::with_capacity(pattern.param_names.len());
     for (i, name) in pattern.param_names.iter().enumerate() {
@@ -1263,9 +1401,6 @@ pub struct MatchResult {
     /// mock's declared path (which may be a pattern like `/users/:id`),
     /// not necessarily the concrete request path
     pub matched_key: String,
-    /// Number of literal (non-parameter) segments in the mock's declared
-    /// path, used to break score ties in favor of the more specific route
-    pub specificity: u32,
     /// The components `score` was assembled from, so the win can be explained
     /// without re-running the matchers
     pub breakdown: ScoreBreakdown,
@@ -1466,6 +1601,9 @@ fn scan_candidates_at(
         if !is_pattern_path(path_part) {
             continue;
         }
+        if !template_may_match(path_part, path) {
+            continue;
+        }
         let Some(pattern) = compile_path_pattern(path_part) else {
             continue;
         };
@@ -1573,7 +1711,19 @@ fn find_matching_mock_at(
         base_key
     );
 
-    let mut candidates: Vec<MatchResult> = Vec::new();
+    // Candidates borrow their mock. A deep copy of a mock (its whole response
+    // body) used to be made for every candidate that matched, to be thrown away
+    // for every one but the winner; only the winner is cloned now.
+    struct Candidate<'a> {
+        mock: &'a MockConfig,
+        score: u32,
+        index: usize,
+        path_params: HashMap<String, String>,
+        matched_key: String,
+        specificity: u32,
+        breakdown: ScoreBreakdown,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     // Exact match: O(1) lookup, no path params, full score.
     if let Some(mock_list) = mocks.get(&base_key) {
@@ -1585,16 +1735,14 @@ fn find_matching_mock_at(
                 continue;
             }
             if let Some(breakdown) = calculate_match_score(context, mock) {
-                candidates.push(MatchResult {
-                    mock: mock.clone(),
+                candidates.push(Candidate {
+                    mock,
                     score: breakdown.total(),
                     index,
                     path_params: HashMap::new(),
                     matched_key: base_key.clone(),
                     specificity: path_specificity(lookup_path),
                     breakdown,
-                    trailing_slash_normalized: false,
-                    head_from_get: false,
                 });
             }
         }
@@ -1616,6 +1764,9 @@ fn find_matching_mock_at(
             if !is_pattern_path(path_part) {
                 continue;
             }
+            if !template_may_match(path_part, lookup_path) {
+                continue;
+            }
             let Some(pattern) = compile_path_pattern(path_part) else {
                 continue;
             };
@@ -1628,16 +1779,14 @@ fn find_matching_mock_at(
                     continue;
                 }
                 if let Some(breakdown) = calculate_match_score(context, mock) {
-                    candidates.push(MatchResult {
-                        mock: mock.clone(),
+                    candidates.push(Candidate {
+                        mock,
                         score: breakdown.total().saturating_sub(PATTERN_MATCH_PENALTY),
                         index,
                         path_params: params.clone(),
                         matched_key: key.clone(),
                         specificity: path_specificity(path_part),
                         breakdown,
-                        trailing_slash_normalized: false,
-                        head_from_get: false,
                     });
                 }
             }
@@ -1663,7 +1812,16 @@ fn find_matching_mock_at(
 
     if let Some(best) = candidates.into_iter().next() {
         debug!("Found matching mock with score {}", best.score);
-        Some(best)
+        Some(MatchResult {
+            mock: best.mock.clone(),
+            score: best.score,
+            index: best.index,
+            path_params: best.path_params,
+            matched_key: best.matched_key,
+            breakdown: best.breakdown,
+            trailing_slash_normalized: false,
+            head_from_get: false,
+        })
     } else {
         debug!("No matching mock found");
         None
@@ -1871,6 +2029,9 @@ fn accumulate_candidates_for(
             continue;
         };
         if !is_pattern_path(path_part) {
+            continue;
+        }
+        if !template_may_match(path_part, lookup_path) {
             continue;
         }
         let Some(pattern) = compile_path_pattern(path_part) else {
@@ -2630,6 +2791,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         };
 
         let mocks = HashMap::from([(
@@ -2758,6 +2920,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -3281,6 +3444,7 @@ mod tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -3655,6 +3819,7 @@ mod benches {
                     response_file: None,
                     template: None,
                     response_bytes: None,
+                    template_escape: None,
                 }],
             );
         }
@@ -3677,6 +3842,7 @@ mod benches {
                 response_file: None,
                 template: None,
                 response_bytes: None,
+                template_escape: None,
             }],
         );
 
@@ -3744,6 +3910,7 @@ mod explanation_tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -4402,6 +4569,7 @@ mod scenario_tests {
             response_file: None,
             template: None,
             response_bytes: None,
+            template_escape: None,
         }
     }
 
@@ -4605,5 +4773,174 @@ mod scenario_tests {
 
         assert!(!explanation.contains("inactive tags"), "{}", explanation);
         assert!(explanation.contains("POST"), "{}", explanation);
+    }
+}
+
+/// Parsing helpers fixed in #138.
+#[cfg(test)]
+mod request_parsing_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn decode_path_decodes_each_segment_but_keeps_encoded_slashes() {
+        assert_eq!(decode_path("/plain/path"), "/plain/path");
+        assert_eq!(decode_path("/a%20b/c%C3%A9"), "/a b/cé");
+        assert_eq!(decode_path("/a%2Fb"), "/a%2Fb");
+        assert_eq!(decode_path("/a%2fb%20c"), "/a%2Fb c");
+        // `+` is a space only in query strings and forms.
+        assert_eq!(decode_path("/a+b"), "/a+b");
+        // A literal percent that isn't an escape is left alone.
+        assert_eq!(decode_path("/100%"), "/100%");
+    }
+
+    #[test]
+    fn decode_path_keeps_a_segment_that_is_not_valid_utf8() {
+        assert_eq!(decode_path("/x/%FF%FE/y"), "/x/%FF%FE/y");
+    }
+
+    #[test]
+    fn media_type_ignores_case_parameters_and_whitespace() {
+        assert_eq!(
+            media_type(" Application/JSON ; charset=UTF-8"),
+            "application/json"
+        );
+        assert!(is_json_media_type("application/vnd.api+json"));
+        assert!(is_json_media_type("APPLICATION/Problem+JSON"));
+        assert!(!is_json_media_type("application/jsonp"));
+        assert!(!is_json_media_type("text/plain"));
+    }
+
+    #[test]
+    fn parse_headers_joins_repeated_headers_in_arrival_order() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-tag", HeaderValue::from_static("a"));
+        headers.append("x-other", HeaderValue::from_static("1"));
+        headers.append("x-tag", HeaderValue::from_static("b"));
+
+        let parsed = parse_headers(&headers);
+
+        assert_eq!(parsed["x-tag"], "a, b");
+        assert_eq!(parsed["x-other"], "1");
+    }
+
+    #[test]
+    fn parse_headers_keeps_a_non_utf8_value_lossily() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-raw", HeaderValue::from_bytes(b"caf\xe9").unwrap());
+
+        let parsed = parse_headers(&headers);
+
+        assert_eq!(parsed["x-raw"], "caf\u{fffd}");
+    }
+}
+
+/// Timing probe for per-request matching cost (#139). Ignored by default; run
+/// with `cargo test --release -- --ignored --nocapture matching_cost`.
+#[cfg(test)]
+mod matching_cost {
+    use super::*;
+    use crate::types::MockConfig;
+    use std::time::Instant;
+
+    fn big_mock(method: &str, path: &str) -> MockConfig {
+        MockConfig {
+            method: method.to_string(),
+            path: path.to_string(),
+            status: 200,
+            // A response with some weight, so a per-candidate clone shows up.
+            response: serde_json::json!({
+                "items": (0..40).map(|i| serde_json::json!({"id": i, "name": format!("item {i}"), "tags": ["a","b","c"]})).collect::<Vec<_>>()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn matching_cost() {
+        let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
+        for i in 0..500 {
+            let m = big_mock("GET", &format!("/exact/{i}"));
+            mocks
+                .entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+            let m = big_mock("GET", &format!("/p{i}/:id"));
+            mocks
+                .entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+        }
+        // Several competing mocks on one path: the per-candidate clone case.
+        for _ in 0..10 {
+            let m = big_mock("GET", "/shared");
+            mocks
+                .entry(crate::types::create_mock_key(&m.method, &m.path))
+                .or_default()
+                .push(m);
+        }
+
+        let time = |label: &str, path: &str| {
+            let ctx = RequestContext::new("GET".into(), path.into());
+            let n = 5000;
+            let start = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(find_matching_mock(&ctx, &mocks, None));
+            }
+            println!(
+                "{label:<28} {:>8.1} µs/request",
+                start.elapsed().as_secs_f64() * 1e6 / n as f64
+            );
+        };
+        time("exact hit", "/exact/250");
+        time("shared path (10 candidates)", "/shared");
+        time("pattern hit (500 patterns)", "/p499/7");
+        time("miss (scans every key)", "/nothing/here");
+    }
+}
+
+#[cfg(test)]
+mod pattern_prefilter_tests {
+    use super::*;
+
+    /// The prefilter is only a shortcut: it must never turn away a path the
+    /// compiled template would have matched.
+    #[test]
+    fn template_may_match_never_rejects_a_path_the_pattern_matches() {
+        let cases = [
+            ("/users/:id", "/users/42"),
+            ("/users/{id}", "/users/42"),
+            ("/:resource/:id", "/orders/7"),
+            ("/{a}/x/{b}", "/anything/x/else"),
+            ("/api/v1/users/:id/posts/:post", "/api/v1/users/3/posts/9"),
+            ("/users/:id/", "/users/42/"),
+            ("/:id", "/42"),
+        ];
+        for (template, path) in cases {
+            let pattern = compile_path_pattern(template).expect(template);
+            assert!(
+                match_path_pattern(&pattern, path).is_some(),
+                "{template} should match {path}"
+            );
+            assert!(template_may_match(template, path), "{template} vs {path}");
+        }
+    }
+
+    #[test]
+    fn template_may_match_rejects_the_obvious_misses() {
+        assert!(!template_may_match("/users/:id", "/users/42/extra"));
+        assert!(!template_may_match("/users/:id", "/orders/42"));
+        assert!(!template_may_match("/users/:id", "/users"));
+        assert!(template_may_match("/:any/:id", "/orders/42"));
+    }
+
+    #[test]
+    fn is_pattern_path_still_recognises_every_parameter_syntax() {
+        assert!(is_pattern_path("/users/:id"));
+        assert!(is_pattern_path("/users/{id}"));
+        assert!(!is_pattern_path("/users/42"));
+        assert!(!is_pattern_path("/users/:"));
+        assert!(!is_pattern_path("/users/{}"));
     }
 }
