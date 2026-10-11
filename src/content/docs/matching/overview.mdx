@@ -64,6 +64,9 @@ Strict mode is useful for security-style tests (you don't want a request with ex
   <Card title="Trailing-Slash Tolerance" icon="random">
     `/things` and `/things/` are treated as the same endpoint when nothing distinguishes them. See [Trailing-Slash Tolerance](/matching/trailing-slash/).
   </Card>
+  <Card title="HEAD Requests" icon="information">
+    A `HEAD` with no mock of its own is answered from the matching `GET` mock, minus the body. See [HEAD Requests](/matching/head-requests/).
+  </Card>
 </CardGrid>
 
 <Aside type="tip">

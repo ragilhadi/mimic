@@ -32,6 +32,7 @@ The bound address is always visible — it's printed in the startup log next to 
 | `MIMIC_MAX_BODY_SIZE` | `10485760` (10 MB) | Maximum request body Mimic will buffer, in bytes. Requests over the limit get `413 Payload Too Large`. |
 | `MIMIC_MAX_RESPONSE_FILE` | `10485760` (10 MB) | Largest file a mock may serve with [`response_file`](/dynamic-responses/response-file/), in bytes. `0` removes the cap. |
 | `MIMIC_STRICT_TRAILING_SLASH` | `false` | Disable [trailing-slash tolerance](/matching/trailing-slash/) — `/things` and `/things/` become distinct paths again. |
+| `MIMIC_HEAD_FROM_GET` | `true` | Answer a `HEAD` from the mock the matching `GET` would have used. `false` = a `HEAD` is answered only by an explicit `HEAD` mock. See [HEAD Requests](/matching/head-requests/). |
 | `MIMIC_STRICT_IGNORE_HEADERS` | unset | Comma-separated header names to add to [strict header mode](/matching/headers/#strict-modes-built-in-ignore-list)'s built-in ignore list. |
 
 ## Health & Admin
@@ -84,6 +85,7 @@ See [Built-in CORS](/guides/cors/).
 | `MIMIC_PROXY_UPSTREAM` | unset | Forward unmatched requests to this upstream instead of 404ing. |
 | `MIMIC_RECORD_UPSTREAM` | `false` | Record proxied responses as new mock files. |
 | `MIMIC_PROXY_TIMEOUT_MS` | `5000` | How long to wait for the upstream before falling back to a 404. |
+| `MIMIC_PROXY_BUFFER_LIMIT` | `10485760` | Bytes of an upstream response buffered for the log and recording; larger or `text/event-stream` responses are streamed. `0` = always buffer. |
 | `MIMIC_RECORD_MATCH_HEADERS` | unset | Extra request headers to pin as matchers on a recording, comma-separated. |
 
 See [Proxy & Record-and-Replay](/guides/proxy/).
