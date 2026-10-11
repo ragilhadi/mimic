@@ -16,7 +16,7 @@ use axum::{
 };
 use handler::{
     admin_dashboard, clear_requests, configured_active_tags, configured_bind_address,
-    configured_port, get_scenario, handle_request, health_check, list_mocks, list_requests,
+    configured_port_checked, get_scenario, handle_request, health_check, list_mocks, list_requests,
     list_sequences, max_body_size, max_log_entries, reset_sequences, set_scenario, AppState,
 };
 use loader::load_mocks;
@@ -24,8 +24,49 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// What the command line asks `mimic` to do.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// `mimic import-openapi ...` (arguments after the subcommand)
+    Import(Vec<String>),
+    /// `mimic validate ...` (arguments after the subcommand)
+    Validate(Vec<String>),
+    Help,
+    Version,
+    /// An argument that is not a subcommand or flag Mimic knows. Starting a
+    /// server for it would turn a typo (`mimic --hlep`) into a listening port.
+    Unknown(String),
+    Server,
+}
+
+/// Decide what `args` (as from `env::args()`, program name first) asks for.
+fn parse_command(args: &[String]) -> Command {
+    match args.get(1).map(String::as_str) {
+        None => Command::Server,
+        Some("import-openapi") => Command::Import(args[2..].to_vec()),
+        Some("validate") => Command::Validate(args[2..].to_vec()),
+        Some("--help" | "-h" | "help") => Command::Help,
+        Some("--version" | "-V" | "version") => Command::Version,
+        Some(other) => Command::Unknown(other.to_string()),
+    }
+}
+
+/// Usage text for the top-level command.
+const USAGE: &str = "\
+Usage: mimic [COMMAND]
+
+Run with no arguments to start the mock server (configured through MIMIC_*
+environment variables, PORT and RUST_LOG).
+
+Commands:
+  import-openapi <spec>   Generate mock files from an OpenAPI 3.x spec
+  validate [dir]          Check a mocks directory without starting the server
+  help, --help, -h        Print this help
+  version, --version, -V  Print the version
+";
 
 /// Application entry point.
 ///
@@ -35,10 +76,17 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// I/O and have no business starting a server.
 fn main() {
     let args: Vec<String> = env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("import-openapi") => std::process::exit(run_import(&args[2..])),
-        Some("validate") => std::process::exit(validate::run_validate(&args[2..])),
-        _ => run_server(),
+    match parse_command(&args) {
+        Command::Import(rest) => std::process::exit(run_import(&rest)),
+        Command::Validate(rest) => std::process::exit(validate::run_validate(&rest)),
+        Command::Help => print!("{USAGE}"),
+        Command::Version => println!("mimic {}", env!("CARGO_PKG_VERSION")),
+        Command::Unknown(arg) => {
+            eprintln!("error: unrecognized argument '{arg}'\n");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+        Command::Server => run_server(),
     }
 }
 
@@ -124,16 +172,14 @@ async fn run_server() {
     let mocks_dir = loader::resolve_mocks_dir();
 
     // Get port from environment variable
-    let port = configured_port();
+    let port = configured_port_checked().unwrap_or_else(|e| fatal(&e));
 
     // Address to bind to: MIMIC_BIND_ADDRESS, else 0.0.0.0 (every interface),
     // unchanged from before this setting existed. A value that's set but
     // doesn't parse fails startup rather than silently falling back — binding
     // wider than the operator asked for is the one outcome this setting
     // exists to prevent.
-    let bind_address = configured_bind_address().unwrap_or_else(|e| {
-        panic!("{}", e);
-    });
+    let bind_address = configured_bind_address().unwrap_or_else(|e| fatal(&e));
 
     // Scenario selection: which tagged mock groups start out matchable
     let active_tags = configured_active_tags();
@@ -272,6 +318,9 @@ async fn run_server() {
         // re-parsing after startup — see #110. Owned by this loop and moved
         // into and back out of each `spawn_blocking` call.
         let mut cache = loader::LoaderCache::new();
+        // Whether the last cycle ended with per-file errors, i.e. whether the
+        // installed store holds routes carried forward by `apply_reload`.
+        let mut had_errors = false;
         loop {
             interval.tick().await;
             let mocks_dir = reload_dir.clone();
@@ -300,7 +349,14 @@ async fn run_server() {
             });
             cache = returned_cache;
 
-            if !outcome.changed {
+            // A cycle that finds nothing new still has to install its result
+            // when the previous one carried routes forward past a broken file:
+            // the error clearing (the file fixed *or deleted*) is itself the
+            // change, and skipping it left deleted mocks being served.
+            let has_errors = !outcome.result.errors.is_empty();
+            let install = reload_needs_install(outcome.changed, has_errors, had_errors);
+            had_errors = has_errors;
+            if !install {
                 // Nothing added, removed, or edited since last cycle: no
                 // write lock, no shadow-mock diff, no counter pruning.
                 debug!("🔄 Hot reload: no changes detected");
@@ -342,6 +398,10 @@ async fn run_server() {
         }
     });
 
+    // Read before `create_router` takes the state: the banner below has to
+    // name the health path that was actually registered.
+    let health_path = state.reserved.health.clone();
+
     // Build router
     let app = create_router(state);
 
@@ -349,18 +409,74 @@ async fn run_server() {
     let addr = SocketAddr::new(bind_address, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| {
-            panic!("Failed to bind to {}: {}", addr, e);
-        });
+        .unwrap_or_else(|e| fatal(&format!("Failed to bind to {}: {}", addr, e)));
 
     info!("🚀 Server listening on http://{}", addr);
-    info!("📋 Health check available at http://{}/health", addr);
+    if let Some(path) = health_path {
+        info!("📋 Health check available at http://{}{}", addr, path);
+    }
     info!("🔄 Hot reload enabled (checking every 2s)");
 
-    // Start server
-    axum::serve(listener, app).await.unwrap_or_else(|e| {
-        panic!("Server error: {}", e);
+    // Start server. On SIGTERM/SIGINT it stops accepting connections and lets
+    // in-flight requests finish, bounded by `SHUTDOWN_GRACE`.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap_or_else(|e| fatal(&format!("Server error: {}", e)));
+    info!("Server stopped");
+}
+
+/// How long in-flight requests get to finish after a shutdown signal before
+/// the process exits anyway. A `delay_ms` mock or a stuck client must not be
+/// able to hold a container past its orchestrator's grace period.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves on the first SIGINT or (on Unix) SIGTERM, then arms the forced-exit
+/// timer. Without a handler a process running as PID 1 ignores SIGTERM, so
+/// `docker stop` waited out its grace period and killed the server mid-request.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    info!(
+        "Shutdown signal received: draining in-flight requests (up to {}s)",
+        SHUTDOWN_GRACE.as_secs()
+    );
+    tokio::spawn(async {
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+        warn!("Shutdown grace period elapsed; exiting with requests still in flight");
+        std::process::exit(1);
     });
+}
+
+/// Report a startup configuration error in one line and exit non-zero.
+///
+/// Used instead of `panic!`, which prints a thread name and a source location
+/// where the operator needed to read "PORT is set to 'abc'".
+fn fatal(message: &str) -> ! {
+    error!("{}", message);
+    eprintln!("error: {}", message);
+    std::process::exit(1);
 }
 
 /// One mock that will never serve a request because Mimic answers its
@@ -493,15 +609,29 @@ fn warn_empty_mock_set(dir: &loader::ResolvedMocksDir) {
     }
 }
 
+/// Whether a hot-reload cycle's result must be installed.
+///
+/// `changed` is the loader's own verdict; errors force an install because
+/// `apply_reload` merges last-known-good routes in for them; and a cycle that
+/// *had* errors before but has none now must install too, to replace that merge
+/// with the clean result.
+fn reload_needs_install(changed: bool, has_errors: bool, had_errors: bool) -> bool {
+    changed || has_errors || had_errors
+}
+
 /// Build the mock map a hot-reload cycle should install, given what's
 /// currently registered and what the cycle managed to load.
 ///
 /// A clean cycle replaces the map outright. A cycle with per-file errors —
 /// one file mid-save, one teammate's typo — applies every mock that *did*
-/// parse, so unrelated edits still take effect, and carries forward any route
-/// the previous map had that this cycle didn't produce. That last part keeps
-/// the broken file's own route serving its last-known-good response instead of
+/// parse, so unrelated edits still take effect, and carries forward the
+/// previously-registered mocks **of the files that failed**. That keeps a broken
+/// file's own route serving its last-known-good response instead of
 /// disappearing and reappearing as the file is fixed.
+///
+/// Only the failed files' mocks are carried: a mock whose file was deleted, or
+/// whose `path` was edited, is not "broken" and must go, whether or not some
+/// other file happens to be failing at the same time.
 fn apply_reload(
     current: &HashMap<String, Vec<types::MockConfig>>,
     result: loader::LoadResult,
@@ -510,14 +640,37 @@ fn apply_reload(
         return result.mocks;
     }
 
+    let failed: Vec<&std::path::Path> = result.errors.iter().map(|(p, _)| p.as_path()).collect();
+    let applied = result.mocks.len();
     let mut merged = result.mocks;
-    let mut retained = 0usize;
+    let mut touched: HashSet<String> = HashSet::new();
     for (key, mocks) in current {
-        if !merged.contains_key(key) {
-            merged.insert(key.clone(), mocks.clone());
-            retained += 1;
+        for mock in mocks {
+            // A failed path may be a directory (unreadable, or gone), in which
+            // case everything under it is carried.
+            let from_failed_file = mock.source.as_deref().is_some_and(|source| {
+                failed
+                    .iter()
+                    .any(|f| std::path::Path::new(source).starts_with(f))
+            });
+            if from_failed_file {
+                merged.entry(key.clone()).or_default().push(mock.clone());
+                touched.insert(key.clone());
+            }
         }
     }
+    // Same order the loader produces: by source path.
+    for key in &touched {
+        if let Some(bucket) = merged.get_mut(key) {
+            bucket.sort_by(|a, b| {
+                a.source
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .cmp(&b.source.as_deref().map(std::path::Path::new))
+            });
+        }
+    }
+    let retained = merged.len() - applied;
 
     // The loader no longer logs per-file failures itself — the result carries
     // them — so this summary names each file and why it failed. A line saying
@@ -526,7 +679,7 @@ fn apply_reload(
         "🔄 Hot reload: {} file(s) failed to load; applied {} endpoint(s) that parsed, \
          kept {} previously-registered endpoint(s)",
         result.errors.len(),
-        merged.len() - retained,
+        applied,
         retained
     );
     for (file, message) in &result.errors {
@@ -1277,10 +1430,9 @@ mod tests {
     fn test_broken_files_route_keeps_its_last_good_response() {
         // /broken parsed last cycle but not this one. Its route must keep
         // serving rather than flap out of existence while the file is fixed.
-        let current = map(vec![
-            mock("GET", "/broken", "last-good"),
-            mock("GET", "/ok", "ok"),
-        ]);
+        let mut last_good = mock("GET", "/broken", "last-good");
+        last_good.source = Some("broken-0.json".to_string());
+        let current = map(vec![last_good, mock("GET", "/ok", "ok")]);
         let result = load_result(map(vec![mock("GET", "/ok", "ok-updated")]), 1);
 
         let next = apply_reload(&current, result);
@@ -1487,6 +1639,192 @@ mod tests {
         assert!(
             next.contains_key("GET:/b"),
             "/b is independently valid and must become available"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Hot reload must not resurrect deleted mocks (#137)
+    // ------------------------------------------------------------------
+
+    fn sourced(method: &str, path: &str, marker: &str, source: &str) -> MockConfig {
+        let mut m = mock(method, path, marker);
+        m.source = Some(source.to_string());
+        m
+    }
+
+    #[test]
+    fn test_a_deleted_mock_is_dropped_even_while_another_file_is_broken() {
+        // a.json was deleted; broken.json is failing to parse this cycle.
+        let current = map(vec![
+            sourced("GET", "/gone", "gone", "m/a.json"),
+            sourced("GET", "/broken", "last-good", "m/broken.json"),
+            sourced("GET", "/stay", "stay", "m/b.json"),
+        ]);
+        let result = LoadResult {
+            mocks: map(vec![sourced("GET", "/stay", "stay", "m/b.json")]),
+            errors: vec![("m/broken.json".into(), "bad".to_string())],
+            files: 2,
+        };
+
+        let next = apply_reload(&current, result);
+
+        assert!(
+            !next.contains_key("GET:/gone"),
+            "a deleted file's route must not be carried forward"
+        );
+        assert_eq!(next["GET:/broken"][0].response["source"], "last-good");
+        assert!(next.contains_key("GET:/stay"));
+    }
+
+    #[test]
+    fn test_editing_a_mocks_path_does_not_leave_the_old_route_while_a_sibling_is_broken() {
+        let current = map(vec![sourced("GET", "/old", "v1", "m/a.json")]);
+        let result = LoadResult {
+            mocks: map(vec![sourced("GET", "/new", "v2", "m/a.json")]),
+            errors: vec![("m/broken.json".into(), "bad".to_string())],
+            files: 2,
+        };
+
+        let next = apply_reload(&current, result);
+
+        assert!(next.contains_key("GET:/new"));
+        assert!(!next.contains_key("GET:/old"));
+    }
+
+    #[test]
+    fn test_a_failed_directory_carries_forward_everything_under_it() {
+        let current = map(vec![
+            sourced("GET", "/a", "a", "m/sub/a.json"),
+            sourced("GET", "/b", "b", "m/other/b.json"),
+        ]);
+        let result = LoadResult {
+            mocks: HashMap::new(),
+            errors: vec![("m/sub".into(), "unreadable".to_string())],
+            files: 0,
+        };
+
+        let next = apply_reload(&current, result);
+
+        assert!(next.contains_key("GET:/a"));
+        assert!(!next.contains_key("GET:/b"));
+    }
+
+    #[test]
+    fn test_carried_forward_mocks_keep_the_loaders_bucket_order() {
+        let current = map(vec![
+            sourced("GET", "/x", "a", "m/a.json"),
+            sourced("GET", "/x", "c", "m/c.json"),
+        ]);
+        let result = LoadResult {
+            mocks: map(vec![sourced("GET", "/x", "b", "m/b.json")]),
+            errors: vec![("m/c.json".into(), "bad".to_string())],
+            files: 3,
+        };
+
+        let next = apply_reload(&current, result);
+
+        let order: Vec<_> = next["GET:/x"]
+            .iter()
+            .map(|m| m.response["source"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            order,
+            ["b", "c"],
+            "a.json was deleted, c.json is carried, sorted by path"
+        );
+    }
+
+    #[test]
+    fn test_clearing_errors_forces_an_install() {
+        assert!(!reload_needs_install(false, false, false));
+        assert!(reload_needs_install(true, false, false));
+        assert!(reload_needs_install(false, true, false));
+        assert!(
+            reload_needs_install(false, false, true),
+            "the cycle after the last error clears must replace the carried-forward store"
+        );
+    }
+
+    /// The whole story of the report, through the real loader: delete a mock
+    /// while a sibling is broken, then remove the broken file.
+    #[test]
+    fn test_deleting_the_broken_file_afterwards_replaces_the_stale_store() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mock(
+            dir.path(),
+            "a.json",
+            r#"{"method":"GET","path":"/gone","status":200,"response":"x"}"#,
+        );
+        write_mock(
+            dir.path(),
+            "b.json",
+            r#"{"method":"GET","path":"/stay","status":200,"response":"y"}"#,
+        );
+        let path = dir.path().to_str().unwrap();
+        let mut cache = loader::LoaderCache::new();
+
+        // Startup.
+        let first = loader::load_mocks_map_hot_reload(path, &mut cache);
+        let mut store = first.result.mocks;
+        let mut had_errors = false;
+
+        // A broken file appears, and a.json is deleted in the same window.
+        write_mock(dir.path(), "broken.json", "{bad");
+        std::fs::remove_file(dir.path().join("a.json")).unwrap();
+        let outcome = loader::load_mocks_map_hot_reload(path, &mut cache);
+        let has_errors = !outcome.result.errors.is_empty();
+        assert!(reload_needs_install(
+            outcome.changed,
+            has_errors,
+            had_errors
+        ));
+        had_errors = has_errors;
+        store = apply_reload(&store, outcome.result);
+        assert!(!store.contains_key("GET:/gone"));
+
+        // The broken file is removed: nothing else changed.
+        std::fs::remove_file(dir.path().join("broken.json")).unwrap();
+        let outcome = loader::load_mocks_map_hot_reload(path, &mut cache);
+        let has_errors = !outcome.result.errors.is_empty();
+        assert!(reload_needs_install(
+            outcome.changed,
+            has_errors,
+            had_errors
+        ));
+        store = apply_reload(&store, outcome.result);
+        assert!(store.contains_key("GET:/stay"));
+        assert!(!store.contains_key("GET:/gone"));
+    }
+
+    // ------------------------------------------------------------------
+    // Command line (#137)
+    // ------------------------------------------------------------------
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        std::iter::once("mimic")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_command() {
+        assert_eq!(parse_command(&argv(&[])), Command::Server);
+        assert_eq!(parse_command(&argv(&["--help"])), Command::Help);
+        assert_eq!(parse_command(&argv(&["-h"])), Command::Help);
+        assert_eq!(parse_command(&argv(&["--version"])), Command::Version);
+        assert_eq!(parse_command(&argv(&["-V"])), Command::Version);
+        assert_eq!(
+            parse_command(&argv(&["validate", "./m"])),
+            Command::Validate(vec!["./m".to_string()])
+        );
+        assert_eq!(
+            parse_command(&argv(&["import-openapi", "s.yaml", "--force"])),
+            Command::Import(vec!["s.yaml".to_string(), "--force".to_string()])
+        );
+        assert_eq!(
+            parse_command(&argv(&["--hlep"])),
+            Command::Unknown("--hlep".to_string())
         );
     }
 

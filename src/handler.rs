@@ -750,12 +750,34 @@ fn push_bounded(log: &mut Vec<RequestRecord>, record: RequestRecord, cap: usize)
 /// The port the server is configured to listen on.
 ///
 /// Lives here so `/health` reports the same number `main` binds to rather than
-/// re-deriving it and risking disagreement.
+/// re-deriving it and risking disagreement. An unusable value reads as the
+/// default; startup goes through [`configured_port_checked`] first, so by the
+/// time anything serves a request the value is known to be valid.
 pub fn configured_port() -> u16 {
-    std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080)
+    configured_port_checked().unwrap_or(DEFAULT_PORT)
+}
+
+/// Port used when `PORT` is unset or empty.
+const DEFAULT_PORT: u16 = 8080;
+
+/// [`configured_port`] that reports a `PORT` that is set but unusable instead
+/// of quietly serving on another port — the same policy as
+/// [`configured_bind_address`]: a listener that isn't where the operator said
+/// it would be is worse than one that refuses to start.
+pub fn configured_port_checked() -> Result<u16, String> {
+    parse_port(std::env::var("PORT").ok())
+}
+
+fn parse_port(value: Option<String>) -> Result<u16, String> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(DEFAULT_PORT),
+        Some(raw) => raw.parse::<u16>().map_err(|_| {
+            format!(
+                "PORT is set to '{}', which is not a valid port number (0-65535)",
+                raw
+            )
+        }),
+    }
 }
 
 /// Environment variable overriding the address Mimic binds to.
@@ -6565,6 +6587,20 @@ mod scenario_tests {
             parse_bind_address(None),
             Ok(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         );
+    }
+
+    #[test]
+    fn parse_port_defaults_when_unset_or_empty_and_rejects_garbage() {
+        assert_eq!(parse_port(None), Ok(8080));
+        assert_eq!(parse_port(Some("".to_string())), Ok(8080));
+        assert_eq!(parse_port(Some("  ".to_string())), Ok(8080));
+        assert_eq!(parse_port(Some(" 9090 ".to_string())), Ok(9090));
+        // Previously an unparsable PORT silently became 8080 while an
+        // unparsable MIMIC_BIND_ADDRESS aborted; both abort now.
+        for bad in ["abc", "70000", "-1", "80.5"] {
+            let err = parse_port(Some(bad.to_string())).unwrap_err();
+            assert!(err.contains("PORT") && err.contains(bad), "{err}");
+        }
     }
 
     #[test]

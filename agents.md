@@ -24,6 +24,8 @@
 - **Inputs:** HTTP requests on port 8080, `PORT` and `RUST_LOG` env vars
 - **Outputs:** HTTP responses, access logs, health checks
 - **Responsibilities:** Setup routes (`/health`, `/admin/*`, catch-all), middleware, lifecycle management
+- **Command line and lifecycle:** `parse_command` picks `import-openapi`, `validate`, `--help`/`--version`, or the server; any other argument exits 2 with usage rather than starting a listener. An unusable `PORT` or `MIMIC_BIND_ADDRESS` exits 1 with a one-line message (`fatal`), never a panic. SIGTERM/SIGINT drain in-flight requests, bounded by a 10 s grace period. Process-level behaviour is covered by `tests/process.rs`, which runs the real binary
+- **Hot reload and errors:** a cycle with per-file errors installs every mock that parsed and carries forward only the previous mocks *of the files that failed* (by `source`), so a deleted file's route goes away even while a sibling is broken. The cycle after the last error clears is always installed (`reload_needs_install`)
 - **Reserved routes:** `/health` and the admin endpoints are matched ahead of the fallback, so a mock declaring one is loaded but unreachable. `ReservedRoutes` is the single list of those method+path pairs — the router registers from it and `/admin/mocks` flags collisions against it, so the two can't disagree. `MIMIC_HEALTH_PATH`, `MIMIC_ADMIN_PREFIX`, and `MIMIC_DISABLE_ADMIN` move or remove them. Every built-in route carries `.fallback(handle_request)`, so an undeclared method reaches the mock pipeline instead of producing a bare 405.
 
 ### 3. **Matcher Agent** (`src/matcher.rs`)
