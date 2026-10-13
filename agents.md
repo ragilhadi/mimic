@@ -18,7 +18,6 @@
 - **Outputs:** `HashMap<String, MockConfig>` for O(1) lookup
 - **Responsibilities:** Scan, parse, validate mock files; build method:path index
 - **File-backed bodies:** a mock's `response_file` is resolved against that mock file's own directory, canonicalized, refused if it escapes the mocks root, capped by `MIMIC_MAX_RESPONSE_FILE` (default 10 MB), and read into `MockConfig::response_bytes` here — so request handling never does file I/O, and a hot-reload cycle picks up a changed fixture. A file some mock claims is served, never registered as a mock of its own
-- **Arrays (#142):** a file whose top level is an array holds several mocks — JSON dispatches on the leading `[`, YAML on a parsed `Value::Sequence` (block or flow). Each element is a full `MockConfig` resolving its fixtures like any file. Element identity is `(source file, index)` — `orders.json#2` — reported by `/admin/mocks`, explanations, and validate, and stable across hot reloads; it is positional, so reordering elements resets their state. An element that fails validation is a `LoadError { element: Some(i) }` that doesn't stop its siblings; a file that doesn't parse fails wholesale. Only fully-loaded files enter the hot-reload cache
 
 ### 2. **Router Agent** (`src/main.rs`)
 - **Purpose:** Route HTTP requests to handlers
@@ -26,7 +25,7 @@
 - **Outputs:** HTTP responses, access logs, health checks
 - **Responsibilities:** Setup routes (`/health`, `/admin/*`, catch-all), middleware, lifecycle management
 - **Command line and lifecycle:** `parse_command` picks `import-openapi`, `validate`, `--help`/`--version`, or the server; any other argument exits 2 with usage rather than starting a listener. An unusable `PORT` or `MIMIC_BIND_ADDRESS` exits 1 with a one-line message (`fatal`), never a panic. SIGTERM/SIGINT drain in-flight requests, bounded by a 10 s grace period. Process-level behaviour is covered by `tests/process.rs`, which runs the real binary
-- **Hot reload and errors:** a cycle with per-file errors installs every mock that parsed and carries forward only the previous mocks *of the files that failed* (by `source`) — element-aware for array files, so a failed element (`orders.json#2`) carries exactly itself, not its siblings — so a deleted file's route goes away even while a sibling is broken. The cycle after the last error clears is always installed (`reload_needs_install`)
+- **Hot reload and errors:** a cycle with per-file errors installs every mock that parsed and carries forward only the previous mocks *of the files that failed* (by `source`), so a deleted file's route goes away even while a sibling is broken. The cycle after the last error clears is always installed (`reload_needs_install`)
 - **Reserved routes:** `/health` and the admin endpoints are matched ahead of the fallback, so a mock declaring one is loaded but unreachable. `ReservedRoutes` is the single list of those method+path pairs — the router registers from it and `/admin/mocks` flags collisions against it, so the two can't disagree. `MIMIC_HEALTH_PATH`, `MIMIC_ADMIN_PREFIX`, and `MIMIC_DISABLE_ADMIN` move or remove them. Every built-in route carries `.fallback(handle_request)`, so an undeclared method reaches the mock pipeline instead of producing a bare 405.
 
 ### 3. **Matcher Agent** (`src/matcher.rs`)
@@ -56,8 +55,8 @@
 
 ### 6. **Importer Agent** (`src/openapi.rs`)
 - **Purpose:** Generate mock files from an OpenAPI 3.x spec
-- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--base-path <path>] [--bundle] [--force] [--brace-params]`
-- **Outputs:** One `MockConfig` JSON file per operation + response status — or, with `--bundle`, one array file per path (live primaries in `<slug>.<ext>`, the path's alternatives inert in `<slug>_alt.<ext>.disabled`)
+- **Inputs:** `mimic import-openapi <spec.yaml|spec.json> [--out <dir>] [--status <code>] [--base-path <path>] [--force] [--brace-params]`
+- **Outputs:** One `MockConfig` JSON file per operation + response status
 - **Responsibilities:** Parse JSON/YAML, resolve `$ref`, pick examples or build schema stubs, translate `{id}` path templates, apply the base path from `servers[0]` (variable defaults resolved; `--base-path` overrides, `''` drops; the applied prefix is printed), refuse to clobber a non-empty output directory without `--force`
 - **Note:** Runs instead of the server (checked in `main` before the async runtime starts) and exits when done
 
