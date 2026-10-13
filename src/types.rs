@@ -275,6 +275,35 @@ pub struct MockConfig {
     /// value present in the mock JSON itself is overwritten at load time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+
+    /// The element index within the source file, when that file is an array
+    /// of mocks and this is one of its elements — `None` for a single-object
+    /// mock file, the shape everything had before arrays existed.
+    ///
+    /// Loader-owned and skipped by serde, like [`MockConfig::source`]: the
+    /// index is positional within the file, decided at parse time, and a
+    /// value written into the mock file by hand must not be able to claim it.
+    /// It is the best identity a mock in an array has — which is also its
+    /// documented weakness: reordering elements resets their sequence state,
+    /// the way renaming a file does for whole files.
+    #[serde(skip)]
+    pub source_index: Option<usize>,
+}
+
+impl MockConfig {
+    /// The source as a human reads it: the file path, plus a `#index` suffix
+    /// when the mock is one element of an array file — `orders.json#2`.
+    ///
+    /// This is what `/admin/mocks`, match explanations, validator findings,
+    /// and the shadowed-mock warnings all report, answering "where do I go
+    /// to change this?" at element granularity.
+    pub fn source_label(&self) -> Option<String> {
+        match (&self.source, self.source_index) {
+            (Some(source), Some(index)) => Some(format!("{}#{}", source, index)),
+            (Some(source), None) => Some(source.clone()),
+            (None, _) => None,
+        }
+    }
 }
 
 /// Response delay configuration: a fixed duration or a random range
@@ -430,9 +459,13 @@ where
 /// `METHOD:/path`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MockOrigin {
-    /// The file the mock was loaded from. Stable for as long as the file is,
-    /// which is exactly the lifetime the state keyed by it should have.
-    Source(String),
+    /// The file the mock was loaded from, plus its element index when that
+    /// file held an array of mocks (`orders.json`, element `2`). Stable for
+    /// as long as the file is, which is exactly the lifetime the state keyed
+    /// by it should have. The index is positional within the file, so
+    /// reordering elements resets their state — the whole-file equivalent of
+    /// renaming a file being "correctly loses identity".
+    Source(String, Option<usize>),
     /// Position in the bucket, for a mock built in-process — tests, generated
     /// fixtures — with no file behind it. Carries the old semantics for the
     /// only case that can't do better.
@@ -448,9 +481,11 @@ pub enum MockOrigin {
 /// the same `METHOD:/path` and position 0 silently starts naming a different
 /// mock, handing it a half-consumed sequence and another mock's hit count.
 ///
-/// The file path is the stable half. A mock keeps its identity when a sibling
-/// appears or disappears, and loses it — correctly — when its own file is
-/// renamed or deleted.
+/// The file path is the stable half — for an array file, `path#index`, so two
+/// mocks in one file keep separate counters the way two files would. A mock
+/// keeps its identity when a sibling appears or disappears, and loses it —
+/// correctly — when its own file is renamed or deleted, or its element moves
+/// to a different position.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MockIdentity {
     /// The registration key, `METHOD:/declared/path`. For a pattern mock this
@@ -466,7 +501,7 @@ impl MockIdentity {
         Self {
             key: key.to_string(),
             origin: match mock.source.as_deref() {
-                Some(source) => MockOrigin::Source(source.to_string()),
+                Some(source) => MockOrigin::Source(source.to_string(), mock.source_index),
                 None => MockOrigin::Position(index),
             },
         }
@@ -484,20 +519,33 @@ impl MockIdentity {
             .map_or(self.key.as_str(), |(_, path)| path)
     }
 
-    /// The file this mock came from, if it came from one.
-    pub fn source(&self) -> Option<&str> {
+    /// The file this mock came from — with a `#index` suffix when it is one
+    /// element of an array file (`orders.json#2`) — if it came from one.
+    pub fn source(&self) -> Option<String> {
         match &self.origin {
-            MockOrigin::Source(source) => Some(source),
+            MockOrigin::Source(source, element) => match element {
+                Some(index) => Some(format!("{}#{}", source, index)),
+                None => Some(source.clone()),
+            },
             MockOrigin::Position(_) => None,
         }
     }
 
     /// A human-readable rendering for the admin API, e.g.
-    /// `POST:/orders @ mocks/orders_flow.json`.
+    /// `POST:/orders @ mocks/orders_flow.json#2`.
     pub fn label(&self) -> String {
+        match self.source() {
+            Some(source) => format!("{} @ {}", self.key, source),
+            None => format!("{}#{}", self.key, self.origin_position()),
+        }
+    }
+
+    /// The position behind a [`MockOrigin::Position`] origin; `0` is never
+    /// meaningful for a `Source` origin.
+    fn origin_position(&self) -> usize {
         match &self.origin {
-            MockOrigin::Source(source) => format!("{} @ {}", self.key, source),
-            MockOrigin::Position(index) => format!("{}#{}", self.key, index),
+            MockOrigin::Position(index) => *index,
+            MockOrigin::Source(..) => 0,
         }
     }
 }
@@ -713,6 +761,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -795,6 +844,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -826,6 +876,7 @@ mod tests {
                 delay_ms: None,
                 response_headers: None,
                 source: None,
+                source_index: None,
                 sequence: None,
                 tags: Vec::new(),
                 response_file: None,
@@ -907,6 +958,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -999,6 +1051,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1020,6 +1073,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1330,6 +1384,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             response_file: None,

@@ -15,6 +15,7 @@ fn mock(method: &str, path: &str) -> MockConfig {
         delay_ms: None,
         response_headers: None,
         source: None,
+        source_index: None,
         sequence: None,
         tags: Vec::new(),
         response_file: None,

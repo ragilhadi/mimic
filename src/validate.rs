@@ -35,7 +35,7 @@ use crate::handler::{
     configured_active_tags, content_type_for_file, is_textual_content_type, ReservedRoutes,
     ACTIVE_TAGS_ENV,
 };
-use crate::loader::{load_mocks_map, resolve_mocks_dir, LoadResult, MOCKS_DIR_ENV};
+use crate::loader::{load_mocks_map, resolve_mocks_dir, LoadError, LoadResult, MOCKS_DIR_ENV};
 use crate::regex_cache::compiled_regex;
 use crate::template::{is_known_source, template_regex, KNOWN_CASTS};
 use crate::types::{
@@ -248,13 +248,15 @@ fn collect_findings(
     // What the loader itself refused to load: an unparsable file, both
     // `response` and `response_file`, a fixture that is missing, oversized or
     // outside the mocks root. These are errors — each one is a mock the
-    // server never registers at all.
-    for (file, message) in &result.errors {
+    // server never registers at all. An element of an array file that failed
+    // validation is reported as `file#index`; its siblings that did load are
+    // checked like every other mock below.
+    for error in &result.errors {
         findings.push(Finding {
-            file: display_path(file),
+            file: display_path(Path::new(&error.target())),
             severity: Severity::Error,
             kind: "load_error",
-            message: message_for_report(file, message),
+            message: message_for_report(error),
         });
     }
 
@@ -276,12 +278,15 @@ fn collect_findings(
     findings
 }
 
-/// The file a finding attributes a mock to — always set by the loader; the
-/// fallback is what the server's own diagnostics would say for a mock that
-/// never came from a file.
+/// The file a finding attributes a mock to, with the `#index` of an array
+/// element when it has one — always set by the loader; the fallback is what
+/// the server's own diagnostics would say for a mock that never came from a
+/// file.
 fn source_of(mock: &MockConfig) -> String {
-    let walked = mock.source.as_deref().unwrap_or("(built in-process)");
-    display_path(Path::new(walked))
+    let walked = mock
+        .source_label()
+        .unwrap_or_else(|| "(built in-process)".to_string());
+    display_path(Path::new(&walked))
 }
 
 /// Route Mimic answers itself: loaded, listed on `/admin/mocks`, never
@@ -696,19 +701,21 @@ fn display_path(path: &Path) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-/// Loader error messages mostly embed the file they are about; the finding's
-/// file column would repeat it. Strip the shapes the loader actually emits —
+/// Loader error messages mostly embed the target they are about — the file,
+/// or `file#index` for one element of an array file; the finding's file
+/// column would repeat it. Strip the shapes the loader actually emits —
 /// nothing else is rewritten.
-fn message_for_report(file: &Path, message: &str) -> String {
-    // The path as the loader embedded it — with the `./` the report column
+fn message_for_report(error: &LoadError) -> String {
+    // The target as the loader embedded it — with the `./` the report column
     // strips, if it had one.
-    let embedded = file.to_string_lossy();
+    let embedded = error.target();
+    let message = &error.message;
 
     // Two messages carry no payload beyond the rule; rewrite them as a sentence.
-    if message == format!("Empty method in {}", embedded) {
+    if message == &format!("Empty method in {}", embedded) {
         return "mock declares an empty `method`".to_string();
     }
-    if message == format!("Empty path in {}", embedded) {
+    if message == &format!("Empty path in {}", embedded) {
         return "mock declares an empty `path`".to_string();
     }
 
@@ -1088,6 +1095,106 @@ mod tests {
             second.message.contains("status 1000"),
             "the mock's own status is checked too: {}",
             second.message
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Array files (#142)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_element_load_error_is_reported_on_file_index() {
+        let dir = mocks_dir(&[(
+            "orders.json",
+            br#"[
+                {"method":"GET","path":"/orders","status":200,"response":{"ok":true}},
+                {"method":"","path":"/orders","status":201,"response":{"ok":true}}
+            ]"#,
+        )]);
+
+        let finding = one(&dir);
+        assert_eq!(finding.kind, "load_error");
+        assert!(
+            finding.file.ends_with("orders.json#1"),
+            "the column names the element, not just the file: {:?}",
+            finding.file
+        );
+        assert!(
+            finding.message.contains("empty `method`"),
+            "the rule survives the trim: {:?}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn mock_checks_on_an_array_element_name_the_element() {
+        // A mock that DID load is checked like any other; its findings point
+        // at the element it is, so a report can be acted on file-by-file.
+        let dir = mocks_dir(&[(
+            "orders.json",
+            br#"[
+                {"method":"GET","path":"/orders","status":200,"response":{"ok":true}},
+                {"method":"GET","path":"badpath","status":1000,"response":{"ok":true}},
+                {"method":"GET","path":"/orders2","status":200,"response":{}}
+            ]"#,
+        )]);
+
+        let found = findings(&dir, None);
+        assert_eq!(found.len(), 2, "{:?}", found);
+        assert!(found.iter().all(|f| f.file.ends_with("orders.json#1")));
+        assert!(found.iter().all(|f| f.severity == Severity::Error));
+        assert!(found.iter().any(|f| f.kind == "invalid_status"));
+        assert!(found.iter().any(|f| f.kind == "path_without_slash"));
+    }
+
+    #[test]
+    fn a_whole_file_array_failure_is_reported_on_the_file() {
+        let dir = mocks_dir(&[
+            (
+                "users.json",
+                br#"{"method":"GET","path":"/users","status":200,"response":{}}"#,
+            ),
+            ("broken.json", b"[{\"method\":\"GET\""),
+        ]);
+
+        let found = findings(&dir, None);
+        assert_eq!(found.len(), 1, "{:?}", found);
+        assert!(
+            found[0].file.ends_with("broken.json"),
+            "{:?}",
+            found[0].file
+        );
+        assert_eq!(found[0].kind, "load_error");
+        assert!(
+            found[0].message.contains("EOF while parsing"),
+            "the parser's own diagnosis survives the trim: {:?}",
+            found[0].message
+        );
+    }
+
+    #[test]
+    fn a_duplicate_route_within_one_array_file_warns_per_element() {
+        let dir = mocks_dir(&[(
+            "orders.json",
+            br#"[
+                {"method":"GET","path":"/orders","status":200,"response":{"which":1}},
+                {"method":"GET","path":"/orders","status":200,"response":{"which":2}}
+            ]"#,
+        )]);
+
+        let found = findings(&dir, None);
+        assert_eq!(found.len(), 1, "{:?}", found);
+        assert_eq!(found[0].kind, "duplicate_route");
+        assert_eq!(found[0].severity, Severity::Warning);
+        assert!(
+            found[0].file.ends_with("orders.json#1"),
+            "the loser names its element: {:?}",
+            found[0].file
+        );
+        assert!(
+            found[0].message.contains("orders.json#0"),
+            "the winner names its element too: {:?}",
+            found[0].message
         );
     }
 
@@ -1586,19 +1693,34 @@ mod tests {
 
     #[test]
     fn a_message_the_loader_never_trims_is_kept_verbatim() {
+        let error_for = |message: &str| LoadError {
+            file: Path::new("mocks/x.json").to_path_buf(),
+            element: None,
+            message: message.to_string(),
+        };
         assert_eq!(
-            message_for_report(Path::new("mocks/x.json"), "totally custom error"),
+            message_for_report(&error_for("totally custom error")),
             "totally custom error"
         );
         assert_eq!(
-            message_for_report(Path::new("mocks/x.json"), "Empty method in mocks/x.json"),
+            message_for_report(&error_for("Empty method in mocks/x.json")),
             "mock declares an empty `method`"
         );
         assert_eq!(
-            message_for_report(
-                Path::new("mocks/x.json"),
+            message_for_report(&error_for(
                 "mocks/x.json sets both `response` and `response_file` (body.txt); use one or the other"
-            ),
+            )),
+            "`response` and `response_file` (body.txt); use one or the other"
+        );
+        // An element error names `file#index` in both the column and the
+        // embedded prefix it gets trimmed by.
+        let element_error = LoadError {
+            file: Path::new("mocks/orders.json").to_path_buf(),
+            element: Some(2),
+            message: "mocks/orders.json#2 sets both `response` and `response_file` (body.txt); use one or the other".to_string(),
+        };
+        assert_eq!(
+            message_for_report(&element_error),
             "`response` and `response_file` (body.txt); use one or the other"
         );
         assert_eq!(

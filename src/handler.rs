@@ -1743,7 +1743,9 @@ fn describe_mock_entry(
         "method": mock.method,
         "path": mock.path,
         "status": mock.status,
-        "source": mock.source,
+        // Where to go to change this mock — `file#N` when it is one element
+        // of an array file, the plain path otherwise.
+        "source": mock.source_label(),
         "has_path_params": is_pattern_path(&mock.path),
         "matchers": {
             "query_params": mock.query_params.is_some(),
@@ -1860,9 +1862,11 @@ pub async fn list_sequences(State(state): State<AppState>) -> Json<serde_json::V
                 // The mock's own `source` where it's still loaded, falling back
                 // to the file the identity was minted from so a counter left
                 // over from a deleted mock still names the file it came from.
+                // Either half may name one element of an array file
+                // (`orders.json#2`).
                 "source": mock
-                    .and_then(|m| m.source.clone())
-                    .or_else(|| identity.source().map(str::to_string)),
+                    .and_then(|m| m.source_label())
+                    .or_else(|| identity.source()),
             })
         })
         .collect();
