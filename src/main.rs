@@ -336,10 +336,11 @@ async fn run_server() {
                     loader::ReloadOutcome {
                         result: loader::LoadResult {
                             mocks: std::collections::HashMap::new(),
-                            errors: vec![(
-                                reload_dir.clone().into(),
-                                "hot-reload task panicked".to_string(),
-                            )],
+                            errors: vec![loader::LoadError {
+                                file: reload_dir.clone().into(),
+                                element: None,
+                                message: "hot-reload task panicked".to_string(),
+                            }],
                             files: 0,
                         },
                         changed: true,
@@ -505,8 +506,7 @@ fn shadowed_mocks(
                     method: mock.method.clone(),
                     path: mock.path.clone(),
                     source: mock
-                        .source
-                        .clone()
+                        .source_label()
                         .unwrap_or_else(|| "(built in-process)".to_string()),
                     owner,
                 })
@@ -629,9 +629,13 @@ fn reload_needs_install(changed: bool, has_errors: bool, had_errors: bool) -> bo
 /// file's own route serving its last-known-good response instead of
 /// disappearing and reappearing as the file is fixed.
 ///
-/// Only the failed files' mocks are carried: a mock whose file was deleted, or
-/// whose `path` was edited, is not "broken" and must go, whether or not some
-/// other file happens to be failing at the same time.
+/// The carry is element-aware for array files: an error naming element `i`
+/// (`orders.json#2`) carries forward only that element's own last-known-good
+/// mock, so its siblings are replaced by their fresh versions instead of
+/// being duplicated alongside them. Only the failed files' mocks are carried:
+/// a mock whose file was deleted, or whose `path` was edited, is not "broken"
+/// and must go, whether or not some other file happens to be failing at the
+/// same time.
 fn apply_reload(
     current: &HashMap<String, Vec<types::MockConfig>>,
     result: loader::LoadResult,
@@ -640,7 +644,6 @@ fn apply_reload(
         return result.mocks;
     }
 
-    let failed: Vec<&std::path::Path> = result.errors.iter().map(|(p, _)| p.as_path()).collect();
     let applied = result.mocks.len();
     let mut merged = result.mocks;
     let mut touched: HashSet<String> = HashSet::new();
@@ -648,45 +651,53 @@ fn apply_reload(
         for mock in mocks {
             // A failed path may be a directory (unreadable, or gone), in which
             // case everything under it is carried.
-            let from_failed_file = mock.source.as_deref().is_some_and(|source| {
-                failed
-                    .iter()
-                    .any(|f| std::path::Path::new(source).starts_with(f))
+            let from_failed = mock.source.as_deref().is_some_and(|source| {
+                result.errors.iter().any(|error| {
+                    std::path::Path::new(source).starts_with(error.file.as_path())
+                        && match error.element {
+                            // The whole file failed: everything it
+                            // registered last cycle is carried.
+                            None => true,
+                            // Only element `element` failed: carry its
+                            // own mock and nothing else.
+                            Some(index) => mock.source_index == Some(index),
+                        }
+                })
             });
-            if from_failed_file {
+            if from_failed {
                 merged.entry(key.clone()).or_default().push(mock.clone());
                 touched.insert(key.clone());
             }
         }
     }
-    // Same order the loader produces: by source path.
+    // Same order the loader produces: by source file, then element within a
+    // file. The numeric element index matters — `orders.json#2` sorts before
+    // `orders.json#10` only as a number — and it must not fall back to the
+    // HashMap's iteration order for mocks that share a source file.
     for key in &touched {
         if let Some(bucket) = merged.get_mut(key) {
             bucket.sort_by(|a, b| {
-                a.source
-                    .as_deref()
-                    .map(std::path::Path::new)
-                    .cmp(&b.source.as_deref().map(std::path::Path::new))
+                (a.source.as_deref(), a.source_index).cmp(&(b.source.as_deref(), b.source_index))
             });
         }
     }
     let retained = merged.len() - applied;
 
     // The loader no longer logs per-file failures itself — the result carries
-    // them — so this summary names each file and why it failed. A line saying
-    // "1 file failed" sent someone scrolling; name the file.
+    // them — so this summary names each target and why it failed. A line
+    // saying "1 file failed" sent someone scrolling; name the file.
     warn!(
-        "🔄 Hot reload: {} file(s) failed to load; applied {} endpoint(s) that parsed, \
+        "🔄 Hot reload: {} load error(s); applied {} endpoint(s) that parsed, \
          kept {} previously-registered endpoint(s)",
         result.errors.len(),
         applied,
         retained
     );
-    for (file, message) in &result.errors {
+    for error in &result.errors {
         warn!(
             "🔄 Hot reload: failed to load {}: {}",
-            file.display(),
-            message
+            error.target(),
+            error.message
         );
     }
 
@@ -1357,6 +1368,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1386,11 +1398,10 @@ mod tests {
         LoadResult {
             mocks,
             errors: (0..failures)
-                .map(|i| {
-                    (
-                        std::path::PathBuf::from(format!("broken-{i}.json")),
-                        "x".to_string(),
-                    )
+                .map(|i| loader::LoadError {
+                    file: std::path::PathBuf::from(format!("broken-{i}.json")),
+                    element: None,
+                    message: "x".to_string(),
                 })
                 .collect(),
             files: 0,
@@ -1569,6 +1580,158 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Array files: independent, positional state (#142)
+    // ------------------------------------------------------------------
+
+    /// `POST /orders` twice through the pipeline, as `post_orders` does, but
+    /// against a directory whose whole mock set lives in one array file —
+    /// the shape #142 introduced. `order` is who sits at element #0.
+    fn sequenced_orders_array_in(first: &str, second: &str) -> String {
+        let element = |who: &str| {
+            let step = |n: u8| {
+                format!(
+                    r#"{{"status":200,"response":{{"who":"{}","step":{}}}}}"#,
+                    who, n
+                )
+            };
+            format!(
+                r#"{{"method":"POST","path":"/orders","status":200,"response":{{}},
+                     "sequence":[{},{}]}}"#,
+                step(1),
+                step(2)
+            )
+        };
+        format!("[{},{}]", element(first), element(second))
+    }
+
+    /// The step of a counter keyed to an identity whose source ends with
+    /// `needle` — `orders.json#0` names one element, `a_orders.json` a file.
+    /// Both forms are what `MockIdentity::source` reports.
+    async fn counter_step_of(state: &AppState, needle: &str) -> Option<usize> {
+        state
+            .sequence_counters
+            .read()
+            .await
+            .iter()
+            .find(|(identity, _)| identity.source().is_some_and(|s| s.ends_with(needle)))
+            .map(|(_, step)| *step)
+    }
+
+    async fn hit_count_of(state: &AppState, needle: &str) -> Option<u64> {
+        state
+            .mock_hits
+            .read()
+            .await
+            .iter()
+            .find(|(identity, _)| identity.source().is_some_and(|s| s.ends_with(needle)))
+            .map(|(_, count)| *count)
+    }
+
+    #[tokio::test]
+    async fn test_two_sequence_elements_in_one_file_keep_independent_counters() {
+        // Two sequence mocks share one file, and would share one counter if
+        // identity were keyed by the file alone — exactly the collision #142
+        // calls out.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("orders.json"),
+            sequenced_orders_array_in("first", "second"),
+        )
+        .unwrap();
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+
+        // Both requests match bucket position 0 — element #0. Its identity
+        // is the file *plus the index*, so only its counter moves.
+        post_orders(&state).await;
+        post_orders(&state).await;
+        assert_eq!(
+            counter_step_of(&state, "orders.json#0").await,
+            Some(2),
+            "element #0 counted its own calls"
+        );
+        assert_eq!(
+            counter_step_of(&state, "orders.json#1").await,
+            None,
+            "element #1 has served nothing and owns no counter"
+        );
+
+        // A sibling file sorts ahead of the array; nothing about the
+        // elements' identities changes, so their state stays put.
+        write_mock(dir.path(), "a_orders.json", &sequenced_orders_mock("a"));
+        reload_cycle(&state, &store, dir.path()).await;
+
+        assert_eq!(
+            counter_step_of(&state, "orders.json#0").await,
+            Some(2),
+            "a sibling joining the bucket must not move an element's counter"
+        );
+        assert_eq!(counter_step_of(&state, "a_orders.json").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_hit_counts_stay_with_array_elements_across_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("orders.json"),
+            sequenced_orders_array_in("first", "second"),
+        )
+        .unwrap();
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+        post_orders(&state).await;
+        post_orders(&state).await;
+        assert_eq!(hit_count_of(&state, "orders.json#0").await, Some(2));
+
+        write_mock(dir.path(), "a_orders.json", &sequenced_orders_mock("a"));
+        reload_cycle(&state, &store, dir.path()).await;
+
+        assert_eq!(
+            hit_count_of(&state, "orders.json#0").await,
+            Some(2),
+            "element #0's hit count survives the reload it always used to"
+        );
+        assert_eq!(hit_count_of(&state, "orders.json#1").await, None);
+        assert_eq!(hit_count_of(&state, "a_orders.json").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_reordering_array_elements_resets_their_state() {
+        // The index is the identity, and it is positional within the file:
+        // swap two elements and each sits where the other's state was, the
+        // way renaming a file resets a whole file's. Documented, best-possible
+        // behavior — not a bug.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("orders.json"),
+            sequenced_orders_array_in("first", "second"),
+        )
+        .unwrap();
+
+        let store = load_mocks(dir.path().to_str().unwrap());
+        let state = AppState::new(store.clone());
+        post_orders(&state).await;
+        post_orders(&state).await;
+        assert_eq!(counter_step_of(&state, "orders.json#0").await, Some(2));
+
+        // Swap: "second" now sits at #0 and "first" at #1.
+        std::fs::write(
+            dir.path().join("orders.json"),
+            sequenced_orders_array_in("second", "first"),
+        )
+        .unwrap();
+        reload_cycle(&state, &store, dir.path()).await;
+
+        // The counter keyed #0 survives (a live mock still holds that
+        // identity) — but it now names the *other* mock: "first" moved to #1
+        // and owns no state, the semantic the README documents.
+        assert_eq!(counter_step_of(&state, "orders.json#0").await, Some(2));
+        assert_eq!(counter_step_of(&state, "orders.json#1").await, None);
+    }
+
     #[tokio::test]
     async fn test_reload_drops_counters_for_a_deleted_mock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1663,7 +1826,11 @@ mod tests {
         ]);
         let result = LoadResult {
             mocks: map(vec![sourced("GET", "/stay", "stay", "m/b.json")]),
-            errors: vec![("m/broken.json".into(), "bad".to_string())],
+            errors: vec![loader::LoadError {
+                file: "m/broken.json".into(),
+                element: None,
+                message: "bad".to_string(),
+            }],
             files: 2,
         };
 
@@ -1682,7 +1849,11 @@ mod tests {
         let current = map(vec![sourced("GET", "/old", "v1", "m/a.json")]);
         let result = LoadResult {
             mocks: map(vec![sourced("GET", "/new", "v2", "m/a.json")]),
-            errors: vec![("m/broken.json".into(), "bad".to_string())],
+            errors: vec![loader::LoadError {
+                file: "m/broken.json".into(),
+                element: None,
+                message: "bad".to_string(),
+            }],
             files: 2,
         };
 
@@ -1700,7 +1871,11 @@ mod tests {
         ]);
         let result = LoadResult {
             mocks: HashMap::new(),
-            errors: vec![("m/sub".into(), "unreadable".to_string())],
+            errors: vec![loader::LoadError {
+                file: "m/sub".into(),
+                element: None,
+                message: "unreadable".to_string(),
+            }],
             files: 0,
         };
 
@@ -1718,7 +1893,11 @@ mod tests {
         ]);
         let result = LoadResult {
             mocks: map(vec![sourced("GET", "/x", "b", "m/b.json")]),
-            errors: vec![("m/c.json".into(), "bad".to_string())],
+            errors: vec![loader::LoadError {
+                file: "m/c.json".into(),
+                element: None,
+                message: "bad".to_string(),
+            }],
             files: 3,
         };
 
@@ -1733,6 +1912,144 @@ mod tests {
             ["b", "c"],
             "a.json was deleted, c.json is carried, sorted by path"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Element-aware carry-forward across an array file (#142)
+    // ------------------------------------------------------------------
+
+    /// A mock from an array file, at `index` within it.
+    fn array_sourced(method: &str, path: &str, marker: &str, index: usize) -> MockConfig {
+        let mut m = mock(method, path, marker);
+        m.source = Some("m/orders.json".to_string());
+        m.source_index = Some(index);
+        m
+    }
+
+    #[test]
+    fn test_a_failed_array_element_carries_forward_only_itself() {
+        // orders.json holds two mocks under POST /orders; this cycle element
+        // 0 failed validation while its sibling loaded fresh. Element 0's
+        // own last-known-good mock is carried; the sibling is not, or the
+        // fresh registration would be duplicated.
+        let current = map(vec![
+            array_sourced("POST", "/orders", "last-good", 0),
+            array_sourced("POST", "/orders", "stale", 1),
+        ]);
+        let result = LoadResult {
+            mocks: map(vec![array_sourced("POST", "/orders", "fresh", 1)]),
+            errors: vec![loader::LoadError {
+                file: "m/orders.json".into(),
+                element: Some(0),
+                message: "bad".to_string(),
+            }],
+            files: 1,
+        };
+
+        let next = apply_reload(&current, result);
+
+        let markers: Vec<_> = next["POST:/orders"]
+            .iter()
+            .map(|m| m.response["source"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            markers,
+            ["last-good", "fresh"],
+            "the failed element is carried ahead of the fresh sibling, in element order"
+        );
+    }
+
+    #[test]
+    fn test_a_freshly_loaded_array_element_replaces_it_without_duplication() {
+        // The whole-file failure case already carries everything; the
+        // element case's discipline is that loading siblings replace
+        // themselves. An error on element 1 must not resurrect its
+        // last-known-good copy when element 0 re-loads fine.
+        let current = map(vec![
+            array_sourced("POST", "/orders", "old", 0),
+            array_sourced("POST", "/orders", "old", 1),
+        ]);
+        let result = LoadResult {
+            mocks: map(vec![array_sourced("POST", "/orders", "new", 0)]),
+            errors: vec![loader::LoadError {
+                file: "m/orders.json".into(),
+                element: Some(1),
+                message: "bad".to_string(),
+            }],
+            files: 1,
+        };
+
+        let next = apply_reload(&current, result);
+
+        let markers: Vec<_> = next["POST:/orders"]
+            .iter()
+            .map(|m| m.response["source"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            markers,
+            ["new", "old"],
+            "element 0 fresh; element 1 carried — and only carried once"
+        );
+        assert_eq!(next["POST:/orders"].len(), 2, "no duplicated sibling");
+    }
+
+    #[test]
+    fn test_an_array_carry_sorts_elements_numerically_within_the_file() {
+        // The carried bucket sorts by (source, element): `#2` ahead of
+        // `#10`, which a lexicographic string sort of the label would get
+        // backwards. With >9 elements this order is what the dashboard and
+        // the tie-break see.
+        let current = map(vec![
+            array_sourced("POST", "/orders", "e2", 2),
+            array_sourced("POST", "/orders", "e10", 10),
+        ]);
+        let result = LoadResult {
+            mocks: map(vec![array_sourced("GET", "/other", "ok", 0)]),
+            errors: vec![loader::LoadError {
+                file: "m/orders.json".into(),
+                element: None,
+                message: "bad".to_string(),
+            }],
+            files: 1,
+        };
+
+        let next = apply_reload(&current, result);
+
+        let markers: Vec<_> = next["POST:/orders"]
+            .iter()
+            .map(|m| m.response["source"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            markers,
+            ["e2", "e10"],
+            "numeric element order, not string order"
+        );
+    }
+
+    #[test]
+    fn test_a_whole_file_array_failure_carries_every_element() {
+        // The array file stops parsing mid-save: all of its last-known-good
+        // elements keep serving, exactly like a single-object file's mock.
+        let current = map(vec![
+            array_sourced("GET", "/orders", "a", 0),
+            array_sourced("POST", "/orders", "b", 1),
+        ]);
+        let result = LoadResult {
+            mocks: HashMap::new(),
+            errors: vec![loader::LoadError {
+                file: "m/orders.json".into(),
+                element: None,
+                message: "Failed to parse".to_string(),
+            }],
+            files: 1,
+        };
+
+        let next = apply_reload(&current, result);
+
+        assert!(next.contains_key("GET:/orders"));
+        assert!(next.contains_key("POST:/orders"));
+        assert_eq!(next["GET:/orders"][0].response["source"], "a");
+        assert_eq!(next["POST:/orders"][0].response["source"], "b");
     }
 
     #[test]

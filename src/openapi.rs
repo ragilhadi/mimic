@@ -7,10 +7,12 @@
 //! ```
 //!
 //! The importer reads an OpenAPI 3.x document (JSON or YAML) and writes one
-//! ordinary Mimic mock file per operation + response status. The output is a
-//! plain `MockConfig`, JSON by default or YAML with `--format yaml` — nothing
-//! about it is special either way, so it can be hand-edited afterwards and
-//! Mimic's file-based, zero-config model stays intact.
+//! ordinary Mimic mock file per operation + response status — or, with
+//! `--bundle`, one array file per path holding every operation of that path
+//! (#142). The output is a plain `MockConfig` (or an array of them), JSON by
+//! default or YAML with `--format yaml` — nothing about it is special either
+//! way, so it can be hand-edited afterwards and Mimic's file-based,
+//! zero-config model stays intact.
 //!
 //! Only the subset of OpenAPI that affects a mock response is parsed
 //! (`paths`, operations, `responses`, `content`, examples, and schemas). The
@@ -20,7 +22,7 @@
 
 use crate::types::MockConfig;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,12 +66,19 @@ One live mock file is written per operation, from its primary response.
 Other documented statuses are written alongside as
 <name>_<status>.<ext>.disabled — rename to drop the suffix to enable one.
 
+With --bundle, one array file is written per path instead, holding that
+path's operations together (<users>.json); its alternatives land in one
+inert <slug>_alt.<ext>.disabled array (rename to enable, then delete the
+elements you don't want).
+
 Options:
   --out <dir>          Output directory (default: ./mocks/generated)
   --status <code>      Status treated as each operation's primary response;
                        its file is the live one (default: 200)
   --format <fmt>       Output format for generated mock files: json or yaml
                        (default: json)
+  --bundle             One array file per path holding all its operations,
+                       instead of one file per operation
   --base-path <path>   Prefix every generated mock's path instead of the one
                        the spec's servers[0].url carries; an empty value ('')
                        drops the prefix entirely (default: apply servers[0])
@@ -162,6 +171,9 @@ pub struct ImportOptions {
     pub force: bool,
     pub path_style: PathStyle,
     pub format: OutputFormat,
+    /// `--bundle`: group the generated mocks into one array file per path,
+    /// instead of one file per operation + status.
+    pub bundle: bool,
     /// `None`: derive the base path from the spec's `servers`. `Some("")`:
     /// explicitly drop it. `Some(path)`: override.
     pub base_path: Option<String>,
@@ -176,6 +188,7 @@ impl Default for ImportOptions {
             force: false,
             path_style: PathStyle::Colon,
             format: OutputFormat::default(),
+            bundle: false,
             base_path: None,
         }
     }
@@ -192,6 +205,7 @@ pub fn parse_args(args: &[String]) -> Result<ImportOptions, ImportError> {
         match arg {
             "-h" | "--help" => return Err(ImportError::Usage(String::new())),
             "--force" => options.force = true,
+            "--bundle" => options.bundle = true,
             "--brace-params" => options.path_style = PathStyle::Brace,
             "--out" | "--status" | "--format" | "--base-path" => {
                 let value = args
@@ -700,6 +714,7 @@ pub fn generate_mocks(
                         template: None,
                         response_bytes: None,
                         template_escape: None,
+                        source_index: None,
                     },
                 ));
             }
@@ -709,12 +724,20 @@ pub fn generate_mocks(
     generated
 }
 
+/// One generated mock file's contents: a single mock (the default shape) or
+/// an array of them (`--bundle`, one file per path).
+#[derive(Debug)]
+pub enum GeneratedFile {
+    One(Box<MockConfig>),
+    Many(Vec<MockConfig>),
+}
+
 /// Write generated mocks to `out_dir`.
 ///
 /// Refuses a non-empty directory without `force`, so a second import can't
 /// silently clobber mocks that were hand-edited after the first one.
 pub fn write_mocks(
-    mocks: &[(String, MockConfig)],
+    files: &[(String, GeneratedFile)],
     out_dir: &Path,
     force: bool,
     format: OutputFormat,
@@ -731,22 +754,33 @@ pub fn write_mocks(
         ))
     })?;
 
-    let mut written = Vec::with_capacity(mocks.len());
-    for (name, config) in mocks {
+    let mut written = Vec::with_capacity(files.len());
+    for (name, file) in files {
         let path = out_dir.join(name);
         if path.exists() {
             warn(format!("overwriting existing file '{}'", path.display()));
         }
-        let body = match format {
-            OutputFormat::Json => {
+        let body = match (file, format) {
+            (GeneratedFile::One(config), OutputFormat::Json) => {
                 let mut body = serde_json::to_string_pretty(config).map_err(|e| {
                     ImportError::Io(format!("cannot serialize mock '{}': {}", name, e))
                 })?;
                 body.push('\n');
                 body
             }
-            OutputFormat::Yaml => serde_yaml::to_string(config)
+            (GeneratedFile::Many(configs), OutputFormat::Json) => {
+                let mut body = serde_json::to_string_pretty(configs).map_err(|e| {
+                    ImportError::Io(format!("cannot serialize mock file '{}': {}", name, e))
+                })?;
+                body.push('\n');
+                body
+            }
+            (GeneratedFile::One(config), OutputFormat::Yaml) => serde_yaml::to_string(config)
                 .map_err(|e| ImportError::Io(format!("cannot serialize mock '{}': {}", name, e)))?,
+            (GeneratedFile::Many(configs), OutputFormat::Yaml) => serde_yaml::to_string(configs)
+                .map_err(|e| {
+                    ImportError::Io(format!("cannot serialize mock file '{}': {}", name, e))
+                })?,
         };
         fs::write(&path, body)
             .map_err(|e| ImportError::Io(format!("cannot write '{}': {}", path.display(), e)))?;
@@ -804,8 +838,83 @@ pub fn run_import(args: &[String]) -> Result<(Vec<PathBuf>, String), ImportError
         return Ok((Vec::new(), base_path));
     }
 
-    let written = write_mocks(&mocks, &options.out_dir, options.force, options.format)?;
+    let files = generated_files(mocks, options.bundle, options.format);
+    let written = write_mocks(&files, &options.out_dir, options.force, options.format)?;
     Ok((written, base_path))
+}
+
+/// Shape the generated mocks into the files they are written as: one file per
+/// operation by default, or — with `--bundle` — one array file per path.
+pub fn generated_files(
+    mocks: Vec<(String, MockConfig)>,
+    bundle: bool,
+    format: OutputFormat,
+) -> Vec<(String, GeneratedFile)> {
+    if bundle {
+        bundle_files(&mocks, format)
+    } else {
+        mocks
+            .into_iter()
+            .map(|(name, config)| (name, GeneratedFile::One(Box::new(config))))
+            .collect()
+    }
+}
+
+/// Group generated mocks into one array file per path (#142).
+///
+/// A path's primary mocks — the ones whose generated filename carries no
+/// `.disabled` suffix — become the live `<slug>.<ext>` array, in the order
+/// the operations were generated. Its alternative statuses gather in one
+/// inert `<slug>_alt.<ext>.disabled` array: dropping the suffix makes all of
+/// them live at once, so enabling just one is a matter of deleting the
+/// siblings you don't want. That trade is `--bundle` buying fewer files.
+fn bundle_files(
+    mocks: &[(String, MockConfig)],
+    format: OutputFormat,
+) -> Vec<(String, GeneratedFile)> {
+    let ext = format.extension();
+    let mut used_names: HashSet<String> = HashSet::new();
+    let mut bundled: Vec<(String, GeneratedFile)> = Vec::new();
+
+    // First-encounter order is the spec's own deterministic order, so the
+    // bundle grouping inherits it rather than a HashMap's.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_path: HashMap<&str, (Vec<&MockConfig>, Vec<&MockConfig>)> = HashMap::new();
+    for (name, mock) in mocks {
+        let entry = by_path.entry(mock.path.as_str()).or_default();
+        if entry.0.is_empty() && entry.1.is_empty() {
+            order.push(mock.path.clone());
+        }
+        if name.ends_with(DISABLED_SUFFIX) {
+            entry.1.push(mock);
+        } else {
+            entry.0.push(mock);
+        }
+    }
+
+    for path in order {
+        let (primaries, alternates) = &by_path[path.as_str()];
+        let slug = path_slug(&path);
+
+        let live_name = unique_name(&format!("{}.{}", slug, ext), &mut used_names);
+        bundled.push((
+            live_name,
+            GeneratedFile::Many(primaries.iter().map(|mock| (*mock).clone()).collect()),
+        ));
+
+        if !alternates.is_empty() {
+            let alt_name = unique_name(
+                &format!("{}_alt.{}{}", slug, ext, DISABLED_SUFFIX),
+                &mut used_names,
+            );
+            bundled.push((
+                alt_name,
+                GeneratedFile::Many(alternates.iter().map(|mock| (*mock).clone()).collect()),
+            ));
+        }
+    }
+
+    bundled
 }
 
 // ============================================================================
@@ -2338,14 +2447,159 @@ paths:
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("generated");
         let mocks = generate(&fixture());
+        let mock_count = mocks.len();
 
-        let written = write_mocks(&mocks, &out, false, OutputFormat::Json).unwrap();
+        let written = write_mocks(
+            &generated_files(mocks, false, OutputFormat::Json),
+            &out,
+            false,
+            OutputFormat::Json,
+        )
+        .unwrap();
 
-        assert_eq!(written.len(), mocks.len());
+        assert_eq!(written.len(), mock_count);
         let contents = fs::read_to_string(out.join("get_users_id.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed["path"], "/users/:id");
         assert!(contents.ends_with('\n'));
+    }
+
+    // ------------------------------------------------------------------
+    // --bundle: one array file per path (#142)
+    // ------------------------------------------------------------------
+
+    fn bundled(spec: &OpenApiSpec) -> Vec<(String, GeneratedFile)> {
+        generated_files(
+            generate_mocks(
+                spec,
+                DEFAULT_STATUS,
+                PathStyle::Colon,
+                OutputFormat::Json,
+                "",
+            ),
+            true,
+            OutputFormat::Json,
+        )
+    }
+
+    fn find_many<'a>(files: &'a [(String, GeneratedFile)], name: &str) -> &'a Vec<MockConfig> {
+        match files
+            .iter()
+            .find(|(filename, _)| filename == name)
+            .map(|(_, file)| file)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no file named '{}'; generated: {:?}",
+                    name,
+                    files.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                )
+            }) {
+            GeneratedFile::Many(mocks) => mocks,
+            GeneratedFile::One(_) => panic!("'{}' should be a bundled array", name),
+        }
+    }
+
+    #[test]
+    fn test_bundle_groups_every_operation_of_a_path_into_one_array() {
+        // /users carries GET (primary 200) and POST (primary 201, alternate
+        // 400); /users/{id} carries GET (200, alternate 404) and DELETE
+        // (204). Grouped by path: one live array per path, one inert
+        // alternates array per path that has any.
+        let files = bundled(&fixture());
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "users.json",
+                "users_alt.json.disabled",
+                "users_id.json",
+                "users_id_alt.json.disabled"
+            ],
+            "deterministic in the spec's own path order, live before inert"
+        );
+
+        let users = find_many(&files, "users.json");
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].method, "GET");
+        assert_eq!(users[0].path, "/users");
+        assert_eq!(users[1].method, "POST");
+        assert_eq!(users[1].path, "/users");
+
+        let users_alt = find_many(&files, "users_alt.json.disabled");
+        assert_eq!(users_alt.len(), 1);
+        assert_eq!(users_alt[0].method, "POST");
+        assert_eq!(users_alt[0].status, 400);
+
+        let users_id = find_many(&files, "users_id.json");
+        assert_eq!(users_id.len(), 2);
+        assert_eq!(users_id[0].method, "GET");
+        assert_eq!(users_id[0].path, "/users/:id");
+        assert_eq!(users_id[1].method, "DELETE");
+
+        let users_id_alt = find_many(&files, "users_id_alt.json.disabled");
+        assert_eq!(users_id_alt.len(), 1);
+        assert_eq!(users_id_alt[0].status, 404);
+    }
+
+    #[test]
+    fn test_bundle_output_round_trips_through_the_loader() {
+        // What --bundle writes is ordinary Mimic input: the loader registers
+        // every live element and never touches the inert alternates file.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("generated");
+        write_mocks(&bundled(&fixture()), &out, false, OutputFormat::Json).unwrap();
+
+        let loaded = crate::loader::load_mocks_map(out.to_str().unwrap());
+        assert_eq!(loaded.errors.len(), 0, "{:?}", loaded.errors);
+        assert!(loaded.mocks.contains_key("GET:/users"));
+        assert!(loaded.mocks.contains_key("POST:/users"));
+        assert!(loaded.mocks.contains_key("GET:/users/:id"));
+        assert!(loaded.mocks.contains_key("DELETE:/users/:id"));
+
+        // The array elements ride with their file/index identity, so the
+        // two elements of users.json have distinct, stable identities.
+        assert_eq!(
+            loaded.mocks["GET:/users"][0].source_index,
+            Some(0),
+            "bundled elements keep positional identity"
+        );
+    }
+
+    #[test]
+    fn test_bundle_in_yaml_format_writes_block_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("generated");
+        let files = generated_files(
+            generate_mocks(
+                &fixture(),
+                DEFAULT_STATUS,
+                PathStyle::Colon,
+                OutputFormat::Yaml,
+                "",
+            ),
+            true,
+            OutputFormat::Yaml,
+        );
+        write_mocks(&files, &out, false, OutputFormat::Yaml).unwrap();
+
+        let contents = fs::read_to_string(out.join("users.yaml")).unwrap();
+        assert!(
+            contents.contains("method: GET"),
+            "a YAML array file reads as a block sequence: {contents:?}"
+        );
+
+        let loaded = crate::loader::load_mocks_map(out.to_str().unwrap());
+        assert_eq!(loaded.errors.len(), 0, "{:?}", loaded.errors);
+        assert!(loaded.mocks.contains_key("GET:/users"));
+        assert!(loaded.mocks.contains_key("POST:/users"));
+    }
+
+    #[test]
+    fn test_parse_args_bundle_flag() {
+        let options = parse_args(&args(&["spec.yaml", "--bundle"])).unwrap();
+        assert!(options.bundle);
+        let options = parse_args(&args(&["spec.yaml"])).unwrap();
+        assert!(!options.bundle);
     }
 
     #[test]
@@ -2360,9 +2614,16 @@ paths:
             "",
         );
 
-        let written = write_mocks(&mocks, &out, false, OutputFormat::Yaml).unwrap();
+        let mock_count = mocks.len();
+        let written = write_mocks(
+            &generated_files(mocks, false, OutputFormat::Yaml),
+            &out,
+            false,
+            OutputFormat::Yaml,
+        )
+        .unwrap();
 
-        assert_eq!(written.len(), mocks.len());
+        assert_eq!(written.len(), mock_count);
         let path = out.join("get_users_id.yaml");
         assert!(path.exists(), "expected a .yaml file, found: {:?}", written);
 
@@ -2401,8 +2662,13 @@ paths:
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("handwritten.json"), "{}").unwrap();
 
-        let error =
-            write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap_err();
+        let error = write_mocks(
+            &generated_files(generate(&fixture()), false, OutputFormat::Json),
+            dir.path(),
+            false,
+            OutputFormat::Json,
+        )
+        .unwrap_err();
 
         assert!(
             matches!(error, ImportError::OutputNotEmpty(_)),
@@ -2421,7 +2687,13 @@ paths:
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("get_users_id.json"), "stale").unwrap();
 
-        write_mocks(&generate(&fixture()), dir.path(), true, OutputFormat::Json).unwrap();
+        write_mocks(
+            &generated_files(generate(&fixture()), false, OutputFormat::Json),
+            dir.path(),
+            true,
+            OutputFormat::Json,
+        )
+        .unwrap();
 
         let contents = fs::read_to_string(dir.path().join("get_users_id.json")).unwrap();
         assert!(contents.contains("/users/:id"), "{}", contents);
@@ -2461,7 +2733,13 @@ paths:
     #[test]
     fn test_generated_mocks_are_loadable_and_matchable() {
         let dir = tempfile::tempdir().unwrap();
-        write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
+        write_mocks(
+            &generated_files(generate(&fixture()), false, OutputFormat::Json),
+            dir.path(),
+            false,
+            OutputFormat::Json,
+        )
+        .unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         assert_eq!(loaded.errors.len(), 0, "every generated file must parse");
@@ -2487,7 +2765,13 @@ paths:
     #[test]
     fn test_only_the_primary_status_is_live_per_route() {
         let dir = tempfile::tempdir().unwrap();
-        write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
+        write_mocks(
+            &generated_files(generate(&fixture()), false, OutputFormat::Json),
+            dir.path(),
+            false,
+            OutputFormat::Json,
+        )
+        .unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         for (key, mocks) in &loaded.mocks {
@@ -2509,7 +2793,13 @@ paths:
     #[test]
     fn test_renaming_a_disabled_file_enables_it() {
         let dir = tempfile::tempdir().unwrap();
-        write_mocks(&generate(&fixture()), dir.path(), false, OutputFormat::Json).unwrap();
+        write_mocks(
+            &generated_files(generate(&fixture()), false, OutputFormat::Json),
+            dir.path(),
+            false,
+            OutputFormat::Json,
+        )
+        .unwrap();
 
         fs::remove_file(dir.path().join("get_users_id.json")).unwrap();
         fs::rename(
@@ -2551,7 +2841,13 @@ paths:
             OutputFormat::Json,
             "",
         );
-        write_mocks(&mocks, dir.path(), false, OutputFormat::Json).unwrap();
+        write_mocks(
+            &generated_files(mocks, false, OutputFormat::Json),
+            dir.path(),
+            false,
+            OutputFormat::Json,
+        )
+        .unwrap();
 
         let loaded = crate::loader::load_mocks_map(dir.path().to_str().unwrap());
         let context =

@@ -15,6 +15,7 @@ fn plain_mock(method: &str, path: &str) -> MockConfig {
         delay_ms: None,
         response_headers: None,
         source: None,
+        source_index: None,
         sequence: None,
         tags: Vec::new(),
         response_file: None,
@@ -93,6 +94,27 @@ fn explain_no_match_names_an_absent_required_header() {
     );
     assert!(
         explanation.contains("required header `x-api-key` was absent"),
+        "{}",
+        explanation
+    );
+}
+
+#[test]
+fn explain_no_match_names_one_element_of_an_array_file() {
+    // A mock that is one element of an array file names itself `file#index`,
+    // so the explanation still answers "where do I go to change this?" at
+    // element granularity.
+    let mut mock = plain_mock("GET", "/orders");
+    mock.source = Some("mocks/orders.json".to_string());
+    mock.source_index = Some(2);
+    mock.headers = Some(header_matcher(
+        "x-api-key",
+        HeaderValue::Exact("secret".to_string()),
+    ));
+
+    let explanation = explain_no_match(&ctx("GET", "/orders"), &store(vec![mock]), None).unwrap();
+    assert!(
+        explanation.contains("mocks/orders.json#2"),
         "{}",
         explanation
     );

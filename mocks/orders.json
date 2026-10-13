@@ -1,0 +1,46 @@
+[
+  {
+    "method": "GET",
+    "path": "/orders",
+    "status": 200,
+    "response": {
+      "orders": [
+        { "id": 1, "userId": 1, "status": "shipped", "total": 49.99 },
+        { "id": 2, "userId": 2, "status": "processing", "total": 12.5 },
+        { "id": 3, "userId": 3, "status": "pending", "total": 99.0 }
+      ],
+      "total": 3
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/orders/:id",
+    "status": 200,
+    "response": {
+      "id": 1,
+      "userId": 1,
+      "status": "shipped",
+      "items": [
+        { "sku": "BOOK-01", "quantity": 2 },
+        { "sku": "PEN-04", "quantity": 1 }
+      ],
+      "total": 49.99
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/orders",
+    "status": 201,
+    "response": {
+      "id": 4,
+      "status": "pending",
+      "message": "order accepted"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/orders/:id",
+    "status": 204,
+    "response": null
+  }
+]

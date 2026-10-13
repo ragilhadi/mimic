@@ -25,6 +25,7 @@ fn create_test_state() -> AppState {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -48,6 +49,7 @@ fn create_test_state() -> AppState {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -71,6 +73,7 @@ fn create_test_state() -> AppState {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -307,6 +310,7 @@ async fn test_handle_request_explicit_head_mock_is_unaffected() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -349,6 +353,7 @@ async fn test_handle_request_head_fallback_serves_a_pattern_route() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -401,6 +406,7 @@ async fn test_handle_request_head_fallback_bumps_the_get_mocks_state() {
             delay_ms: None,
             response_headers: None,
             source: Some("mocks/users.json".to_string()),
+            source_index: None,
             sequence: Some(vec![
                 SequenceStep {
                     status: 503,
@@ -543,6 +549,7 @@ async fn test_query_param_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -591,6 +598,7 @@ async fn test_query_param_regex_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -650,6 +658,7 @@ async fn test_header_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -707,6 +716,7 @@ async fn test_header_prefix_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -765,6 +775,7 @@ async fn test_json_body_exact_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -814,6 +825,7 @@ async fn test_json_body_partial_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -880,6 +892,7 @@ async fn test_combined_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -937,6 +950,7 @@ async fn test_template_interpolates_body_query_and_header() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -985,6 +999,7 @@ async fn test_template_query_param_decodes_plus_as_a_space() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1040,6 +1055,7 @@ async fn test_form_body_with_a_plus_encoded_space_matches_and_templates() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1098,6 +1114,7 @@ async fn test_template_nested_body_field() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1138,6 +1155,7 @@ async fn test_template_missing_variable_renders_empty_string() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1195,6 +1213,7 @@ async fn test_template_in_sequence_step_response() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: Some(vec![SequenceStep {
                 status: 200,
                 response: json!({"echoed": "{{body.message}}"}),
@@ -1249,6 +1268,7 @@ async fn test_faker_templates_render_fresh_values_per_call() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1306,6 +1326,7 @@ async fn test_faker_template_in_sequence_step_response() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: Some(vec![SequenceStep {
                 status: 202,
                 response: json!({"job_id": "{{faker.uuid}}"}),
@@ -1368,6 +1389,7 @@ async fn test_faker_is_never_used_for_matching() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1425,6 +1447,7 @@ async fn test_path_param_matches_and_templates_into_response() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1469,6 +1492,7 @@ async fn test_path_param_brace_syntax_multiple_params() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1509,6 +1533,7 @@ async fn test_exact_path_wins_over_path_param_pattern() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1531,6 +1556,7 @@ async fn test_exact_path_wins_over_path_param_pattern() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1588,6 +1614,7 @@ async fn test_path_param_sequence_shared_across_ids() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: Some(vec![
                 SequenceStep {
                     status: 503,
@@ -1664,6 +1691,7 @@ async fn test_no_path_param_match_returns_404() {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1715,6 +1743,7 @@ async fn test_multiple_mocks_same_path_body_differentiation() {
                 delay_ms: None,
                 response_headers: None,
                 source: None,
+                source_index: None,
                 sequence: None,
                 tags: Vec::new(),
                 response_file: None,
@@ -1738,6 +1767,7 @@ async fn test_multiple_mocks_same_path_body_differentiation() {
                 delay_ms: None,
                 response_headers: None,
                 source: None,
+                source_index: None,
                 sequence: None,
                 tags: Vec::new(),
                 response_file: None,
@@ -2021,6 +2051,7 @@ fn sequence_mock(path: &str, steps: Vec<SequenceStep>) -> MockConfig {
         delay_ms: None,
         response_headers: None,
         source: None,
+        source_index: None,
         sequence: Some(steps),
         tags: Vec::new(),
         response_file: None,
@@ -2186,6 +2217,7 @@ async fn test_sequence_counters_independent_per_variant() {
         delay_ms: None,
         response_headers: None,
         source: None,
+        source_index: None,
         sequence: Some(steps),
         tags: Vec::new(),
         response_file: None,
@@ -2694,6 +2726,7 @@ fn body_mock(path: &str, consume_body: bool) -> MockConfig {
         delay_ms: None,
         response_headers: None,
         source: None,
+        source_index: None,
         sequence: None,
         tags: Vec::new(),
         response_file: None,
@@ -2816,6 +2849,7 @@ fn dash_mock(method: &str, path: &str, source: Option<&str>) -> MockConfig {
         delay_ms: None,
         response_headers: None,
         source: source.map(|s| s.to_string()),
+        source_index: None,
         sequence: None,
         tags: Vec::new(),
         response_file: None,
@@ -2872,6 +2906,23 @@ async fn test_list_mocks_reports_every_loaded_mock() {
     assert_eq!(mocks[0]["status"], 200);
     assert_eq!(mocks[0]["source"], "mocks/get_users.json");
     assert_eq!(mocks[1]["key"], "POST:/login");
+}
+
+#[tokio::test]
+async fn test_list_mocks_names_one_element_of_an_array_file() {
+    // Two mocks loaded from the same array file keep separate rows, each
+    // pointing at its own place in that file.
+    let mut first = dash_mock("GET", "/orders", Some("mocks/orders.json"));
+    first.source_index = Some(0);
+    let mut second = dash_mock("DELETE", "/orders/:id", Some("mocks/orders.json"));
+    second.source_index = Some(3);
+
+    let body = list_mocks(State(dash_state(vec![first, second]))).await.0;
+    let mocks = body["mocks"].as_array().unwrap();
+
+    // Sorted by key: DELETE before GET.
+    assert_eq!(mocks[0]["source"], "mocks/orders.json#3");
+    assert_eq!(mocks[1]["source"], "mocks/orders.json#0");
 }
 
 #[tokio::test]
@@ -3083,7 +3134,7 @@ async fn test_list_sequences_survives_a_counter_with_no_mock() {
         counters.insert(
             MockIdentity {
                 key: "POST:/gone".to_string(),
-                origin: crate::types::MockOrigin::Source("mocks/gone.json".to_string()),
+                origin: crate::types::MockOrigin::Source("mocks/gone.json".to_string(), None),
             },
             4,
         );

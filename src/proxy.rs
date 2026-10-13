@@ -760,6 +760,7 @@ fn build_recorded_mock(
         sequence: None,
         tags: Vec::new(),
         source: None,
+        source_index: None,
     }
 }
 

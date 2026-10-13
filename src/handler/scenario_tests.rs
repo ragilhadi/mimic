@@ -16,6 +16,7 @@ fn mock(method: &str, path: &str, marker: &str, tags: &[&str]) -> MockConfig {
         delay_ms: None,
         response_headers: None,
         source: None,
+        source_index: None,
         sequence: None,
         tags: tags.iter().map(|t| t.to_string()).collect(),
         response_file: None,

@@ -7,14 +7,41 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
+/// One mock file — or one element of an array file — that failed to load,
+/// with the reason it failed.
+#[derive(Debug, Clone)]
+pub struct LoadError {
+    /// The file the failure is in, as the walk named it.
+    pub file: PathBuf,
+    /// `Some(index)` when the file is an array of mocks and only element
+    /// `index` failed validation — its siblings still load. `None` when the
+    /// whole file failed: unreadable, or not valid JSON/YAML.
+    pub element: Option<usize>,
+    /// The reason, naming the file (or `file#index`) it is about.
+    pub message: String,
+}
+
+impl LoadError {
+    /// What to name this failure as in diagnostics: the file, or the
+    /// positional `file#index` for an element error.
+    pub fn target(&self) -> String {
+        match self.element {
+            Some(index) => format!("{}#{}", self.file.display(), index),
+            None => self.file.display().to_string(),
+        }
+    }
+}
+
 /// Result of loading mock configurations, including any errors encountered.
 pub struct LoadResult {
     pub mocks: HashMap<String, Vec<MockConfig>>,
-    /// Per-file failures — the file and *why* it failed — in the walk's
-    /// sorted order. The loader only ever had a count of these; carrying the
-    /// messages is what lets a consumer log or report them without
-    /// re-deriving them (the hot-reload summary, `mimic validate`).
-    pub errors: Vec<(PathBuf, String)>,
+    /// Per-file (or per-element) failures — the target and *why* it failed —
+    /// in the walk's sorted order. The loader only ever had a count of
+    /// these; carrying the messages is what lets a consumer log or report
+    /// them without re-deriving them (the hot-reload summary,
+    /// `mimic validate`), and carrying the element is what lets a hot reload
+    /// carry forward exactly the mock that failed and not its siblings.
+    pub errors: Vec<LoadError>,
     /// How many candidate mock files the walk scanned: everything counted in
     /// [`Self::errors`] and every mock in [`Self::mocks`], plus files skipped
     /// as fixtures. The number a validator's summary line talks about.
@@ -51,10 +78,14 @@ impl FileFingerprint {
 /// A mock file's last successful parse, plus the fingerprints of every
 /// fixture it depends on — so a `response_file` edit is detected even though
 /// the mock file that references it hasn't changed.
+///
+/// "Successful" means *every* element of the file loaded: an element that
+/// fails validation would otherwise freeze that verdict under an unchanged
+/// fingerprint, and fixing it would never take effect.
 struct CachedMock {
     fingerprint: FileFingerprint,
     fixture_fingerprints: Vec<(PathBuf, FileFingerprint)>,
-    outcome: LoadedMock,
+    outcome: LoadedFile,
 }
 
 /// Cross-cycle state a hot-reload loop carries so it can skip re-reading and
@@ -126,8 +157,8 @@ pub fn max_response_file_size() -> u64 {
 
 /// One mock as it came off disk: the config, plus the fixture files it claims.
 ///
-/// The fixture list is what lets the directory walk tell a fixture apart from a
-/// mock. Fixtures live inside the mocks root — the containment check requires
+/// The fixture list is what lets the directory walk tell a fixture apart from
+/// a mock. Fixtures live inside the mocks root — the containment check requires
 /// it — so a `.json` fixture would otherwise be picked up by the walk and
 /// reported as a mock file that failed to parse.
 #[derive(Clone)]
@@ -135,6 +166,54 @@ struct LoadedMock {
     mock: MockConfig,
     /// Canonical paths of the files this mock serves its bodies from.
     fixtures: Vec<PathBuf>,
+}
+
+/// One mock-candidate file's outcome: the mocks it holds, loaded or failed
+/// in place, or a whole-file failure that never got as far as any of them.
+#[derive(Clone)]
+enum LoadedFile {
+    /// The file couldn't be read or parsed at all — nothing is known about
+    /// any mock inside it, so the file fails as a whole, as it always has.
+    Failed(String),
+    /// The file parsed, holding one outcome per mock it contains, in file
+    /// order. `array` records the file's top-level shape, which decides how
+    /// its failures are reported: a single-object file fails as a whole
+    /// (no element index, byte-for-byte as it always did), while an element
+    /// of an array file fails in place as `file#index` without stopping its
+    /// siblings.
+    Parsed {
+        array: bool,
+        outcomes: Vec<Result<LoadedMock, String>>,
+    },
+}
+
+impl LoadedFile {
+    /// Every fixture file the loaded mocks of this file claim.
+    fn fixtures(&self) -> Vec<&PathBuf> {
+        match self {
+            LoadedFile::Parsed { outcomes, .. } => outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().ok())
+                .flat_map(|loaded| loaded.fixtures.iter())
+                .collect(),
+            LoadedFile::Failed(_) => Vec::new(),
+        }
+    }
+
+    /// Whether every mock of this file loaded — the condition under which an
+    /// outcome may enter the hot-reload cache.
+    fn fully_loaded(&self) -> bool {
+        match self {
+            LoadedFile::Parsed { outcomes, .. } => outcomes.iter().all(Result::is_ok),
+            LoadedFile::Failed(_) => false,
+        }
+    }
+
+    /// How the file's `index`th mock reports its element: `Some` inside an
+    /// array file, `None` in a single-object one.
+    fn element_of(array: bool, index: usize) -> Option<usize> {
+        array.then_some(index)
+    }
 }
 
 // ============================================================================
@@ -289,7 +368,11 @@ fn load_mocks_map_core(
         return ReloadOutcome {
             result: LoadResult {
                 mocks: HashMap::new(),
-                errors: vec![(PathBuf::from(path), "mock path does not exist".to_string())],
+                errors: vec![LoadError {
+                    file: PathBuf::from(path),
+                    element: None,
+                    message: "mock path does not exist".to_string(),
+                }],
                 files: 0,
             },
             changed: was_populated,
@@ -307,8 +390,8 @@ fn load_mocks_map_core(
 
     // Pass one: read every candidate file, in a fixed order — skipping
     // whatever `cache` says is unchanged since last time.
-    let mut scanned: Vec<(PathBuf, Result<LoadedMock, String>)> = Vec::new();
-    let mut errors: Vec<(PathBuf, String)> = Vec::new();
+    let mut scanned: Vec<(PathBuf, LoadedFile)> = Vec::new();
+    let mut errors: Vec<LoadError> = Vec::new();
     let mut changed = false;
     // Every mock-candidate file seen this cycle, so a file that vanished
     // (deleted or renamed away) can be dropped from `cache` afterward instead
@@ -342,24 +425,16 @@ fn load_mocks_map_core(
         changed = true;
     }
 
-    // Drop cached fixture bytes no mock claims any more. `cache.files` is
-    // pruned against `seen` above; this map is keyed by fixture path, so a
-    // deleted or renamed fixture would otherwise stay in memory for the life of
-    // the process.
-    let claimed: HashSet<&PathBuf> = scanned
-        .iter()
-        .filter_map(|(_, outcome)| outcome.as_ref().ok())
-        .flat_map(|loaded| loaded.fixtures.iter())
-        .collect();
+    // Every fixture claimed as a fixture by a mock that loaded. A fixture is
+    // served, never registered — including when it is itself valid JSON. The
+    // same set also prunes cached fixture bytes no mock claims any more:
+    // `cache.files` is pruned against `seen` above; the fixture map is keyed
+    // by fixture path, so a deleted or renamed fixture would otherwise stay
+    // in memory for the life of the process.
+    let claimed: HashSet<&PathBuf> = scanned.iter().flat_map(|(_, f)| f.fixtures()).collect();
     cache.fixtures.retain(|path, _| claimed.contains(path));
 
-    // Every file claimed as a fixture by a mock that loaded. A fixture is
-    // served, never registered — including when it is itself valid JSON.
-    let fixtures: HashSet<&PathBuf> = scanned
-        .iter()
-        .filter_map(|(_, outcome)| outcome.as_ref().ok())
-        .flat_map(|loaded| loaded.fixtures.iter())
-        .collect();
+    let fixtures: HashSet<&PathBuf> = scanned.iter().flat_map(|(_, f)| f.fixtures()).collect();
 
     // Pass two: register what parsed, minus the fixtures.
     let mut mocks: HashMap<String, Vec<MockConfig>> = HashMap::new();
@@ -380,24 +455,37 @@ fn load_mocks_map_core(
         }
 
         match outcome {
-            Ok(loaded) => {
-                let mock = loaded.mock.clone();
-                let key = create_mock_key(&mock.method, &mock.path);
-                debug!("Loaded mock: {} -> {}", key, file.display());
-                let entry = mocks.entry(key).or_default();
-                if !entry.is_empty() {
-                    warn!(
-                        "Multiple mocks registered for {} {}: {} total (file: {})",
-                        mock.method,
-                        mock.path,
-                        entry.len() + 1,
-                        file.display()
-                    );
-                }
-                entry.push(mock);
+            LoadedFile::Failed(message) => {
+                errors.push(LoadError {
+                    file: file.clone(),
+                    element: None,
+                    message: message.clone(),
+                });
             }
-            Err(e) => {
-                errors.push((file.clone(), e.clone()));
+            LoadedFile::Parsed { array, outcomes } => {
+                for (index, element) in outcomes.iter().enumerate() {
+                    match element {
+                        Ok(loaded) => {
+                            register_mock(
+                                &mut mocks,
+                                file,
+                                LoadedFile::element_of(*array, index),
+                                loaded,
+                            );
+                        }
+                        Err(message) => {
+                            errors.push(LoadError {
+                                file: file.clone(),
+                                // A single-object file's failure is the whole
+                                // file's — no element index — so the hot
+                                // reload carries its last-known-good mock the
+                                // way it always has.
+                                element: LoadedFile::element_of(*array, index),
+                                message: message.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -438,8 +526,12 @@ fn load_mocks_map_core(
 /// its own logging.
 pub fn load_mocks(path: &str) -> MockStore {
     let result = load_mocks_map(path);
-    for (file, message) in &result.errors {
-        warn!("Failed to load mock file {}: {}", file.display(), message);
+    for error in &result.errors {
+        warn!(
+            "Failed to load mock file {}: {}",
+            error.target(),
+            error.message
+        );
     }
     Arc::new(RwLock::new(result.mocks))
 }
@@ -471,8 +563,8 @@ const MAX_WALK_DEPTH: usize = 64;
 /// so adding a cross-cycle concern (the cache, the change flag) doesn't mean
 /// adding another positional parameter to every recursive call.
 struct ScanState<'a> {
-    scanned: &'a mut Vec<(PathBuf, Result<LoadedMock, String>)>,
-    errors: &'a mut Vec<(PathBuf, String)>,
+    scanned: &'a mut Vec<(PathBuf, LoadedFile)>,
+    errors: &'a mut Vec<LoadError>,
     visited: &'a mut HashSet<PathBuf>,
     cache: &'a mut LoaderCache,
     changed: &'a mut bool,
@@ -506,7 +598,11 @@ fn collect_mock_files(
             dir.display()
         );
         error!("{}", message);
-        state.errors.push((dir.to_path_buf(), message));
+        state.errors.push(LoadError {
+            file: dir.to_path_buf(),
+            element: None,
+            message,
+        });
         return;
     }
 
@@ -515,7 +611,11 @@ fn collect_mock_files(
         Err(e) => {
             let message = format!("Failed to read directory {}: {}", dir.display(), e);
             error!("{}", message);
-            state.errors.push((dir.to_path_buf(), message));
+            state.errors.push(LoadError {
+                file: dir.to_path_buf(),
+                element: None,
+                message,
+            });
             return;
         }
     };
@@ -571,7 +671,7 @@ fn load_single_mock_maybe_cached(
     max_response_file: u64,
     cache: &mut LoaderCache,
     changed: &mut bool,
-) -> Result<LoadedMock, String> {
+) -> LoadedFile {
     let fingerprint = fs::metadata(path)
         .ok()
         .and_then(|m| FileFingerprint::of(&m));
@@ -579,7 +679,7 @@ fn load_single_mock_maybe_cached(
     if let Some(fp) = fingerprint {
         if let Some(cached) = cache.files.get(path) {
             if cached.fingerprint == fp && fixtures_unchanged(&cached.fixture_fingerprints) {
-                return Ok(cached.outcome.clone());
+                return cached.outcome.clone();
             }
         }
     }
@@ -588,10 +688,14 @@ fn load_single_mock_maybe_cached(
     let outcome = load_single_mock(path, root, max_response_file, &mut cache.fixtures);
 
     match (&outcome, fingerprint) {
-        (Ok(loaded), Some(fp)) => {
-            let fixture_fingerprints = loaded
-                .fixtures
-                .iter()
+        // Only a file whose every element loaded is cached: an element that
+        // fails validation stays out, so the next cycle retries it rather
+        // than freezing a "still broken" verdict under an unchanged
+        // fingerprint.
+        (outcome, Some(fp)) if outcome.fully_loaded() => {
+            let fixture_fingerprints = outcome
+                .fixtures()
+                .into_iter()
                 .filter_map(|f| {
                     fs::metadata(f)
                         .ok()
@@ -604,14 +708,15 @@ fn load_single_mock_maybe_cached(
                 CachedMock {
                     fingerprint: fp,
                     fixture_fingerprints,
-                    outcome: loaded.clone(),
+                    outcome: outcome.clone(),
                 },
             );
         }
         _ => {
-            // Parse failure, or a `stat` that raced with a delete: don't cache
-            // it, so the next cycle retries rather than serving a stale
-            // "still broken" verdict forever.
+            // Parse failure, an element that failed validation, or a `stat`
+            // that raced with a delete: don't cache it, so the next cycle
+            // retries rather than serving a stale "still broken" verdict
+            // forever.
             cache.files.remove(path);
         }
     }
@@ -631,17 +736,105 @@ fn fixtures_unchanged(fingerprints: &[(PathBuf, FileFingerprint)]) -> bool {
     })
 }
 
-/// Parse `contents` into a [`MockConfig`], picking the parser from `path`'s
-/// extension: `.yaml`/`.yml` goes through `serde_yaml`, everything else
-/// (including plain `.json`) through `serde_json`. Both parsers deserialize
-/// into the same `MockConfig`, so a mock means exactly the same thing in
-/// either format.
-fn parse_mock_config(path: &Path, contents: &str) -> Result<MockConfig, String> {
+/// How a file — or one element of an array file — names itself in error
+/// messages and warnings: `orders.json`, or `orders.json#2`.
+fn source_label(path: &Path, element: Option<usize>) -> String {
+    match element {
+        Some(index) => format!("{}#{}", path.display(), index),
+        None => path.display().to_string(),
+    }
+}
+
+/// Register one loaded mock under its `METHOD:path` key, and warn when a
+/// bucket gains a second member — the situation `find_matching_mock`'s
+/// file-name tie-break was built for.
+fn register_mock(
+    mocks: &mut HashMap<String, Vec<MockConfig>>,
+    file: &Path,
+    element: Option<usize>,
+    loaded: &LoadedMock,
+) {
+    let mock = &loaded.mock;
+    let key = create_mock_key(&mock.method, &mock.path);
+    debug!("Loaded mock: {} -> {}", key, source_label(file, element));
+    let entry = mocks.entry(key).or_default();
+    if !entry.is_empty() {
+        warn!(
+            "Multiple mocks registered for {} {}: {} total (next from {})",
+            mock.method,
+            mock.path,
+            entry.len() + 1,
+            source_label(file, element)
+        );
+    }
+    entry.push(mock.clone());
+}
+
+/// What one mock file parsed into: a single mock (the shape everything has
+/// always had) or a top-level array of them.
+enum ParsedMockFile {
+    One(Box<MockConfig>),
+    Many(Vec<MockConfig>),
+}
+
+/// Parse `contents` into one or several [`MockConfig`]s, picking the parser
+/// from `path`'s extension: `.yaml`/`.yml` goes through `serde_yaml`,
+/// everything else (including plain `.json`) through `serde_json`. Both
+/// parsers deserialize into the same `MockConfig`, so a mock means exactly
+/// the same thing in either format — and a file holding several of them
+/// means the same thing too.
+fn parse_mock_config(path: &Path, contents: &str) -> Result<ParsedMockFile, String> {
+    let single_parse_error = |e| {
+        format!(
+            "Failed to parse {} in {}: {}",
+            ext_word(path),
+            path.display(),
+            e
+        )
+    };
+
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml") | Some("yml") => serde_yaml::from_str(contents)
-            .map_err(|e| format!("Failed to parse YAML in {}: {}", path.display(), e)),
-        _ => serde_json::from_str(contents)
-            .map_err(|e| format!("Failed to parse JSON in {}: {}", path.display(), e)),
+        Some("yaml") | Some("yml") => {
+            // YAML's top-level shape can't be told apart lexically — a file
+            // may start with comments, `---`, or spell its sequence in block
+            // form (`- method: ...`) — so parse once into a `Value` and let
+            // the parsed data answer: a sequence is an array of mocks,
+            // anything else one mock.
+            let value: serde_yaml::Value = serde_yaml::from_str(contents)
+                .map_err(|e| format!("Failed to parse YAML in {}: {}", path.display(), e))?;
+            match value {
+                serde_yaml::Value::Sequence(items) => {
+                    serde_yaml::from_value(serde_yaml::Value::Sequence(items))
+                        .map(ParsedMockFile::Many)
+                        .map_err(|e| format!("Failed to parse YAML in {}: {}", path.display(), e))
+                }
+                other => serde_yaml::from_value(other)
+                    .map(ParsedMockFile::One)
+                    .map_err(|e| format!("Failed to parse YAML in {}: {}", path.display(), e)),
+            }
+        }
+        _ => {
+            // JSON has no comments or prelude, so the first non-whitespace
+            // byte is the whole story: `[` is an array of mocks, anything
+            // else a single mock, with its parse errors unchanged.
+            if contents.trim_start().starts_with('[') {
+                serde_json::from_str(contents)
+                    .map(ParsedMockFile::Many)
+                    .map_err(single_parse_error)
+            } else {
+                serde_json::from_str(contents)
+                    .map(|mock| ParsedMockFile::One(Box::new(mock)))
+                    .map_err(single_parse_error)
+            }
+        }
+    }
+}
+
+/// The format word a file's parse error names: `JSON` or `YAML`.
+fn ext_word(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("yaml") | Some("yml") => "YAML",
+        _ => "JSON",
     }
 }
 
@@ -650,31 +843,96 @@ fn parse_mock_config(path: &Path, contents: &str) -> Result<MockConfig, String> 
 /// `root` is the mocks root a `response_file` may not escape; `max_response_file`
 /// caps how large one of those files may be.
 ///
-/// Returns the parsed mock along with the fixture files it claims, or an error
-/// message naming the offending file.
+/// Returns every mock the file holds along with the fixture files each claims.
+/// A file that isn't readable or parseable fails as a whole; a file that is
+/// an array of mocks fails per element, so one bad sibling doesn't stop the
+/// rest from loading.
 fn load_single_mock(
     path: &Path,
     root: &Path,
     max_response_file: u64,
     fixture_cache: &mut HashMap<PathBuf, (FileFingerprint, Bytes)>,
-) -> Result<LoadedMock, String> {
-    let contents = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
+) -> LoadedFile {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            return LoadedFile::Failed(format!("Failed to read file {}: {}", path.display(), e))
+        }
+    };
 
-    let mut mock: MockConfig = parse_mock_config(path, &contents)?;
+    let parsed = match parse_mock_config(path, &contents) {
+        Ok(parsed) => parsed,
+        Err(message) => return LoadedFile::Failed(message),
+    };
+
+    // A single-object file keeps index `None`: its identity, `source`, and
+    // sequence state are exactly what they always were. Array elements are
+    // identified positionally — the best identity a mock in an array has.
+    match parsed {
+        ParsedMockFile::One(mock) => LoadedFile::Parsed {
+            array: false,
+            outcomes: vec![load_mock_element(
+                *mock,
+                path,
+                None,
+                root,
+                max_response_file,
+                fixture_cache,
+            )],
+        },
+        ParsedMockFile::Many(mocks) => LoadedFile::Parsed {
+            array: true,
+            outcomes: mocks
+                .into_iter()
+                .enumerate()
+                .map(|(index, mock)| {
+                    load_mock_element(
+                        mock,
+                        path,
+                        Some(index),
+                        root,
+                        max_response_file,
+                        fixture_cache,
+                    )
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Load one [`MockConfig`]: validate it, resolve and read any fixture it
+/// claims, and stamp loader-owned identity onto it.
+///
+/// `element` is `None` for a single-object file and `Some(i)` for element i
+/// of an array file; the labels `source` and error messages carry differ
+/// only by that `#i` suffix (`orders.json` vs `orders.json#2`). Fixtures
+/// resolve against `path`'s directory exactly as they always have — an
+/// element lives in the same file, so it resolves to the same places.
+fn load_mock_element(
+    mut mock: MockConfig,
+    path: &Path,
+    element: Option<usize>,
+    root: &Path,
+    max_response_file: u64,
+    fixture_cache: &mut HashMap<PathBuf, (FileFingerprint, Bytes)>,
+) -> Result<LoadedMock, String> {
+    let label = source_label(path, element);
 
     // The file this mock came from is the answer to "where do I go to change
     // this?", so it's recorded here rather than dropped after the parse.
     // Assigned unconditionally: `source` is loader-owned, and a value written
     // into the mock JSON by hand must not be able to misattribute a mock.
+    // The element index travels alongside it — also loader-owned, since it
+    // is decided by the file's shape, not by anything it says.
     mock.source = Some(path.display().to_string());
+    mock.source_index = element;
 
     // Validate required fields
     if mock.method.is_empty() {
-        return Err(format!("Empty method in {}", path.display()));
+        return Err(format!("Empty method in {}", label));
     }
     if mock.path.is_empty() {
-        return Err(format!("Empty path in {}", path.display()));
+        return Err(format!("Empty path in {}", label));
     }
 
     // Response bodies read from disk. Also loader-owned: whatever a mock file
@@ -683,9 +941,9 @@ fn load_single_mock(
     let mut fixtures = Vec::new();
 
     if let Some(file) = mock.response_file.clone() {
-        reject_both_bodies(&mock.response, &file, path)?;
+        reject_both_bodies(&mock.response, &file, &label)?;
         let (resolved, bytes) =
-            read_response_file(&file, path, root, max_response_file, fixture_cache)?;
+            read_response_file(&file, path, &label, root, max_response_file, fixture_cache)?;
         mock.response_bytes = Some(bytes);
         fixtures.push(resolved);
     }
@@ -693,8 +951,7 @@ fn load_single_mock(
     if !crate::types::is_valid_status(mock.status) {
         warn!(
             "{}: status {} is outside 100-599 and will be served as 200 OK",
-            path.display(),
-            mock.status
+            label, mock.status
         );
     }
 
@@ -703,18 +960,16 @@ fn load_single_mock(
         if !crate::types::is_valid_status(step.status) {
             warn!(
                 "{}: sequence step {} has status {}, outside 100-599, and will be served as 200 OK",
-                path.display(),
-                index,
-                step.status
+                label, index, step.status
             );
         }
         let Some(file) = step.response_file.clone() else {
             continue;
         };
-        reject_both_bodies(&step.response, &file, path)
+        reject_both_bodies(&step.response, &file, &label)
             .map_err(|e| format!("{} (sequence step {})", e, index))?;
         let (resolved, bytes) =
-            read_response_file(&file, path, root, max_response_file, fixture_cache)
+            read_response_file(&file, path, &label, root, max_response_file, fixture_cache)
                 .map_err(|e| format!("{} (sequence step {})", e, index))?;
         step.response_bytes = Some(bytes);
         fixtures.push(resolved);
@@ -725,18 +980,13 @@ fn load_single_mock(
 
 /// `response` and `response_file` are two answers to one question, so a mock
 /// that gives both is rejected rather than having one silently win.
-fn reject_both_bodies(
-    response: &serde_json::Value,
-    file: &str,
-    mock_path: &Path,
-) -> Result<(), String> {
+fn reject_both_bodies(response: &serde_json::Value, file: &str, label: &str) -> Result<(), String> {
     if response.is_null() {
         return Ok(());
     }
     Err(format!(
         "{} sets both `response` and `response_file` ({}); use one or the other",
-        mock_path.display(),
-        file
+        label, file
     ))
 }
 
@@ -748,9 +998,13 @@ fn reject_both_bodies(
 /// unchanged. Containment is checked *after* canonicalization, so `..` segments
 /// and symlinks are both covered — this is a server pointed at a directory it
 /// doesn't own, and "the fixture path is user input" is the whole point.
+///
+/// `label` is how the owning mock names itself in errors — `orders.json`, or
+/// `orders.json#2` when it is one element of an array file.
 fn read_response_file(
     file: &str,
     mock_path: &Path,
+    label: &str,
     root: &Path,
     max_response_file: u64,
     fixture_cache: &mut HashMap<PathBuf, (FileFingerprint, Bytes)>,
@@ -761,7 +1015,7 @@ fn read_response_file(
     let resolved = candidate.canonicalize().map_err(|e| {
         format!(
             "{}: cannot read response_file '{}' ({}): {}",
-            mock_path.display(),
+            label,
             file,
             candidate.display(),
             e
@@ -771,26 +1025,19 @@ fn read_response_file(
     if !resolved.starts_with(root) {
         return Err(format!(
             "{}: response_file '{}' resolves to {}, which is outside the mocks root {}",
-            mock_path.display(),
+            label,
             file,
             resolved.display(),
             root.display()
         ));
     }
 
-    let metadata = fs::metadata(&resolved).map_err(|e| {
-        format!(
-            "{}: cannot stat response_file '{}': {}",
-            mock_path.display(),
-            file,
-            e
-        )
-    })?;
+    let metadata = fs::metadata(&resolved)
+        .map_err(|e| format!("{}: cannot stat response_file '{}': {}", label, file, e))?;
     if !metadata.is_file() {
         return Err(format!(
             "{}: response_file '{}' is not a regular file",
-            mock_path.display(),
-            file
+            label, file
         ));
     }
     // Checked against the file's size before reading, so an oversized fixture
@@ -798,7 +1045,7 @@ fn read_response_file(
     if max_response_file > 0 && metadata.len() > max_response_file {
         return Err(format!(
             "{}: response_file '{}' is {} bytes, over the {}-byte {} limit; skipping this mock",
-            mock_path.display(),
+            label,
             file,
             metadata.len(),
             max_response_file,
@@ -818,21 +1065,15 @@ fn read_response_file(
             }
         }
 
-        let bytes = fs::read(&resolved).map_err(|e| {
-            format!(
-                "{}: failed to read response_file '{}': {}",
-                mock_path.display(),
-                file,
-                e
-            )
-        })?;
+        let bytes = fs::read(&resolved)
+            .map_err(|e| format!("{}: failed to read response_file '{}': {}", label, file, e))?;
         let bytes = Bytes::from(bytes);
 
         debug!(
             "Loaded response_file {} ({} bytes) for {}",
             resolved.display(),
             bytes.len(),
-            mock_path.display()
+            label
         );
 
         fixture_cache.insert(resolved.clone(), (fingerprint, bytes.clone()));
@@ -841,20 +1082,14 @@ fn read_response_file(
 
     // Metadata lacks a usable modified time (some platforms/filesystems):
     // caching would be unsound, so just read it every time, as before.
-    let bytes = fs::read(&resolved).map_err(|e| {
-        format!(
-            "{}: failed to read response_file '{}': {}",
-            mock_path.display(),
-            file,
-            e
-        )
-    })?;
+    let bytes = fs::read(&resolved)
+        .map_err(|e| format!("{}: failed to read response_file '{}': {}", label, file, e))?;
 
     debug!(
         "Loaded response_file {} ({} bytes) for {}",
         resolved.display(),
         bytes.len(),
-        mock_path.display()
+        label
     );
 
     Ok((resolved, Bytes::from(bytes)))
@@ -863,6 +1098,7 @@ fn read_response_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{MockIdentity, MockOrigin};
 
     /// #137: `cache.fixtures` is keyed by fixture path and was never pruned, so
     /// a deleted fixture's bytes stayed in memory for the life of the process.
@@ -1324,12 +1560,21 @@ mod tests {
             DEFAULT_MAX_RESPONSE_FILE,
             &mut HashMap::new(),
         );
-        assert!(result.is_ok());
+        let LoadedFile::Parsed { array, outcomes } = result else {
+            panic!("a single-object file parses into its single outcome");
+        };
+        assert!(!array, "the top level was not an array");
+        assert_eq!(outcomes.len(), 1);
 
-        let mock_config = result.unwrap().mock;
+        let mock_config = &outcomes[0].as_ref().expect("the one mock loads").mock;
         assert_eq!(mock_config.method, "POST");
         assert_eq!(mock_config.path, "/api/test");
         assert_eq!(mock_config.status, 201);
+        assert_eq!(
+            mock_config.source.as_deref(),
+            Some(file_path.to_str().unwrap())
+        );
+        assert_eq!(mock_config.source_index, None);
     }
 
     #[test]
@@ -1371,6 +1616,7 @@ mod tests {
             delay_ms: None,
             response_headers: None,
             source: None,
+            source_index: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -2219,18 +2465,22 @@ mod tests {
     /// Load `dir`, expecting exactly one failing file, and return its message.
     fn load_error(dir: &TempDir) -> String {
         let result = load(dir);
-        let [(_, message)] = &result.errors[..] else {
+        let [error] = &result.errors[..] else {
             panic!(
                 "expected exactly one load error, got {}: {:?}",
                 result.errors.len(),
                 result.errors
             );
         };
+        assert_eq!(
+            error.element, None,
+            "these fixtures are single-object files, so the failure is whole-file"
+        );
         assert!(
             result.mocks.is_empty(),
             "a mock that fails validation must not be registered"
         );
-        message.clone()
+        error.message.clone()
     }
 
     #[test]
@@ -2247,16 +2497,377 @@ mod tests {
 
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.files, 2, "both candidates were scanned");
-        let (file, message) = &result.errors[0];
+        let error = &result.errors[0];
         assert_eq!(
-            file.file_name().and_then(|f| f.to_str()),
+            error.file.file_name().and_then(|f| f.to_str()),
             Some("broken.json")
         );
         assert!(
-            message.contains("Failed to parse") && message.contains("broken.json"),
+            error.message.contains("Failed to parse") && error.message.contains("broken.json"),
             "the message names the rule and the file: {}",
-            message
+            error.message
         );
         assert!(result.mocks.contains_key("GET:/good"));
+    }
+
+    // ------------------------------------------------------------------
+    // Multiple mocks in one file (#142)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_array_file_registers_every_mock_in_it() {
+        let dir = mocks_dir(&[(
+            "orders.json",
+            br#"[
+                {"method":"GET","path":"/orders","status":200,"response":{"orders":[]}},
+                {"method":"POST","path":"/orders","status":201,"response":{"ok":true}},
+                {"method":"GET","path":"/orders/:id","status":200,"response":{"id":7}},
+                {"method":"DELETE","path":"/orders/:id","status":204}
+            ]"#,
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        assert_eq!(result.mocks.len(), 4);
+        assert!(result.mocks.contains_key("GET:/orders"));
+        assert!(result.mocks.contains_key("POST:/orders"));
+        assert!(result.mocks.contains_key("GET:/orders/:id"));
+        assert!(result.mocks.contains_key("DELETE:/orders/:id"));
+
+        // Each element is identified by its position in the file: the
+        // `source` stays the plain path, and the index rides alongside it.
+        for (index, key) in [
+            "GET:/orders",
+            "POST:/orders",
+            "GET:/orders/:id",
+            "DELETE:/orders/:id",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mock = &result.mocks[*key][0];
+            assert_eq!(mock.source_index, Some(index));
+        }
+        assert_eq!(
+            result.mocks["GET:/orders"][0].source.as_deref(),
+            Some(dir.path().join("orders.json").to_str().unwrap()),
+            "`source` is the file to edit; the index lives in source_label"
+        );
+    }
+
+    #[test]
+    fn a_yaml_block_sequence_file_is_an_array_of_mocks() {
+        // The realistic YAML array: block-sequence dashes, not flow syntax —
+        // and a leading comment, one reason the shape is detected after
+        // parsing rather than on the first character.
+        let dir = mocks_dir(&[(
+            "orders.yaml",
+            b"# every endpoint of /orders, together\n- method: GET\n  path: /orders\n  status: 200\n  response:\n    orders: []\n- method: POST\n  path: /orders\n  status: 201\n  response:\n    ok: true\n",
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        assert_eq!(result.mocks.len(), 2);
+        assert!(result.mocks.contains_key("GET:/orders"));
+        assert!(result.mocks.contains_key("POST:/orders"));
+    }
+
+    #[test]
+    fn a_yaml_flow_sequence_file_is_also_an_array() {
+        let dir = mocks_dir(&[(
+            "ping.yaml",
+            br#"[{method: GET, path: /ping, status: 200, response: {}}]"#,
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        assert!(result.mocks.contains_key("GET:/ping"));
+    }
+
+    #[test]
+    fn an_empty_array_file_registers_nothing() {
+        let dir = mocks_dir(&[("empty.json", b"[]")]);
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0);
+        assert!(result.mocks.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_element_is_reported_with_its_index_and_its_siblings_load() {
+        let dir = mocks_dir(&[(
+            "orders.json",
+            br#"[
+                {"method":"GET","path":"/orders","status":200,"response":{"ok":true}},
+                {"method":"","path":"/orders","status":201,"response":{"ok":true}},
+                {"method":"DELETE","path":"/orders/1","status":204}
+            ]"#,
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        let error = &result.errors[0];
+        assert_eq!(
+            error.file.file_name().and_then(|f| f.to_str()),
+            Some("orders.json")
+        );
+        assert_eq!(error.element, Some(1), "the middle element failed");
+        assert!(
+            error.message.contains("orders.json#1"),
+            "the message carries the positional file#index: {}",
+            error.message
+        );
+        // The valid siblings still load, at their own positions.
+        assert!(result.mocks.contains_key("GET:/orders"));
+        assert!(result.mocks.contains_key("DELETE:/orders/1"));
+    }
+
+    #[test]
+    fn a_broken_array_file_fails_as_a_whole() {
+        // Not valid JSON at all: nothing is known about any mock inside, so
+        // the file fails wholesale, like a single-object file always did.
+        let dir = mocks_dir(&[("arr.json", b"[{\"method\":\"GET\"")]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].element, None);
+        assert!(result.errors[0].message.contains("Failed to parse"));
+        assert!(result.mocks.is_empty());
+    }
+
+    #[test]
+    fn an_array_of_non_mocks_fails_as_a_whole() {
+        // Valid JSON, but not an array of MockConfigs: the parse of the
+        // array is a file-level failure naming the format and the file.
+        let dir = mocks_dir(&[("numbers.json", b"[1,2,3]")]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].element, None);
+        assert!(result.errors[0].message.contains("Failed to parse JSON"));
+    }
+
+    #[test]
+    fn fixtures_claimed_from_array_elements_are_served_not_registered() {
+        // The fixture exemption is about the file the walk found, not how
+        // many mocks claim it — a .json fixture one array element references
+        // must not be registered, and its bytes must reach the response.
+        let dir = mocks_dir(&[
+            (
+                "downloads.json",
+                br#"[
+                    {"method":"GET","path":"/report","status":200,"response_file":"fixtures/report.json"},
+                    {"method":"GET","path":"/notes","status":200,"response_file":"fixtures/notes.txt"}
+                ]"#,
+            ),
+            ("fixtures/report.json", br#"{"rows":[1,2]}"#),
+            ("fixtures/notes.txt", b"hello\n"),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        assert_eq!(result.mocks.len(), 2, "the fixture is not a mock");
+        assert_eq!(
+            result.mocks["GET:/report"][0].response_bytes.as_deref(),
+            Some(br#"{"rows":[1,2]}"#.as_slice())
+        );
+        assert_eq!(
+            result.mocks["GET:/notes"][0].response_bytes.as_deref(),
+            Some(b"hello\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_misdeclared_fixture_from_an_array_element_is_an_element_error() {
+        // Element 1's both-bodies mistake must not drag element 0 down, and
+        // must name `#1`.
+        let dir = mocks_dir(&[
+            (
+                "mixed.json",
+                br#"[
+                    {"method":"GET","path":"/ok","status":200,"response":{"ok":true}},
+                    {"method":"GET","path":"/both","status":200,
+                     "response":{"a":1},"response_file":"body.txt"}
+                ]"#,
+            ),
+            ("body.txt", b"bytes"),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].element, Some(1));
+        assert!(result.errors[0].message.contains("mixed.json#1"));
+        assert!(result.mocks.contains_key("GET:/ok"));
+    }
+
+    #[test]
+    fn array_elements_and_single_files_coexist_in_sorted_order() {
+        // The load-order rule (#86) covers every mock in the walk: bucket
+        // order stays a function of the file paths, with an array file's
+        // elements landing together, in element order, at the position its
+        // path sorts in.
+        let dir = mocks_dir(&[
+            (
+                "a_users.json",
+                br#"{"method":"GET","path":"/dup","status":200,"response":{"from":"a"}}"#,
+            ),
+            (
+                "m_orders.json",
+                br#"[
+                    {"method":"GET","path":"/dup","status":200,"response":{"from":"element#0"}},
+                    {"method":"GET","path":"/dup","status":200,"response":{"from":"element#1"}}
+                ]"#,
+            ),
+            (
+                "z_users.json",
+                br#"{"method":"GET","path":"/dup","status":200,"response":{"from":"z"}}"#,
+            ),
+        ]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        let order: Vec<String> = result.mocks["GET:/dup"]
+            .iter()
+            .map(|m| m.response["from"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            order,
+            ["a", "element#0", "element#1", "z"],
+            "the array file's elements load together, between the files their path sorts among"
+        );
+    }
+
+    #[test]
+    fn a_clean_array_file_is_cached_across_hot_reload_cycles() {
+        // The hot-reload cache, with the outcome now holding several mocks:
+        // a fully-loaded array file is neither re-read nor re-parsed on the
+        // next cycle.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("good.json"),
+            br#"[
+                {"method":"GET","path":"/a","status":200,"response":{"ok":true}},
+                {"method":"GET","path":"/b","status":200,"response":{"ok":true}}
+            ]"#,
+        )
+        .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(first.changed, "the first cycle always loads");
+        assert_eq!(first.result.errors.len(), 0, "{:?}", first.result.errors);
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(
+            !second.changed,
+            "the whole array outcome hit the cache; nothing else changed"
+        );
+        assert_eq!(second.result.mocks.len(), 2);
+    }
+
+    #[test]
+    fn an_element_failure_is_retried_every_cycle_until_fixed() {
+        // A file whose element fails validation isn't cached — the same
+        // contract a file that fails wholesale has always had — so its fixed
+        // element takes effect on the cycle after the fix, and while broken
+        // the load error is reported every cycle.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("partial.json"),
+            br#"[
+                {"method":"GET","path":"/c","status":200,"response":{"ok":true}},
+                {"method":"","path":"/d","status":200,"response":{"ok":true}}
+            ]"#,
+        )
+        .unwrap();
+
+        let mut cache = LoaderCache::new();
+        let first = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert_eq!(first.result.errors.len(), 1);
+        assert_eq!(first.result.errors[0].element, Some(1));
+        assert!(first.result.mocks.contains_key("GET:/c"));
+
+        let second = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(second.changed, "the failing element keeps the cycle hot");
+        assert_eq!(second.result.errors.len(), 1);
+
+        fs::write(
+            dir.path().join("partial.json"),
+            br#"[
+                {"method":"GET","path":"/c","status":200,"response":{"ok":true}},
+                {"method":"GET","path":"/d","status":200,"response":{"ok":true}}
+            ]"#,
+        )
+        .unwrap();
+        let third = load_mocks_map_hot_reload(dir.path().to_str().unwrap(), &mut cache);
+        assert!(third.changed, "the fixed element changed");
+        assert_eq!(third.result.errors.len(), 0, "{:?}", third.result.errors);
+        assert!(third.result.mocks.contains_key("GET:/d"));
+    }
+
+    #[test]
+    fn an_array_element_keeps_the_single_object_identity_carry_alive() {
+        // The single-mock identity contract, restated next to the new
+        // array identity: a single-object file's mock carries no element
+        // index, so its identity is exactly what it was before the feature.
+        let dir = mocks_dir(&[(
+            "single.json",
+            br#"{"method":"GET","path":"/users","status":200,"response":{"ok":true}}"#,
+        )]);
+
+        let result = load(&dir);
+        let mock = &result.mocks["GET:/users"][0];
+        assert_eq!(mock.source_index, None, "no index: not an array element");
+        let identity = MockIdentity::of(mock, "GET:/users", 0);
+        assert_eq!(
+            identity,
+            MockIdentity {
+                key: "GET:/users".to_string(),
+                origin: MockOrigin::Source(mock.source.clone().unwrap(), None),
+            },
+            "the identity a counter keyed on today is unchanged"
+        );
+        assert_eq!(identity.source(), Some(mock.source.clone().unwrap()));
+        assert_eq!(
+            identity.label(),
+            format!("GET:/users @ {}", mock.source.as_deref().unwrap())
+        );
+    }
+
+    #[test]
+    fn two_sequence_elements_in_one_file_get_distinct_identities() {
+        // The whole reason array elements need an index in their identity:
+        // two sequence mocks in one file would otherwise collide on the
+        // source path and share a counter.
+        let dir = mocks_dir(&[(
+            "flaky.json",
+            br#"[
+                {"method":"GET","path":"/flaky","status":200,
+                 "sequence":[{"status":503,"response":{"step":1}},{"status":200,"response":{"step":2}}]},
+                {"method":"GET","path":"/flaky","status":200,
+                 "sequence":[{"status":500,"response":{"step":1}},{"status":201,"response":{"step":2}}]}
+            ]"#,
+        )]);
+
+        let result = load(&dir);
+        assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
+        let bucket = &result.mocks["GET:/flaky"];
+        assert_eq!(bucket.len(), 2);
+
+        let identity_of = |index: usize| MockIdentity::of(&bucket[index], "GET:/flaky", index);
+        let first = identity_of(0);
+        let second = identity_of(1);
+        assert_ne!(first, second, "two elements of one file are two mocks");
+
+        let source = bucket[0].source.clone().unwrap();
+        assert_eq!(
+            first.source(),
+            Some(format!("{}#0", source)),
+            "the label names the element's place in the file"
+        );
+        assert_eq!(second.source(), Some(format!("{}#1", source)));
+        assert_eq!(
+            second.label(),
+            format!("GET:/flaky @ {}", second.source().unwrap())
+        );
     }
 }

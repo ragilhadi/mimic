@@ -339,6 +339,58 @@ JSON stays the default and first-class format — every example in this README
 that's shown as `.json` works exactly as written; YAML is an alternative for
 files where either of the above is worth it, not a replacement.
 
+### Multiple mocks in one file
+
+A file whose top level is an **array** holds several mocks instead of exactly
+one. Each element is a full `MockConfig`, so a resource's whole surface can
+live in one file:
+
+```json
+[
+  { "method": "GET",    "path": "/orders",     "status": 200, "response": { "orders": [] } },
+  { "method": "GET",    "path": "/orders/:id", "status": 200, "response": { "id": 1 } },
+  { "method": "POST",   "path": "/orders",     "status": 201, "response": { "id": 2 } },
+  { "method": "DELETE", "path": "/orders/:id", "status": 204 }
+]
+```
+
+The same shape as a YAML array (`- ` elements, or flow `[...]` syntax):
+
+```yaml
+- method: GET
+  path: /orders
+  status: 200
+  response:
+    orders: []
+- method: POST
+  path: /orders
+  status: 201
+  response:
+    id: 2
+```
+
+The object form keeps working exactly as before — a file holding one mock is
+not an array and behaves byte-for-byte as it always did.
+
+**Semantics worth knowing:**
+
+- **Identity is the file plus the element's position.** Sequence counters,
+  hit counts, and their admin listings report `orders.json#2` for an element.
+  The index is positional, so *reordering elements resets their state* — the
+  same way renaming a file does — which is the best identity available when
+  one file holds several mocks.
+- **Errors are per element where possible.** An element that fails
+  validation is reported as `orders.json#2` and its siblings still load; a
+  file that isn't valid JSON/YAML at all fails as a whole, as it always did.
+  `mimic validate` reports both shapes.
+- **`response_file` is unchanged.** A fixture referenced by an array element
+  resolves against the containing file's directory, and is served rather
+  than registered as a mock.
+- **Multiple single-mock files can't collide on identity.** Two elements in
+  one file share the file, so they get separate identities by index; two
+  mocks in one file can still declare the same `METHOD:path` — that tie is
+  broken by load order, like two files would be.
+
 ### Reserved endpoints
 
 Mimic answers a handful of routes itself, and they are matched **ahead of** the
@@ -418,8 +470,10 @@ mock set is replaced outright, so removing a file removes its route.
 
 #### What happens to sequence state across a reload
 
-Sequence positions and hit counts belong to **the mock's file**, not to its
-position in the list of mocks sharing a `METHOD:path`. Across a reload:
+Sequence positions and hit counts belong to **the mock's file** — for an
+element of an array file, to that element's position **within** the file
+(`orders.json#2`) — not to its position in the list of mocks sharing a
+`METHOD:path`. Across a reload:
 
 - **Editing a file** — including editing its `sequence` — leaves that mock's
   position and hit count where they were. Reset explicitly with
@@ -430,12 +484,18 @@ position in the list of mocks sharing a `METHOD:path`. Across a reload:
   is loaded next.
 - **A file that stops parsing** keeps both its route and its counters, since
   its last-known-good response is still being served.
+- **For an array file, one element that fails validation** carries forward
+  only that element's own last-known-good mock — its siblings are replaced by
+  their fresh versions rather than duplicated. And since the identity is the
+  element's position, **reordering elements resets their state** the way
+  renaming a file does.
 
-Mock files load in a fixed order — depth-first, alphabetical by full path — so
-which of several mocks registered for the same `METHOD:path` wins a tie is a
-function of their file names and nothing else. It does not vary between
-filesystems, between a fresh clone and a rebuilt image, or after an unrelated
-file is added to the directory.
+Mock files load in a fixed order — depth-first, alphabetical by full path, an
+array's elements together in element order — so which of several mocks
+registered for the same `METHOD:path` wins a tie is a function of their file
+names (and element positions, within a file) and nothing else. It does not
+vary between filesystems, between a fresh clone and a rebuilt image, or after
+an unrelated file is added to the directory.
 
 ---
 
@@ -1804,6 +1864,7 @@ it.
 | `--out <dir>` | `./mocks/generated` | Output directory |
 | `--status <code>` | `200` | Status treated as each operation's *primary* response; its file is the live one |
 | `--format <json\|yaml>` | `json` | Output format for generated mock files (`yml` is accepted as an alias for `yaml`) |
+| `--bundle` | off | One array file per path holding all its operations, instead of one file per operation; see [Bundling](#bundling---bundle) |
 | `--base-path <path>` | from `servers[0]` | Prefix for every generated mock's path; an empty value (`--base-path ''`) drops it entirely |
 | `--force` | off | Write into a non-empty output directory, overwriting files of the same name |
 | `--brace-params` | off | Emit path parameters as `{id}` instead of `:id` |
@@ -1886,6 +1947,66 @@ mv mocks/generated/get_users_id_404.json.disabled mocks/generated/get_users_id_4
 ```
 
 Hot reload picks the change up within a couple of seconds — no restart needed.
+
+### Bundling (`--bundle`)
+
+A realistic API surface is many small mocks that belong together, and a
+directory of one file per operation + status gets noisy. `--bundle` writes one
+**array file per path** instead, holding that path's operations together — the
+array form the loader reads natively (see
+[Multiple mocks in one file](#multiple-mocks-in-one-file)).
+
+```bash
+mimic import-openapi spec.yaml --out ./mocks/generated --bundle
+```
+
+For a spec with `GET /users`, `POST /users` (documenting `201` and `400`), and
+`GET /users/{id}` (documenting `200` and `404`), `--bundle` writes:
+
+**`mocks/generated/users.json`** — the live array, one element per operation
+of `/users`:
+
+```json
+[
+  {
+    "method": "GET",
+    "path": "/users",
+    "status": 200,
+    "response": {"users": []},
+    "consume_body": false
+  },
+  {
+    "method": "POST",
+    "path": "/users",
+    "status": 201,
+    "response": {"id": 1, "name": "Alice"},
+    "consume_body": false
+  }
+]
+```
+
+**`mocks/generated/users_alt.json.disabled`** — the path's alternative statuses
+together, inert until renamed (`.yaml.disabled` with `--format yaml`):
+
+```json
+[
+  {
+    "method": "POST",
+    "path": "/users",
+    "status": 400,
+    "response": {"error": "bad request"},
+    "consume_body": false
+  }
+]
+```
+
+Plus `users_id.json` and `users_id_alt.json.disabled` for `/users/{id}` — four
+files total instead of six, and a spec with many statuses per operation
+shrinks harder. Enabling one alternative means dropping the `.disabled`
+suffix, which makes the *whole alternates array* live at once — delete the
+elements you don't want from it (the file is ordinary JSON/YAML, so every
+mimic tool works on it). Element identity is positional, so reordering a
+bundle's elements resets their state exactly like any array file.
 
 ### Where the response body comes from
 

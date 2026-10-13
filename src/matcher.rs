@@ -1926,10 +1926,11 @@ fn calculate_match_score(context: &RequestContext, mock: &MockConfig) -> Option<
 // ============================================================================
 
 /// How a mock is named in an explanation: its source file when it was loaded
-/// from one, otherwise its registration key and position.
+/// from one — `file#N` for an element of an array file — otherwise its
+/// registration key and position.
 fn describe_mock(mock: &MockConfig, key: &str, index: usize) -> String {
-    match mock.source {
-        Some(ref source) => source.clone(),
+    match mock.source_label() {
+        Some(source) => source,
         None => format!("`{}` #{}", key, index),
     }
 }
