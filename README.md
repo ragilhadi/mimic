@@ -689,6 +689,35 @@ Multiple parameters, and nested resources, work the same way:
 - Exact-path lookups stay O(1); the pattern scan only runs when the exact lookup matched nothing, so mocks with no path parameters see no performance change. Each path template is compiled to a regex once per process and reused, never recompiled per request.
 - A [sequence](#-stateful-response-sequences) on a pattern mock advances a single shared counter across every value of the parameter (e.g. `/items/1` and `/items/2` progress the same sequence for `/items/:id`), not one counter per resolved id.
 
+#### Wildcards, constraints and optional segments (#147)
+
+Beyond single-segment parameters, the path template understands:
+
+| Syntax | Matches | Capture |
+|---|---|---|
+| `*` | exactly one segment | `{{path.*}}` |
+| `**` (final segment only) | one or more trailing segments, slashes included | `{{path.*}}` |
+| `:rest*` / `{rest**}` (final) | the same, named | `{{path.rest}}` |
+| `:id(\d+)` / `{id:\d+}` | the segment, only if it matches the regex | `{{path.id}}` |
+| `:id?` / `{id?}` (final) | the segment **or nothing** | `{{path.id}}` when present |
+
+```json
+{ "method": "GET", "path": "/assets/**", "status": 200, "response_file": "index.html" }
+{ "method": "GET", "path": "/users/:id(\\d+)", "status": 200, "response": {"id": "{{path.id}}"} }
+{ "method": "GET", "path": "/v1/users/:id?", "status": 200, "response": {"id": "{{path.id}}"} }
+```
+
+- A numeric constraint is how `/users/me` (`literal`) and `/users/:id(\d+)`
+  stop colliding: `/users/42` matches the constraint, `/users/me` does not.
+- Wildcards and constrained/optional parameters participate in route
+  specificity ordering: more literal segments rank higher, so an exact path
+  still beats every parameterized form, and `/assets/img/logo.png` outranks
+  `/assets/**` for a request that matches both.
+- Malformed templates — a `**` not at the end, an optional segment not at the
+  end — are refused at load time (`mimic validate` reports them too).
+- The slash-count fast path is skipped for `**`/optional templates; all other
+  patterns keep it.
+
 ### Query Parameter Matching
 
 Match requests based on URL query string parameters:
