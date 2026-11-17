@@ -1367,26 +1367,35 @@ fn form_body_reject_reason(
 
 /// A path template compiled into a regex, plus the parameter names in the
 /// order their capture groups appear. Supports `:name` (Express-style) and
-/// `{name}` (OpenAPI-style) segments.
+/// `{name}` (OpenAPI-style) segments — with regex constraints and optional
+/// markers (#147) — plus `*` and a final `**` rest segment.
 #[derive(Debug, Clone)]
 pub struct CompiledPathPattern {
     pub regex: Regex,
     pub param_names: Vec<String>,
-    /// How many `/` the template contains — and so any path it can match.
-    slashes: usize,
+    /// How many `/` the template contains — and so any path it can match —
+    /// when every segment is exact-width (no rest, no optional segment).
+    /// `None` for templates whose match may carry a different slash count,
+    /// which disables the slash-count prefilter.
+    slashes: Option<usize>,
 }
 
-/// True if any path segment uses `:name` or `{name}` parameter syntax.
+/// True if any path segment uses parameter or wildcard syntax.
+///
+/// Recognizes `:name` / `{name}` parameters, `:name(regex)` / `{name:regex}`
+/// regex-constrained parameters, `:name?` / `{name?}` optional parameters, a
+/// `*` segment (one unnamed segment), and a trailing `**` or `{rest**}` /
+/// `:rest*` segment (one or more segments, captured with slashes). Every
+/// other path — including most real routes — contains neither `:` nor `{`
+/// nor `*`, and this returns before any splitting.
 pub fn is_pattern_path(path: &str) -> bool {
-    // Every parameter syntax contains `:` or `{`; most routes contain neither,
-    // and this runs once per registered route per unmatched-exact request.
-    if !path.contains([':', '{']) {
+    if !path.contains([':', '{', '*']) {
         return false;
     }
-    path.split('/').any(|segment| {
-        (segment.starts_with(':') && segment.len() > 1)
-            || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
-    })
+    let segments: Vec<&str> = path.split('/').collect();
+    segments
+        .iter()
+        .any(|&segment| is_param_segment(segment) || is_wildcard_segment(segment))
 }
 
 /// Compile (or reuse) the pattern for `path`.
@@ -1410,38 +1419,93 @@ pub fn path_pattern_is_cached(path: &str) -> bool {
 }
 
 /// Compile a path template into a regex with one (unnamed, positional)
-/// capture group per parameter segment — using positional groups rather
-/// than Rust regex's named-group syntax means parameter names aren't
-/// restricted to `[A-Za-z0-9_]` (e.g. `:org-id` works).
+/// capture group per parameter/star segment — positional groups rather than
+/// Rust regex's named-group syntax keep parameter names unrestricted
+/// (`:org-id` works).
 ///
-/// Returns `None` if the path has no parameter segments, or the resulting
-/// regex fails to compile.
+/// Syntax (#147): `:name`/`{name}`, `:name(regex)`/`{name:regex}` constrained,
+/// `:name?`/`{name?}` optional (final only), `*` (one unnamed segment), and a
+/// final `**`/`:rest*`/`{rest**}` (one or more segments, captured with
+/// slashes — see [`CompiledPathPattern::slashes`]).
+///
+/// Returns `None` when the path has no dynamic segment, is malformed (a rest
+/// segment not final, an optional segment not final), or the regex fails to
+/// compile.
 fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
+    let segments = parse_path_segments(path)?;
     let mut param_names = Vec::new();
     let mut regex_parts = Vec::new();
 
-    for segment in path.split('/') {
-        if let Some(name) = segment.strip_prefix(':').filter(|n| !n.is_empty()) {
-            param_names.push(name.to_string());
-            regex_parts.push("([^/]+)".to_string());
-        } else if segment.len() > 2 && segment.starts_with('{') && segment.ends_with('}') {
-            param_names.push(segment[1..segment.len() - 1].to_string());
-            regex_parts.push("([^/]+)".to_string());
-        } else {
-            regex_parts.push(regex::escape(segment));
+    for segment in &segments {
+        match segment {
+            PathSegment::Literal(escaped) => regex_parts.push(escaped.clone()),
+            PathSegment::Star => {
+                param_names.push("*".to_string());
+                regex_parts.push("([^/]+)".to_string());
+            }
+            PathSegment::Param {
+                name,
+                constraint,
+                optional,
+            } => {
+                // The constraint is spliced into the capture group:
+                // `[^/]+` is the default; a constraint like `(\d+)` inside
+                // `([^/]+)` would double-capture, so a constraint becomes a
+                // non-capturing group and stays anchored to the segment.
+                let group = match constraint {
+                    Some(pattern) => format!("(?:{})", pattern),
+                    None => "[^/]+".to_string(),
+                };
+                if *optional {
+                    // The optional segment's `/` rides inside the group: an
+                    // absent segment must not leave an empty `//` behind.
+                    regex_parts.push(format!("(?:/({}))?", group));
+                } else {
+                    regex_parts.push(format!("({})", group));
+                }
+                param_names.push(name.clone());
+            }
+            PathSegment::Rest { name } => {
+                param_names.push(name.clone().unwrap_or_else(|| "*".to_string()));
+                regex_parts.push("(.+)".to_string());
+            }
         }
     }
 
-    if param_names.is_empty() {
-        return None;
+    // With an optional or rest segment the request's slash count can differ
+    // from the template's, so the slash-count prefilter is unavailable.
+    let has_rest = segments
+        .last()
+        .is_some_and(|last| matches!(last, PathSegment::Rest { .. }));
+    let has_optional = segments
+        .iter()
+        .any(|segment| matches!(segment, PathSegment::Param { optional: true, .. }));
+
+    // Assemble by joining consecutive parts with `/`, but an optional
+    // segment's `/` lives inside its group — the join must not add another.
+    let mut pattern = String::with_capacity(regex_parts.iter().map(|p| p.len() + 1).sum::<usize>());
+    let mut first = true;
+    for (position, part) in regex_parts.iter().enumerate() {
+        let optional_part = matches!(
+            segments.get(position),
+            Some(PathSegment::Param { optional: true, .. })
+        );
+        if !first && !optional_part {
+            pattern.push('/');
+        }
+        pattern.push_str(part);
+        first = false;
     }
 
-    let pattern = format!("^{}$", regex_parts.join("/"));
-    match Regex::new(&pattern) {
+    match Regex::new(&format!("^{}$", pattern)) {
         Ok(regex) => Some(CompiledPathPattern {
             regex,
             param_names,
-            slashes: path.bytes().filter(|&b| b == b'/').count(),
+            slashes: if has_rest || has_optional {
+                None
+            } else {
+                Some(path.bytes().filter(|&b| b == b'/').count())
+            },
         }),
         Err(e) => {
             warn!("Invalid path parameter pattern '{}': {}", path, e);
@@ -1450,17 +1514,219 @@ fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
     }
 }
 
+/// One parsed segment of a path template.
+#[derive(Debug, Clone, PartialEq)]
+enum PathSegment {
+    /// A literal segment; the string is already regex-escaped.
+    Literal(String),
+    /// `:name` / `{name}`, optionally regex-constrained (`:id(\d+)`,
+    /// `{id:\d+}`) and optionally marked optional (`:id?` / `{id?}`) — the
+    /// optional marker may only be final.
+    Param {
+        name: String,
+        constraint: Option<String>,
+        optional: bool,
+    },
+    /// `*` — exactly one segment, captured under the name `*`.
+    Star,
+    /// `**` / `:rest*` / `{rest**}` — one or more trailing segments, captured
+    /// with their slashes. Always final; optional name.
+    Rest { name: Option<String> },
+}
+
+/// True if a template segment is one of the wildcard spellings: a bare `*`,
+/// a bare `**`, or a named rest segment (`:rest*`, `{rest**}`).
+fn is_wildcard_segment(segment: &str) -> bool {
+    matches!(segment, "*" | "**")
+        || segment
+            .strip_prefix(':')
+            .is_some_and(|rest| rest.len() > 1 && rest.ends_with('*'))
+        || (segment.starts_with('{')
+            && segment
+                .strip_suffix('}')
+                .is_some_and(|inner| inner.len() > 3 && inner.ends_with("**")))
+}
+
+/// Whether a segment declares a parameter: `:name` (with any suffix the
+/// detailed parser accepts) or `{...}`.
+fn is_param_segment(segment: &str) -> bool {
+    (segment.starts_with(':') && segment.len() > 1 && segment != ":*")
+        || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
+}
+
+/// Parse `path` into [`PathSegment`]s, or `None` when the template has no
+/// dynamic segment or is malformed: a rest segment not at the end, an
+/// optional segment not at the end, or an empty parameter name.
+fn parse_path_segments(path: &str) -> Option<Vec<PathSegment>> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut parsed = Vec::with_capacity(segments.len());
+    let mut rest_seen = false;
+
+    for (position, segment) in segments.iter().enumerate() {
+        let is_last = position == segments.len() - 1;
+
+        // A bare `*` may sit anywhere; only the rest spellings are
+        // final-only. It is checked first so the rest rule can't eat it.
+        if *segment == "*" {
+            if rest_seen {
+                return None;
+            }
+            parsed.push(PathSegment::Star);
+            continue;
+        }
+
+        if is_rest_segment(segment) {
+            if !is_last || rest_seen {
+                // `**` and its named spellings are only valid as the final
+                // segment, and only once.
+                return None;
+            }
+            let name = segment
+                .strip_prefix(':')
+                .map(|rest| rest.trim_end_matches('*').trim_end_matches('{').to_string())
+                .or_else(|| {
+                    segment
+                        .strip_prefix('{')
+                        .and_then(|inner| inner.strip_suffix('}'))
+                        .map(|inner| {
+                            inner
+                                .trim_end_matches('*')
+                                .trim_end_matches('{')
+                                .to_string()
+                        })
+                })
+                .filter(|name| !name.is_empty());
+            parsed.push(PathSegment::Rest { name });
+            rest_seen = true;
+            continue;
+        }
+
+        if is_param_segment(segment) {
+            if let Some(param) = parse_param_segment(segment) {
+                if param.optional && !is_last {
+                    // An optional segment may only be final: `:id?/rest` has
+                    // no coherent reading.
+                    return None;
+                }
+                if rest_seen {
+                    return None;
+                }
+                parsed.push(PathSegment::Param {
+                    name: param.name,
+                    constraint: param.constraint,
+                    optional: param.optional,
+                });
+                continue;
+            }
+            // A segment that looks like a parameter but parses as one only
+            // partially (`:`, `{}`, `{a(b}`) stays a literal below.
+        }
+
+        if rest_seen {
+            return None;
+        }
+        parsed.push(PathSegment::Literal(regex::escape(segment)));
+    }
+
+    if parsed
+        .iter()
+        .all(|segment| matches!(segment, PathSegment::Literal(_)))
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+/// Whether a segment is one of the *rest* spellings: `**`, `:rest*`,
+/// `{rest**}` — one-or-more trailing segments. A bare `*` is not a rest
+/// segment; it matches exactly one.
+fn is_rest_segment(segment: &str) -> bool {
+    segment == "**"
+        || segment
+            .strip_prefix(':')
+            .is_some_and(|rest| rest.len() > 1 && rest.ends_with('*'))
+        || (segment.starts_with('{')
+            && segment
+                .strip_suffix('}')
+                .is_some_and(|inner| inner.len() > 3 && inner.ends_with("**")))
+}
+
+/// One `:name` / `{name}` segment taken apart.
+struct ParsedParam {
+    name: String,
+    constraint: Option<String>,
+    optional: bool,
+}
+
+/// Parse one parameter segment into name, optional regex constraint, and the
+/// optional-marker. Returns `None` for segments that declare no name.
+///
+/// The optional marker (`?`) is only recognized before a constraint's opening
+/// `(` — a regex may contain `?`, and `:id(\d+?)` constrains rather than
+/// marks optional.
+fn parse_param_segment(segment: &str) -> Option<ParsedParam> {
+    let (name, constraint, optional) = if let Some(rest) = segment.strip_prefix(':') {
+        let optional = rest.ends_with('?') && !rest.ends_with(")?");
+        let body = rest.strip_suffix('?').filter(|_| optional).unwrap_or(rest);
+        match body.split_once('(') {
+            Some((name, constraint)) => {
+                let constraint = constraint.strip_suffix(')')?;
+                (name.to_string(), Some(constraint.to_string()), false)
+            }
+            None => (body.to_string(), None, optional),
+        }
+    } else {
+        // Braced form: `{name}`, `{name:constraint}`, `{name?}`.
+        let inner = &segment[1..segment.len() - 1];
+        let optional = inner.ends_with('?') && !inner.ends_with(")?");
+        let body = inner
+            .strip_suffix('?')
+            .filter(|_| optional)
+            .unwrap_or(inner);
+        match body.split_once(':') {
+            Some((name, constraint)) => (name.to_string(), Some(constraint.to_string()), false),
+            None => (body.to_string(), None, optional),
+        }
+    };
+
+    if name.is_empty() {
+        return None;
+    }
+    Some(ParsedParam {
+        name: name.to_string(),
+        constraint,
+        optional,
+    })
+}
+
 /// A cheap necessary condition for `template` (a declared pattern path) to
-/// match `request_path`: the same number of segments, and the same first segment
-/// whenever the template's first segment is a literal.
+/// match `request_path`: the template has no more segments than the request
+/// (a template can only ever be narrower than the request when it carries a
+/// rest segment, which adds none), and the same first segment whenever the
+/// template's first segment is a literal.
 ///
 /// A request is checked against every pattern route registered for its method,
 /// so this runs once per route; rejecting the great majority here keeps the cache
 /// lookup and the regex off that loop. It never rejects a path the template
 /// would match.
 fn template_may_match(template: &str, request_path: &str) -> bool {
-    let slashes = |s: &str| s.bytes().filter(|&b| b == b'/').count();
-    if slashes(template) != slashes(request_path) {
+    let slash_count = |s: &str| s.bytes().filter(|&b| b == b'/').count();
+    let is_wildcard_template = template.contains("**")
+        || template
+            .split('/')
+            .any(|segment| segment == "*" || is_wildcard_segment(segment));
+    let template_slashes = slash_count(template);
+    let request_slashes = slash_count(request_path);
+    if !is_wildcard_template && template_slashes != request_slashes {
+        return false;
+    }
+    // A wildcard template (rest or `*` segments) can only need *fewer or the
+    // same* number of request segments than the template declares, minus the
+    // segments the rest swallows; conservatively, any request with at least
+    // as many segments as the prefix before the rest can still match. The
+    // regex itself decides — this prefilter is about keeping the worst case
+    // bounded, not correctness.
+    if is_wildcard_template && template_slashes > request_slashes + 1 {
         return false;
     }
     let template_first = template
@@ -1468,11 +1734,8 @@ fn template_may_match(template: &str, request_path: &str) -> bool {
         .split('/')
         .next()
         .unwrap_or("");
-    let is_param = |seg: &str| {
-        (seg.starts_with(':') && seg.len() > 1)
-            || (seg.starts_with('{') && seg.ends_with('}') && seg.len() > 2)
-    };
-    if is_param(template_first) {
+    let is_dynamic = |seg: &str| is_param_segment(seg) || is_wildcard_segment(seg);
+    if is_dynamic(template_first) || template_first.is_empty() {
         return true;
     }
     request_path
@@ -1489,18 +1752,27 @@ pub fn match_path_pattern(
     pattern: &CompiledPathPattern,
     request_path: &str,
 ) -> Option<HashMap<String, String>> {
-    // A template matches only paths with the same number of segments, so the
-    // vast majority of non-matching routes are rejected by counting slashes —
-    // cheaper than running the regex, and a request is checked against every
-    // pattern route registered for its method.
-    if request_path.bytes().filter(|&b| b == b'/').count() != pattern.slashes {
-        return None;
+    // A template whose segments are all exact-width matches only paths with
+    // the same number of segments, so the vast majority of non-matching
+    // routes are rejected by counting slashes — cheaper than running the
+    // regex, and a request is checked against every pattern route registered
+    // for its method. Rest/optional templates skip this and let the regex
+    // decide.
+    if let Some(expected) = pattern.slashes {
+        if request_path.bytes().filter(|&b| b == b'/').count() != expected {
+            return None;
+        }
     }
     let caps = pattern.regex.captures(request_path)?;
     let mut params = HashMap::with_capacity(pattern.param_names.len());
     for (i, name) in pattern.param_names.iter().enumerate() {
-        let value = caps.get(i + 1)?.as_str().to_string();
-        params.insert(name.clone(), value);
+        // An optional segment (`:id?`) that was absent leaves its group
+        // non-participating — `caps.get` returns `None` and that is a match
+        // with no value, not a failure to match.
+        let Some(value) = caps.get(i + 1) else {
+            continue;
+        };
+        params.insert(name.clone(), value.as_str().to_string());
     }
     Some(params)
 }
@@ -1594,15 +1866,14 @@ pub struct MatchResult {
     pub head_from_get: bool,
 }
 
-/// Count the literal — i.e. non-`:name`, non-`{name}` — segments of a declared
-/// mock path. `/users/:id` scores 1, `/{resource}/:id` scores 0, and an exact
-/// path scores one per segment.
+/// Count the literal — i.e. static — segments of a declared mock path, ranked
+/// so a more literal route is more specific: `/users/:id` scores 2,
+/// `/{resource}/:id` scores 1, `/assets/**` scores 1, `/:any/**` scores 0,
+/// and an exact path one per segment.
 fn path_specificity(path: &str) -> u32 {
     path.split('/')
         .filter(|segment| {
-            let is_param = (segment.starts_with(':') && segment.len() > 1)
-                || (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2);
-            !is_param && !segment.is_empty()
+            !segment.is_empty() && !is_param_segment(segment) && !is_wildcard_segment(segment)
         })
         .count() as u32
 }
@@ -2381,6 +2652,8 @@ mod explanation_tests;
 mod json_form_tests;
 #[cfg(test)]
 mod matching_cost;
+#[cfg(test)]
+mod path_wildcard_tests;
 #[cfg(test)]
 mod pattern_prefilter_tests;
 #[cfg(test)]
