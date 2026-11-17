@@ -203,6 +203,21 @@ pub fn prepare_runtime_mock(
     mock.source_index = None;
     mock.response_bytes = None;
 
+    if let Some(collection) = &mock.collection {
+        if !mock.response.is_null() || mock.response_file.is_some() {
+            return Err(format!(
+                "{} declares a collection and a body; the collection defines the behaviour",
+                label
+            ));
+        }
+        if !collection.path.starts_with('/') || collection.name.is_empty() {
+            return Err(format!(
+                "{} collection needs a `/`-rooted path and a non-empty name",
+                label
+            ));
+        }
+    }
+
     if let Some(file) = mock.response_file.clone() {
         reject_both_bodies(&mock.response, &file, &label)?;
         let mut cache = HashMap::new();
@@ -1032,6 +1047,45 @@ fn load_mock_element(
         return Err(format!("Empty path in {}", label));
     }
 
+    // A collection mock ignores the mock-shaped fields — declaring them
+    // alongside is almost certainly a mistake, and "silently ignored" is
+    // exactly the failure mode this loader exists to surface.
+    if let Some(collection) = &mock.collection {
+        if !mock.response.is_null() {
+            return Err(format!(
+                "{} declares a collection and a `response`; the collection defines the behaviour",
+                label
+            ));
+        }
+        if mock.response_file.is_some() {
+            return Err(format!(
+                "{} declares a collection and a `response_file`; the collection defines the behaviour",
+                label
+            ));
+        }
+        if mock.sequence.is_some() {
+            return Err(format!(
+                "{} declares a collection and a `sequence`; the collection defines the behaviour",
+                label
+            ));
+        }
+        if mock.body.is_some() || mock.query_params.is_some() || mock.headers.is_some() {
+            return Err(format!(
+                "{} declares a collection and matchers; matching does not apply to collections",
+                label
+            ));
+        }
+        if !collection.path.starts_with('/') {
+            return Err(format!(
+                "{} collection path `{}` must start with `/`",
+                label, collection.path
+            ));
+        }
+        if collection.name.is_empty() {
+            return Err(format!("{} collection has an empty `name`", label));
+        }
+    }
+
     // Response bodies read from disk. Also loader-owned: whatever a mock file
     // says about `response_bytes` is dropped by serde before we get here.
     mock.response_bytes = None;
@@ -1719,6 +1773,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
