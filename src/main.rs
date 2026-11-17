@@ -16,8 +16,9 @@ use axum::{
 };
 use handler::{
     admin_dashboard, clear_requests, configured_active_tags, configured_bind_address,
-    configured_port_checked, get_scenario, handle_request, health_check, list_mocks, list_requests,
-    list_sequences, max_body_size, max_log_entries, reset_sequences, set_scenario, AppState,
+    configured_port_checked, count_requests, export_har, force_reload, get_scenario,
+    handle_request, health_check, list_mocks, list_requests, list_sequences, max_body_size,
+    max_log_entries, reset_all, reset_sequences, set_scenario, AppState,
 };
 use loader::load_mocks;
 use std::collections::{HashMap, HashSet};
@@ -307,6 +308,10 @@ async fn run_server() {
     let reload_counters = state.sequence_counters.clone();
     let reload_hits = state.mock_hits.clone();
     let reload_reserved = state.reserved.clone();
+    // Woken by `POST /admin/reload` to install a cycle immediately instead of
+    // waiting out the polling interval (#149).
+    let reload_trigger = std::sync::Arc::new(tokio::sync::Notify::new());
+    let state = state.with_reload_trigger(reload_trigger.clone());
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
@@ -322,7 +327,18 @@ async fn run_server() {
         // installed store holds routes carried forward by `apply_reload`.
         let mut had_errors = false;
         loop {
-            interval.tick().await;
+            // Wake on the timer or on `POST /admin/reload` — either runs one
+            // full reload cycle, so a forced reload never races the timer:
+            // both paths converge on the same install.
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = reload_trigger.notified() => {
+                    // `notify_one` from the admin endpoint. A notify that
+                    // arrives while a cycle is running is coalesced by
+                    // `Notify`; the next pass picks it up.
+                    debug!("🔄 Hot reload: forced by admin endpoint");
+                }
+            }
             let mocks_dir = reload_dir.clone();
             // Run blocking file I/O off the async runtime to avoid stalling request handling
             let (outcome, returned_cache) = tokio::task::spawn_blocking(move || {
@@ -636,7 +652,10 @@ fn reload_needs_install(changed: bool, has_errors: bool, had_errors: bool) -> bo
 /// a mock whose file was deleted, or whose `path` was edited, is not "broken"
 /// and must go, whether or not some other file happens to be failing at the
 /// same time.
-fn apply_reload(
+///
+/// Also the installer `POST /admin/reload` runs when no background reloader
+/// exists — one implementation, two callers.
+pub fn apply_reload(
     current: &HashMap<String, Vec<types::MockConfig>>,
     result: loader::LoadResult,
 ) -> HashMap<String, Vec<types::MockConfig>> {
@@ -738,6 +757,19 @@ fn create_router(state: AppState) -> Router {
                     .delete(clear_requests)
                     .fallback(handle_request),
             )
+            // Verification API (#149): assert counts, reset state, force a
+            // reload, export the log as HAR. All token-guarded by the same
+            // `ADMIN_ROUTES` rules as the endpoints above.
+            .route(
+                &at("/requests/count"),
+                get(count_requests).fallback(handle_request),
+            )
+            .route(
+                &at("/requests.har"),
+                get(export_har).fallback(handle_request),
+            )
+            .route(&at("/reset"), post(reset_all).fallback(handle_request))
+            .route(&at("/reload"), post(force_reload).fallback(handle_request))
             .route(&at("/mocks"), get(list_mocks).fallback(handle_request))
             .route(
                 &at("/sequences"),
@@ -810,6 +842,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tower::util::ServiceExt;
+
+    #[path = "verification_tests.rs"]
+    mod verification;
 
     fn test_state() -> AppState {
         AppState::new(Arc::new(tokio::sync::RwLock::new(HashMap::new())))

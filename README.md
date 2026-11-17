@@ -402,6 +402,10 @@ mock set. A mock declaring one of these loads normally, is listed by
 | `/health` | `GET` |
 | `/admin/dashboard` | `GET` |
 | `/admin/requests` | `GET`, `DELETE` |
+| `/admin/requests/count` | `GET` |
+| `/admin/requests.har` | `GET` |
+| `/admin/reset` | `POST` |
+| `/admin/reload` | `POST` |
 | `/admin/mocks` | `GET` |
 | `/admin/sequences` | `GET` |
 | `/admin/sequences/reset` | `POST` |
@@ -2312,6 +2316,38 @@ rule the server doesn't actually enforce.
 
 All of them are query parameters on `/admin/requests`, so they work from
 `curl` too — the dashboard is a client of the same public API.
+
+### Verification API (#149)
+
+The "assert what happened" half of mocking — the endpoints a test suite calls
+between cases:
+
+```bash
+# "POST /payments was called exactly once" — passes or fails by its HTTP status
+curl --fail "localhost:8080/admin/requests/count?path=/payments&method=POST&expect=1"
+# 200 when the count matches, 417 Expectation Failed when it doesn't.
+
+# Same filters as /admin/requests, without the assertion
+curl "localhost:8080/admin/requests/count?path=/payments&status=5xx"
+
+# One documented call returning the server to a clean state between tests:
+# clears the request log, mock hit counts, and sequence counters.
+curl -X POST localhost:8080/admin/reset
+
+# Run a reload cycle right now (after writing a mock file), no 2s wait —
+# responds with the post-reload endpoint list.
+curl -X POST localhost:8080/admin/reload
+
+# Download the log as a HAR 1.2 document (Chrome DevTools / Charles can open it).
+curl --output log.har "localhost:8080/admin/requests.har"
+```
+
+Every recorded request also carries **`duration_ms`** — wall-clock time from
+receipt to the response being handed back, a matched mock's `delay_ms`
+included — visible in `/admin/requests` and in each HAR entry's `time`.
+
+All four endpoints are ordinary admin routes: `MIMIC_ADMIN_PREFIX` moves them,
+`MIMIC_DISABLE_ADMIN` removes them, and `MIMIC_ADMIN_TOKEN` guards them.
 
 ### Other behaviour
 

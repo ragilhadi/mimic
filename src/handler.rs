@@ -59,7 +59,11 @@ pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
 const ADMIN_ROUTES: &[(&str, &[&str])] = &[
     ("/dashboard", &["GET"]),
     ("/requests", &["GET", "DELETE"]),
+    ("/requests/count", &["GET"]),
+    ("/requests.har", &["GET"]),
     ("/mocks", &["GET"]),
+    ("/reset", &["POST"]),
+    ("/reload", &["POST"]),
     ("/sequences", &["GET"]),
     ("/sequences/reset", &["POST"]),
     ("/scenario", &["GET", "POST"]),
@@ -573,6 +577,10 @@ pub struct AppState {
     /// Set from `main`'s resolved mocks directory, defaulted here to
     /// `"mocks"` for tests that never enable proxying and so never read it.
     pub mocks_dir: String,
+    /// Signaller the admin API uses to wake the hot-reload loop immediately
+    /// (`POST /admin/reload`); `None` when the server isn't running the
+    /// reloader (unit tests, `run_server` before the task spawns).
+    pub reload_trigger: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl AppState {
@@ -602,7 +610,17 @@ impl AppState {
             proxy_config: None,
             record_state: Arc::new(crate::proxy::RecordState::new()),
             mocks_dir: "mocks".to_string(),
+            reload_trigger: None,
         }
+    }
+
+    /// Set the reload trigger the admin API uses to wake the hot-reload
+    /// loop (`POST /admin/reload`), as `main` does once the reloader task
+    /// exists. `None` (the default from [`AppState::new`]) makes
+    /// `POST /admin/reload` run a synchronous cycle instead.
+    pub fn with_reload_trigger(mut self, trigger: Arc<tokio::sync::Notify>) -> Self {
+        self.reload_trigger = Some(trigger);
+        self
     }
 
     /// Replace the reserved-route configuration, as `main` does once it has
@@ -764,7 +782,7 @@ pub fn truncate_body(body: String, limit: usize) -> String {
 
 /// Append `record` to `log`, dropping the oldest entries once `cap` is
 /// exceeded. A `cap` of 0 leaves the log unbounded.
-fn push_bounded(
+pub(crate) fn push_bounded(
     log: &mut std::collections::VecDeque<RequestRecord>,
     record: RequestRecord,
     cap: usize,
@@ -863,6 +881,11 @@ pub async fn handle_request(
     let method_str = method.as_str().to_string();
 
     debug!("Incoming request: {} {}", method_str, uri);
+
+    // Wall-clock reference for `/admin/requests` `duration_ms` (#149): taken
+    // before anything else touches the request so the measured span covers
+    // body reading, matching, templating and the served `delay_ms`.
+    let request_started = std::time::Instant::now();
 
     // Parse query parameters from URI
     let query_params = parse_query_string(uri.query());
@@ -1106,6 +1129,7 @@ pub async fn handle_request(
                     match_score: Some(match_score),
                     path_params,
                     match_explanation: Some(match_explanation),
+                    started_at: Some(request_started),
                 },
             )
             .await;
@@ -1147,6 +1171,7 @@ pub async fn handle_request(
                         &headers,
                         context,
                         &parsed_headers,
+                        request_started,
                     )
                     .await;
                 }
@@ -1186,6 +1211,7 @@ pub async fn handle_request(
                     match_score: None,
                     path_params: HashMap::new(),
                     match_explanation: explanation,
+                    started_at: Some(request_started),
                 },
             )
             .await;
@@ -1250,6 +1276,7 @@ async fn answer_preflight(
             match_score: None,
             path_params: HashMap::new(),
             match_explanation: Some(cors::PREFLIGHT_EXPLANATION.to_string()),
+            started_at: None,
         },
     )
     .await;
@@ -1267,6 +1294,10 @@ async fn answer_preflight(
 ///
 /// `context` is moved in and consumed: this is the terminal handling for the
 /// request, mirroring the 404 branch it stands in for.
+// `request_started` is the one arg past lint's comfort threshold; splitting
+// the timings out of the signature would hide exactly the datum the
+// verification API records.
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy_fallback(
     state: &AppState,
     proxy_cfg: &crate::proxy::ProxyConfig,
@@ -1275,6 +1306,7 @@ async fn handle_proxy_fallback(
     headers: &HeaderMap,
     context: RequestContext,
     parsed_headers: &HashMap<String, String>,
+    request_started: std::time::Instant,
 ) -> Response {
     let method_str = context.method.clone();
     let path = context.path.clone();
@@ -1346,6 +1378,7 @@ async fn handle_proxy_fallback(
                     match_score: None,
                     path_params,
                     match_explanation: Some(format!("proxied to {}", proxy_cfg.upstream)),
+                    started_at: Some(request_started),
                 },
             )
             .await;
@@ -1382,6 +1415,7 @@ async fn handle_proxy_fallback(
                     match_score: None,
                     path_params: HashMap::new(),
                     match_explanation: Some(format!("proxy error: {}", e)),
+                    started_at: Some(request_started),
                 },
             )
             .await;
@@ -1495,6 +1529,10 @@ struct RequestOutcome {
     match_score: Option<u32>,
     path_params: HashMap<String, String>,
     match_explanation: Option<String>,
+    /// Instant the request arrived at `handle_request` — the reference for
+    /// [`RequestRecord::duration_ms`]. `None` when unknown (synthetic log
+    /// entries answered without a real request cycle).
+    started_at: Option<std::time::Instant>,
 }
 
 /// Record a request into the request log, redacting sensitive headers
@@ -1525,6 +1563,9 @@ async fn record_request(state: &AppState, context: RequestContext, outcome: Requ
     let mut record = RequestRecord {
         id: 0,
         timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        duration_ms: outcome
+            .started_at
+            .map(|start| start.elapsed().as_millis() as u64),
         method: context.method,
         path: context.path,
         query_params: context.query_params_all,
@@ -1979,6 +2020,374 @@ pub async fn clear_requests(State(state): State<AppState>) -> StatusCode {
     let mut log = state.request_log.write().await;
     log.clear();
     StatusCode::NO_CONTENT
+}
+
+// ============================================================================
+// Verification API (#149) — assert what happened, not just look at it
+// ============================================================================
+
+/// Query parameters of `GET /admin/requests/count`.
+///
+/// The same filters `list_requests` applies — path, method, status, and
+/// unmatched-only — plus an optional `expect` that turns the response into
+/// an assertion: `200` when the count matches, `417` when it doesn't, so a
+/// test suite can fail with `curl --fail` and no JSON parsing.
+#[derive(Deserialize, Default)]
+pub struct CountFilter {
+    pub path: Option<String>,
+    pub method: Option<String>,
+    /// An exact code (`404`) or a status class (`4xx`, `5xx`).
+    pub status: Option<String>,
+    /// Keep only requests that matched no mock. Accepts `true`/`1`/`yes`.
+    pub unmatched_only: Option<String>,
+    /// The count the caller expects. Unset means "report, don't assert".
+    pub expect: Option<String>,
+}
+
+/// `GET /admin/requests/count` — how many recorded requests satisfy the
+/// filters.
+///
+/// A count endpoint is the "verify" half of a mock server: `POST /payments
+/// exactly once` is `count?path=/payments&method=POST&expect=1`, answered by
+/// the HTTP status itself. The `RequestFilter` body/header matchers richer
+/// verification would want are deliberately left to a follow-up — path,
+/// method and status already cover the dominant call-count asserts, and the
+/// filter semantics reuse [`list_requests`]'s one implementation.
+pub async fn count_requests(
+    State(state): State<AppState>,
+    Query(filter): Query<CountFilter>,
+) -> Response {
+    let unmatched_only = filter.unmatched_only.as_deref().is_some_and(is_truthy);
+    let count = {
+        let log = state.request_log.read().await;
+        log.iter()
+            .filter(|r| {
+                if let Some(ref p) = filter.path {
+                    if !p.is_empty() && !r.path.contains(p.as_str()) {
+                        return false;
+                    }
+                }
+                if let Some(ref m) = filter.method {
+                    if !m.is_empty() && !r.method.eq_ignore_ascii_case(m) {
+                        return false;
+                    }
+                }
+                if let Some(ref s) = filter.status {
+                    if !status_matches(s, r.response_status) {
+                        return false;
+                    }
+                }
+                !(unmatched_only && r.matched_mock.is_some())
+            })
+            .count()
+    };
+
+    let expect = filter
+        .expect
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let status = match expect.and_then(|e| e.parse::<usize>().ok()) {
+        Some(expected) => {
+            if count == expected {
+                StatusCode::OK
+            } else {
+                StatusCode::EXPECTATION_FAILED
+            }
+        }
+        None => StatusCode::OK,
+    };
+
+    (
+        status,
+        Json(json!({
+            "count": count,
+            "expect": expect.map(|e| e.parse::<usize>().ok().unwrap_or(0)),
+            "matched": expect.is_none_or(|e| {
+                e.parse::<usize>().ok().is_none_or(|expected| expected == count)
+            }),
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /admin/reset` — return every piece of cross-request state to its
+/// fresh start: the request log, per-mock hit counts, sequence counters, and
+/// the hit-count part of `/admin/mocks` that used to disagree with the log
+/// after `DELETE /admin/requests`.
+///
+/// The one documented call a test suite makes between cases.
+pub async fn reset_all(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cleared_log = {
+        let mut log = state.request_log.write().await;
+        let len = log.len();
+        log.clear();
+        len
+    };
+    let cleared_hits = {
+        let mut hits = state.mock_hits.write().await;
+        let len = hits.len();
+        hits.clear();
+        len
+    };
+    let cleared_counters = {
+        let mut counters = state.sequence_counters.write().await;
+        let len = counters.len();
+        counters.clear();
+        len
+    };
+    info!(
+        "Admin reset: cleared {} request record(s), {} hit count(s), {} sequence counter(s)",
+        cleared_log, cleared_hits, cleared_counters
+    );
+    Json(json!({
+        "cleared_requests": cleared_log,
+        "cleared_hits": cleared_hits,
+        "cleared_sequences": cleared_counters,
+    }))
+}
+
+/// `POST /admin/reload` — run a reload cycle right now and report what it
+/// changed, so a test that has just written a mock file doesn't have to sleep
+/// out the 2-second polling interval.
+///
+/// With the server's reload loop running, the request wakes it via
+/// [`AppState::reload_trigger`] and waits for that cycle to install; without
+/// one (unit tests, or the loop otherwise absent) it runs a synchronous
+/// cycle in-process and installs the result itself. Either way the response
+/// describes the post-reload mock set, not merely the promise of one.
+pub async fn force_reload(State(state): State<AppState>) -> Response {
+    let reload_dir = state.mocks_dir.clone();
+
+    // When the background loop owns installation, hand the cycle over to it:
+    // the loop also reconciles sequence counters and hit counts, and two
+    // installers writing the same store would race.
+    if let Some(trigger) = state.reload_trigger.clone() {
+        trigger.notify_one();
+        // The loop installs within one polling tick after waking; wait for
+        // the store to quiesce by briefly watching it settle, then report.
+        // A bounded wait keeps a hung loop from hanging a test.
+        let settled = wait_for_reload_settle(&state).await;
+        if !settled {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "reload trigger sent, but the hot-reload loop did not settle in time",
+                })),
+            )
+                .into_response();
+        }
+    } else {
+        // No reloader is running (in-process server, tests): run one cycle
+        // synchronously, exactly as the loop would.
+        let mut cache = crate::loader::LoaderCache::new();
+        let dir = reload_dir.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::loader::load_mocks_map_hot_reload(&dir, &mut cache)
+        })
+        .await
+        .map(|o| o.result)
+        .unwrap_or_else(|e| {
+            warn!("Forced reload task panicked: {}", e);
+            crate::loader::LoadResult {
+                mocks: HashMap::new(),
+                errors: Vec::new(),
+                files: 0,
+            }
+        });
+        let had_errors = !outcome.errors.is_empty();
+        {
+            let mut store = state.mocks.write().await;
+            *store = crate::apply_reload(&store, outcome);
+        }
+        let _ = had_errors;
+    }
+
+    // Report the post-reload world: what's registered now, and whether any
+    // file failed to parse.
+    let mocks = state.mocks.read().await;
+    let total: usize = mocks.values().map(Vec::len).sum();
+    let mut keys: Vec<&String> = mocks.keys().collect();
+    keys.sort();
+    Json(json!({
+        "reloaded": true,
+        "endpoints": total,
+        "keys": keys,
+    }))
+    .into_response()
+}
+
+/// Wait for a triggered reload cycle to finish installing: the store stops
+/// changing between polls (same key set, same per-bucket lengths, and stable
+/// element sources), which is enough to know a cycle installed — a mock's
+/// full equality isn't derivable cheaply and never differs without a file
+/// change on disk, which would itself change the bucket shape.
+async fn wait_for_reload_settle(state: &AppState) -> bool {
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    // One mock element's fingerprint fields: (source file, index within it).
+    type ElementFingerprint<'a> = (Option<&'a str>, Option<usize>);
+
+    // A cheap fingerprint: sorted keys plus per-bucket (len, source-label)
+    // pairs. Two consecutive equal fingerprints mean the loop has installed
+    // whatever it woke for.
+    fn fingerprint(store: &HashMap<String, Vec<crate::types::MockConfig>>) -> String {
+        let mut keys: Vec<(&String, Vec<ElementFingerprint<'_>>)> = store
+            .iter()
+            .map(|(key, bucket)| {
+                (
+                    key,
+                    bucket
+                        .iter()
+                        .map(|mock| (mock.source.as_deref(), mock.source_index))
+                        .collect(),
+                )
+            })
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(b.0));
+        format!(
+            "{:?}\u{1}",
+            keys.iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    let deadline = tokio::time::Instant::now() + MAX_WAIT;
+    let mut previous: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL).await;
+        let current = {
+            let store = state.mocks.read().await;
+            fingerprint(&store)
+        };
+        if previous.as_deref() == Some(current.as_str()) {
+            return true;
+        }
+        previous = Some(current);
+    }
+    false
+}
+
+// ============================================================================
+// HAR export (#149)
+// ============================================================================
+
+/// `GET /admin/requests.har` — the request log as a HAR 1.2 document.
+///
+/// The same filters as `list_requests` apply (`path`, `method`, `status`,
+/// `unmatched_only`, `search`, `limit`, `offset` on full-log `?limit=0`
+/// semantics). Bodies and headers carry the same redaction the JSON log
+/// shows: what's in the HAR is what `/admin/requests` records, never a
+/// secret the JSON shape already hides.
+pub async fn export_har(
+    State(state): State<AppState>,
+    Query(filter): Query<RequestFilter>,
+) -> Response {
+    let unmatched_only = filter.unmatched_only.as_deref().is_some_and(is_truthy);
+    let search = filter
+        .search
+        .as_ref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let log = state.request_log.read().await;
+    let entries: Vec<serde_json::Value> = log
+        .iter()
+        .filter(|r| {
+            if let Some(ref p) = filter.path {
+                if !p.is_empty() && !r.path.contains(p.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(ref m) = filter.method {
+                if !m.is_empty() && !r.method.eq_ignore_ascii_case(m) {
+                    return false;
+                }
+            }
+            if let Some(ref s) = filter.status {
+                if !status_matches(s, r.response_status) {
+                    return false;
+                }
+            }
+            if unmatched_only && r.matched_mock.is_some() {
+                return false;
+            }
+            if let Some(ref needle) = search {
+                if !record_matches_search(r, needle) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|r| {
+            json!({
+                "startedDateTime": r.timestamp,
+                "time": r.duration_ms.unwrap_or(0),
+                "_resourceType": "mimic",
+                "request": {
+                    "method": r.method,
+                    "url": r.path,
+                    "queryString": r.query_params.iter().map(|(k, values)| json!({
+                        "name": k,
+                        "value": values.first().cloned().unwrap_or_default(),
+                    })).collect::<Vec<_>>(),
+                    "headers": r.headers.iter().map(|(k, v)| json!({
+                        "name": k,
+                        "value": v,
+                    })).collect::<Vec<_>>(),
+                    "headersSize": -1,
+                    "bodySize": r.body.as_ref().map_or(-1, |b| b.len() as i64),
+                    "postData": r.body.as_ref().map(|b| json!({
+                        "mimeType": "",
+                        "text": b,
+                    })),
+                },
+                "response": {
+                    "status": r.response_status,
+                    "statusText": "",
+                    "headers": r.response_headers.iter().map(|(k, v)| json!({
+                        "name": k,
+                        "value": v,
+                    })).collect::<Vec<_>>(),
+                    "headersSize": -1,
+                    "bodySize": r.response_body.as_ref().map_or(-1, |b| b.len() as i64),
+                    "content": {
+                        "size": r.response_body.as_ref().map_or(-1, |b| b.len() as i64),
+                        "mimeType": r.response_headers.get("content-type").cloned().unwrap_or_default(),
+                        "text": r.response_body,
+                    },
+                },
+                "cache": {},
+                "timings": {
+                    "send": 0,
+                    "wait": r.duration_ms.unwrap_or(0),
+                    "receive": 0,
+                },
+                "_mimicMatchedMock": r.matched_mock,
+                "_mimicMatchScore": r.match_score,
+                "_mimicMatchExplanation": r.match_explanation,
+            })
+        })
+        .collect();
+
+    let har = json!({
+        "log": {
+            "version": "1.2",
+            "creator": {
+                "name": "mimic",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "entries": entries,
+        }
+    });
+
+    let mut response = Json(har).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str("application/har+json") {
+        response.headers_mut().insert(CONTENT_TYPE, value);
+    }
+    response
 }
 
 /// A response body being served from a `response_file` rather than from
