@@ -422,6 +422,69 @@ fn check_regexes(mock: &MockConfig, file: &str, findings: &mut Vec<Finding>) {
             }
         }
     }
+
+    // `$regex` forms inside a JSON `partial` matcher, at any depth
+    if let Some(BodyMatcher::Json(json)) = &mock.body {
+        if let Some(partial) = &json.partial {
+            let mut problems = Vec::new();
+            collect_json_regex_problems(partial, String::new(), &mut problems);
+            for (field, regex) in problems {
+                if compiled_regex(&regex).is_none() {
+                    findings.push(Finding {
+                        file: file.to_string(),
+                        severity: Severity::Warning,
+                        kind: "invalid_regex",
+                        message: format!(
+                            "JSON body field `{}` $regex `{}` failed to compile; this \
+                             matcher can never match",
+                            field, regex
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Every `$regex` pattern inside a JSON `partial` subtree, with its field
+/// path — the same walk [`crate::matcher::json_partial_reject_reason`] does at
+/// request time, so validate sees exactly the patterns that can fail there.
+fn collect_json_regex_problems(
+    value: &serde_json::Value,
+    field_path: String,
+    problems: &mut Vec<(String, String)>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    // A one-key `$`-form is a matcher; a multi-key object is a literal whose
+    // *values* may themselves hold matchers.
+    if object.len() == 1 {
+        if let Some((key, form)) = object.iter().next() {
+            if let Some(kind) = key.strip_prefix('$').filter(|k| !k.starts_with('$')) {
+                if kind == "regex" {
+                    if let Some(pattern) = form.as_str() {
+                        problems.push((field_path, pattern.to_string()));
+                    }
+                    return;
+                }
+                // $any/$type/$contains forms hold no further regex beneath
+                // the form value except $contains, which is a partial subtree.
+                if kind == "contains" {
+                    collect_json_regex_problems(form, field_path.clone(), problems);
+                }
+                return;
+            }
+        }
+    }
+    for (key, child) in object {
+        let child_path = if field_path.is_empty() {
+            key.clone()
+        } else {
+            format!("{}.{}", field_path, key)
+        };
+        collect_json_regex_problems(child, child_path, problems);
+    }
 }
 
 /// The sequence rule `advance_sequence` enforces when a request actually
