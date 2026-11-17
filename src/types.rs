@@ -181,6 +181,41 @@ pub struct FormBodyMatcher {
     pub strict: bool,
 }
 
+/// A stateful CRUD collection (#153, second PR): a tiny in-memory REST
+/// backend behind `path`.
+///
+/// Declared on a mock whose `method`/`status`/`response` fields are ignored —
+/// the collection *is* the behaviour. Expands to five routes:
+///
+/// - `GET <path>` — list rows
+/// - `POST <path>` — create (assigns the next id), `201` + `Location`
+/// - `GET <path>/:id` — one row or `404`
+/// - `PUT`/`PATCH <path>/:id` — replace fields, `200` or `404`
+/// - `DELETE <path>/:id` — remove, `204` or `404`
+///
+/// Backed by memory only: state lives in [`crate::handler::AppState`],
+/// survives hot reload, and `POST /admin/reset` returns every collection to
+/// its seed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollectionConfig {
+    /// Unique name — also the `mock_hits`/reset key.
+    pub name: String,
+    /// Base path of the collection, e.g. `/users`. Its five routes hang off
+    /// it (`GET /users`, `POST /users`, `GET /users/:id`, …).
+    pub path: String,
+    /// The field inside each row that identifies it (`id`). Must be unique
+    /// per row; created rows get a value assigned when they don't bring one.
+    #[serde(default = "default_id_field")]
+    pub id_field: String,
+    /// Rows the collection starts with. Copied on reset.
+    #[serde(default)]
+    pub seed: Vec<serde_json::Value>,
+}
+
+fn default_id_field() -> String {
+    "id".to_string()
+}
+
 // ============================================================================
 // Main Mock Configuration
 // ============================================================================
@@ -189,6 +224,11 @@ pub struct FormBodyMatcher {
 pub struct MockConfig {
     pub method: String,
     pub path: String,
+    /// The HTTP status the mock serves. `0` when a mock doesn't declare one —
+    /// which only a *collection* mock legitimately does (the collection
+    /// defines its own statuses); a plain mock without a status is warned at
+    /// load and served as 200, exactly like an out-of-range one.
+    #[serde(default)]
     pub status: u16,
 
     /// The response body as JSON.
@@ -258,6 +298,13 @@ pub struct MockConfig {
     /// Optional stateful response sequence (one step consumed per request)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<Vec<SequenceStep>>,
+
+    /// A stateful CRUD collection (#153): this mock declares an in-memory
+    /// REST resource the handler serves directly. Everything else on the
+    /// config (method, status, response, matchers) is ignored — the
+    /// collection generates its own routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<CollectionConfig>,
 
     /// Scenario tags this mock belongs to.
     ///
@@ -783,6 +830,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -867,6 +915,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -900,6 +949,7 @@ mod tests {
                 source: None,
                 source_index: None,
                 disabled: None,
+                collection: None,
                 sequence: None,
                 tags: Vec::new(),
                 response_file: None,
@@ -983,6 +1033,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1077,6 +1128,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1100,6 +1152,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1412,6 +1465,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             response_file: None,

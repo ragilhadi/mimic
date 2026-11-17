@@ -17,6 +17,7 @@ fn plain_mock(method: &str, path: &str) -> MockConfig {
         source: None,
         source_index: None,
         disabled: None,
+        collection: None,
         sequence: None,
         tags: Vec::new(),
         response_file: None,

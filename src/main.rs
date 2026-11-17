@@ -1,3 +1,4 @@
+mod collections;
 mod cors;
 mod faker;
 mod handler;
@@ -904,6 +905,8 @@ mod tests {
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
+    #[path = "collection_tests.rs"]
+    mod collections_tests;
     #[path = "runtime_mock_tests.rs"]
     mod runtime_mocks;
     #[path = "verification_tests.rs"]
@@ -1468,6 +1471,7 @@ mod tests {
             source: None,
             source_index: None,
             disabled: None,
+            collection: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,

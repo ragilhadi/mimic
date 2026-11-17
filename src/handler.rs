@@ -1,3 +1,4 @@
+use crate::collections;
 use crate::cors::{self, CorsConfig};
 use crate::matcher::{
     explain_match, explain_no_match, find_matching_mock, is_pattern_path, parse_body,
@@ -6,8 +7,8 @@ use crate::matcher::{
 };
 use crate::template::{render_response_ref, TemplateContext};
 use crate::types::{
-    is_sensitive_header, is_truthy, parse_active_tags, ActiveTags, MockConfig, MockIdentity,
-    MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
+    is_sensitive_header, is_truthy, parse_active_tags, ActiveTags, CollectionConfig, MockConfig,
+    MockIdentity, MockStore, RequestLog, RequestRecord, SequenceCounters, SequenceStep,
 };
 use axum::{
     body::Body,
@@ -603,6 +604,10 @@ pub struct AppState {
     /// their stable runtime id. Merged under the same lock `apply_reload`
     /// writes through: hot reload replaces the file-backed layer only.
     pub runtime_mocks: Arc<tokio::sync::RwLock<HashMap<String, MockConfig>>>,
+    /// Stateful CRUD collections (#153b): live rows per collection name.
+    /// The *configs* live in the mock store (declared in mock files like
+    /// anything else); only the mutable row state lives here.
+    pub collections: crate::collections::CollectionStore,
     /// Monotonic counter minting runtime ids (`r-1`, `r-2`, …).
     pub runtime_counter: Arc<AtomicU64>,
     /// Whether the runtime mock write routes are locked off
@@ -640,6 +645,7 @@ impl AppState {
             mocks_dir: "mocks".to_string(),
             reload_trigger: None,
             runtime_mocks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            collections: crate::collections::CollectionStore::default(),
             runtime_counter: Arc::new(AtomicU64::new(0)),
             admin_readonly: false,
         }
@@ -1000,9 +1006,76 @@ pub async fn handle_request(
         query_params,
         query_params_all,
         headers: parsed_headers.clone(),
-        body: body_bytes,
+        // Cloned (a refcount bump) so the collection interception below can
+        // read the body after `context` owns the original.
+        body: body_bytes.clone(),
         content_type,
     };
+
+    // Stateful collections (#153b) shadow mock matching for the routes they
+    // own: a collection is a resource, not a mock shape. Any collection
+    // whose base path prefixes the request path gets first refusal — with
+    // the body already read (`needs_body` above can't know a collection
+    // wants it, so the read happens here, and an unread body is recovered
+    // by the operation itself returning 400/405 without one).
+    let collection_configs = collection_configs(&state.mocks).await;
+    let matched_collection = collection_configs
+        .iter()
+        .find(|config| collections::collection_owns(&config.path, &path));
+    if let Some(config) = matched_collection {
+        if let Some(owned) = collections::answer_collection(
+            &state.collections,
+            config,
+            &path,
+            &method_str,
+            Some(&body_bytes.unwrap_or_default()),
+        )
+        .await
+        {
+            let mut header_map = HeaderMap::new();
+            if let Some(location) = owned.location {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&location) {
+                    header_map.insert(axum::http::header::LOCATION, value);
+                }
+            }
+            let response_body_bytes = if owned.body.is_null() {
+                Bytes::new()
+            } else {
+                Bytes::from(owned.body.to_string())
+            };
+            // Content type: JSON unless the body is empty (204/405 carry none).
+            if !response_body_bytes.is_empty() {
+                header_map.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+            }
+
+            let path_params = context.path_params.clone();
+            record_request(
+                &state,
+                context,
+                RequestOutcome {
+                    matched_mock: Some(format!("collection:{}", config.name)),
+                    response_status: owned.status,
+                    response_body: Some(if response_body_bytes.is_empty() {
+                        String::new()
+                    } else {
+                        owned.body.to_string()
+                    }),
+                    response_headers: recorded_response_headers(&header_map),
+                    match_score: None,
+                    path_params,
+                    match_explanation: Some(format!("served by collection `{}`", config.name)),
+                    started_at: Some(request_started),
+                },
+            )
+            .await;
+
+            let status = StatusCode::from_u16(owned.status).unwrap_or(StatusCode::OK);
+            return assemble_response(status, header_map, response_body_bytes);
+        }
+    }
 
     // Find matching mock using the matcher (acquire read lock)
     let mocks = state.mocks.read().await;
@@ -1802,7 +1875,21 @@ pub async fn list_requests(
     }))
 }
 
-/// One loaded mock as `/admin/mocks` reports it.
+/// Every collection declared in the current mock store, in key order for a
+/// stable ownership check (`/users` before `/users-admin` never matters, but
+/// two collections on one path would).
+pub(crate) async fn collection_configs(mocks: &MockStore) -> Vec<CollectionConfig> {
+    let store = mocks.read().await;
+    let mut configs: Vec<CollectionConfig> = store
+        .values()
+        .flatten()
+        .filter_map(|mock| mock.collection.clone())
+        .collect();
+    configs.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.name.cmp(&b.name)));
+    configs
+}
+
+/// The admin's `GET /admin/mocks` row for one mock.
 fn describe_mock_entry(
     key: &str,
     index: usize,
@@ -2174,14 +2261,23 @@ pub async fn reset_all(State(state): State<AppState>) -> Json<serde_json::Value>
         counters.clear();
         len
     };
+    // Stateful collections (#153b) return to their seed — the same fresh
+    // start the rest of the state gets.
+    let collection_configs = collection_configs(&state.mocks).await;
+    let configs_vec: Vec<CollectionConfig> = collection_configs;
+    let config_refs: Vec<&CollectionConfig> = configs_vec.iter().collect();
+    let reset_collections =
+        crate::collections::reset_collections(&state.collections, &config_refs).await;
     info!(
-        "Admin reset: cleared {} request record(s), {} hit count(s), {} sequence counter(s)",
-        cleared_log, cleared_hits, cleared_counters
+        "Admin reset: cleared {} request record(s), {} hit count(s), {} sequence counter(s), \
+         reset {} collection(s)",
+        cleared_log, cleared_hits, cleared_counters, reset_collections
     );
     Json(json!({
         "cleared_requests": cleared_log,
         "cleared_hits": cleared_hits,
         "cleared_sequences": cleared_counters,
+        "reset_collections": reset_collections,
     }))
 }
 
