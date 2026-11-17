@@ -17,6 +17,30 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// One raw HTTP request to `127.0.0.1:port`, returning `(status, full
+/// response text)` — or `None` when nothing answered cleanly (refused,
+/// timed out, or reset mid-read, which happens when a sibling test is
+/// tearing its server down). Never panics.
+fn probe_request(port: u16, raw_request: &str) -> Option<(u16, String)> {
+    use std::io::Write;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(750)))
+        .ok()?;
+    stream
+        .write_all(
+            format!("{raw_request}\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())?;
+    Some((status, response))
+}
+
 /// A command that can't pick up the developer's own configuration.
 fn mimic() -> Command {
     let mut cmd = Command::new(BIN);
@@ -35,49 +59,85 @@ struct Server {
 }
 
 impl Server {
-    fn start(mut cmd: Command, port: u16) -> Self {
-        let child = cmd
-            .env("PORT", port.to_string())
-            .env("MIMIC_BIND_ADDRESS", "127.0.0.1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn mimic");
-        let server = Server { child, port };
-        server.wait_until_listening();
-        server
+    /// Spawn mimic on a freshly allocated port — retrying when the port was
+    /// raced away (see [`free_port`]) — and wait until the child serves
+    /// `expect_path` with `want`, the mock this test wrote. If the child
+    /// died before it could listen (bind conflict) or the port was captured
+    /// by a sibling (whose mock set can't answer `expect_path`), start over
+    /// on a different port.
+    fn start(mut cmd: Command, expect_path: &str, want: u16) -> Self {
+        for attempt in 0..5 {
+            let port = free_port();
+            let child = cmd
+                .env("PORT", port.to_string())
+                .env("MIMIC_BIND_ADDRESS", "127.0.0.1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn mimic");
+            let mut server = Server { child, port };
+            match server.wait_until_listening(expect_path, want) {
+                Ok(()) => return server,
+                Err(reason) => {
+                    let _ = server.child.kill();
+                    let _ = server.child.wait();
+                    if attempt == 4 {
+                        panic!("mimic never served {expect_path} after 5 attempts: {reason}");
+                    }
+                }
+            }
+        }
+        unreachable!("loop returns or panics");
     }
 
-    fn wait_until_listening(&self) {
+    /// Wait until the child actually serves something on its port.
+    ///
+    /// The port comes from [`free_port`], which hands it back to the OS —
+    /// under a parallel test run two spawns can race onto the same port,
+    /// and a probe would then be answered by a *sibling's* server. So the
+    /// probe is only trusted when the answer comes from a mock **this test
+    /// wrote**; `expect_path` is that test's own route, which no sibling's
+    /// mock set contains.
+    fn wait_until_listening(&mut self, expect_path: &str, want: u16) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last = format!("{expect_path} not answered yet");
         while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                return;
+            // The child failing to bind (`fatal(...)` exits 1) is visible
+            // only until a probe succeeds, so check it before probing.
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return Err(format!("exited before listening ({status})"));
+            }
+            if let Some((status, _)) =
+                probe_request(self.port, &format!("GET {expect_path} HTTP/1.1"))
+            {
+                if status == want {
+                    return Ok(());
+                }
+                last = format!("{expect_path} answered {status}, want {want}");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("mimic never listened on {}", self.port);
+        Err(last)
     }
 
     /// `GET path`, returning the status code.
+    ///
+    /// Retries across the read timeout window: a server being torn down by
+    /// a sibling test can reset the connection between the successful probe
+    /// above and this request, and treating that as an assertion failure
+    /// made the suite flaky (a pre-existing race `wait_until_listening`'s
+    /// connect-only check used to let through).
     fn status(&self, path: &str) -> u16 {
-        use std::io::Write;
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        write!(
-            stream,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("no status line in {response:?}"))
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some((status, _)) = probe_request(self.port, &format!("GET {path} HTTP/1.1")) {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("no HTTP status for {path} on {} within 10s", self.port);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn wait_for_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
@@ -182,10 +242,15 @@ fn an_unusable_bind_address_fails_startup_cleanly() {
 #[test]
 fn sigterm_stops_the_server_gracefully_and_the_banner_names_the_real_health_path() {
     let dir = empty_mocks_dir();
+    std::fs::write(
+        dir.path().join("up.json"),
+        r#"{"method":"GET","path":"/sigterm-up","status":200,"response":"up"}"#,
+    )
+    .unwrap();
     let mut cmd = mimic();
     cmd.env("MIMIC_MOCKS_DIR", dir.path())
         .env("MIMIC_HEALTH_PATH", "/ping");
-    let mut server = Server::start(cmd, free_port());
+    let mut server = Server::start(cmd, "/sigterm-up", 200);
     assert_eq!(server.status("/ping"), 200);
 
     let pid = server.child.id().to_string();
@@ -213,10 +278,15 @@ fn sigterm_stops_the_server_gracefully_and_the_banner_names_the_real_health_path
 #[test]
 fn the_banner_omits_the_health_line_when_the_health_check_is_disabled() {
     let dir = empty_mocks_dir();
+    std::fs::write(
+        dir.path().join("up.json"),
+        r#"{"method":"GET","path":"/banner-up","status":200,"response":"up"}"#,
+    )
+    .unwrap();
     let mut cmd = mimic();
     cmd.env("MIMIC_MOCKS_DIR", dir.path())
         .env("MIMIC_HEALTH_PATH", "");
-    let mut server = Server::start(cmd, free_port());
+    let mut server = Server::start(cmd, "/banner-up", 200);
     let _ = server.child.kill();
     server.wait_for_exit(Duration::from_secs(5));
     let log = server.output();
@@ -241,7 +311,7 @@ fn a_deleted_mock_stops_being_served_even_after_a_broken_sibling_goes_away() {
 
     let mut cmd = mimic();
     cmd.env("MIMIC_MOCKS_DIR", dir.path());
-    let server = Server::start(cmd, free_port());
+    let server = Server::start(cmd, "/stay", 200);
     assert_eq!(server.status("/gone"), 200);
 
     let until = |path: &str, want: u16| {
@@ -279,29 +349,26 @@ fn the_verification_api_round_trip_works_over_http() {
 
     let mut cmd = mimic();
     cmd.env("MIMIC_MOCKS_DIR", dir.path());
-    let server = Server::start(cmd, free_port());
+    let server = Server::start(cmd, "/verified", 200);
 
-    // Full-response HTTP helper (status line + headers + body).
+    // Full-response HTTP helper. Retries across resets so a torn-down
+    // sibling's server can't fail an assertion spuriously; the deadline
+    // turns genuine absence into a failure with the last response shown.
     let request = |port: u16, raw: &str| -> (u16, String) {
-        use std::io::Write;
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        write!(
-            stream,
-            "{}\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            raw
-        )
-        .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or(0);
-        (status, response)
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = (0, String::from("<no response>"));
+        loop {
+            if let Some(pair) = probe_request(port, raw) {
+                if pair.0 != 0 {
+                    return pair;
+                }
+                last = pair;
+            }
+            if Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     };
 
     // 1. Force a reload after writing a NEW mock file no reload cycle has
@@ -319,7 +386,21 @@ fn the_verification_api_round_trip_works_over_http() {
         "forced reload must install the new mock immediately"
     );
 
-    // 2. Hit the mock, then count.
+    // 2. Hit the mock, then count. The startup gate in Server::start probes
+    //    /verified too (that's how it knows *this* server won the port), so
+    //    the log already holds one record here — /admin/reset is the
+    //    documented clean-slate call and clears it before the assertion.
+    server.status("/verified");
+    let (reset_status, _) = request(server.port, "POST /admin/reset HTTP/1.1");
+    assert_eq!(reset_status, 200);
+    let (status, _) = request(
+        server.port,
+        "GET /admin/requests/count?path=/verified&method=GET&expect=1 HTTP/1.1",
+    );
+    assert_eq!(
+        status, 417,
+        "no record survives the reset, so expect=1 fails: expected 417 before re-hitting"
+    );
     server.status("/verified");
     let (status, _) = request(
         server.port,
@@ -350,7 +431,8 @@ fn the_verification_api_round_trip_works_over_http() {
     );
     assert!(har.contains("\"version\":\"1.2\""), "HAR body: {har}");
 
-    // 5. Reset wipes the log; the next count is zero.
+    // 5. Reset wipes the log again; the next unfiltered count is zero —
+    //    proving step 2's reset left nothing behind either.
     let (status, _) = request(server.port, "POST /admin/reset HTTP/1.1");
     assert_eq!(status, 200);
     let (status, body) = request(server.port, "GET /admin/requests/count HTTP/1.1");
