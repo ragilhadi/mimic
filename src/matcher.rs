@@ -89,6 +89,20 @@ pub enum RejectReason {
         expected: usize,
         actual: usize,
     },
+    /// A `$type` assertion found the field of a different JSON type
+    JsonTypeMismatch {
+        field: String,
+        expected: String,
+    },
+    /// A `$regex` assertion did not match the field's value
+    JsonRegexMismatch {
+        field: String,
+        pattern: String,
+    },
+    /// A `$contains` assertion found no array element matching the shape
+    JsonContainsMissing {
+        field: String,
+    },
     TextExact,
     TextContains {
         substring: String,
@@ -180,6 +194,21 @@ impl fmt::Display for RejectReason {
                 f,
                 "strict JSON matching expected {} item(s) in `{}`, got {}",
                 expected, field, actual
+            ),
+            RejectReason::JsonTypeMismatch { field, expected } => write!(
+                f,
+                "JSON body field `{}` is not of type `{}`",
+                field, expected
+            ),
+            RejectReason::JsonRegexMismatch { field, pattern } => write!(
+                f,
+                "JSON body field `{}` does not match the regex `{}`",
+                field, pattern
+            ),
+            RejectReason::JsonContainsMissing { field } => write!(
+                f,
+                "no element of the JSON array `{}` matches the `$contains` shape",
+                field
             ),
             RejectReason::TextExact => write!(f, "the text body did not match `exact`"),
             RejectReason::TextContains { substring } => {
@@ -996,6 +1025,14 @@ fn match_json_partial(
 ///
 /// `field_path` is the dotted path walked so far (empty at the root), so a
 /// nested mismatch can name `user.address.city` rather than just "some field".
+///
+/// An expected value that is an object carrying a single `$`-prefixed key is
+/// a matcher *form* rather than a literal object — `{"$any": true}`,
+/// `{"$regex": …}`, `{"$type": …}`, `{"$contains": …}` — and is judged by
+/// [`json_matcher_form_reject_reason`] instead of compared literally. An
+/// object without such a key (or with more than one key, or a nested
+/// `$`-object deeper inside a literal) compares exactly as before, so
+/// existing mocks cannot change meaning. See #143.
 fn json_partial_reject_reason(
     actual: &serde_json::Value,
     expected: &serde_json::Value,
@@ -1008,6 +1045,12 @@ fn json_partial_reject_reason(
             key.to_string()
         } else {
             format!("{}.{}", field_path, key)
+        }
+    }
+
+    if let Some(expected_obj) = expected.as_object() {
+        if matcher_form_kind(expected_obj).is_some() {
+            return json_matcher_form_reject_reason(actual, expected_obj, field_path);
         }
     }
 
@@ -1090,6 +1133,141 @@ fn json_partial_reject_reason(
             }
         }
     }
+}
+
+/// The single `$`-prefixed key marking an expected JSON object as a matcher
+/// form rather than a literal, or `None` if it isn't one.
+///
+/// Deliberately strict — the key must be **alone** — so an object that happens
+/// to carry a field named `$anything` next to other fields is still compared
+/// literally, and no existing mock can change meaning. A one-key object whose
+/// key carries a second `$` (`"$$any"`) is likewise left a literal; escaping
+/// matters only for the `$`-prefixed keys that exist today, and `$any` itself
+/// is already a legal field name compared literally inside a multi-key object.
+fn matcher_form_kind(expected_obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    if expected_obj.len() != 1 {
+        return None;
+    }
+    let (key, _) = expected_obj.iter().next()?;
+    let stripped = key.strip_prefix('$')?;
+    // `$$` is the escape for a matcher key that is *meant* literally, so it
+    // never selects a form — one more level of `$` would.
+    if stripped.starts_with('$') {
+        return None;
+    }
+    Some(stripped)
+}
+
+/// Judge an expected matcher form (the single-key object selected by
+/// [`matcher_form_kind`]) against `actual`, or `None` if it accepts.
+fn json_matcher_form_reject_reason(
+    actual: &serde_json::Value,
+    form: &serde_json::Map<String, serde_json::Value>,
+    field_path: &str,
+) -> Option<RejectReason> {
+    let (key, expected) = form.iter().next().expect("checked to be a one-key form");
+    let kind = key.strip_prefix('$').expect("checked to start with `$`");
+    match kind {
+        "any" => None,
+        "regex" => json_regex_form_reject_reason(actual, expected, field_path),
+        "type" => json_type_form_reject_reason(actual, expected, field_path),
+        "contains" => json_contains_form_reject_reason(actual, expected, field_path),
+        other => {
+            // An unknown `$`-form matches nothing, loudly: a typo (`"$regex"`)
+            // must explain itself on the dashboard instead of silently
+            // comparing as a literal object that can never equal `actual`.
+            debug!("Unknown JSON matcher form `${}`", other);
+            Some(RejectReason::JsonFieldMismatch {
+                field: describe_field_path(field_path),
+            })
+        }
+    }
+}
+
+/// Evaluate `$regex`: the expected value is the pattern string.
+fn json_regex_form_reject_reason(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    field_path: &str,
+) -> Option<RejectReason> {
+    let Some(pattern) = expected.as_str() else {
+        return Some(RejectReason::JsonFieldMismatch {
+            field: describe_field_path(field_path),
+        });
+    };
+    let candidate = actual.as_str().unwrap_or("");
+    match crate::regex_cache::compiled_regex(pattern) {
+        Some(re) if re.is_match(candidate) => None,
+        Some(_) => Some(RejectReason::JsonRegexMismatch {
+            field: describe_field_path(field_path),
+            pattern: truncate_for_display(pattern),
+        }),
+        None => Some(RejectReason::InvalidRegex {
+            pattern: truncate_for_display(pattern),
+        }),
+    }
+}
+
+/// Evaluate `$type`: the expected value names `string|number|boolean|object|
+/// array|null`.
+fn json_type_form_reject_reason(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    field_path: &str,
+) -> Option<RejectReason> {
+    let Some(expected) = expected.as_str() else {
+        return Some(RejectReason::JsonFieldMismatch {
+            field: describe_field_path(field_path),
+        });
+    };
+    let matches = match expected {
+        "string" => actual.is_string(),
+        "number" => actual.is_number(),
+        "boolean" => actual.is_boolean(),
+        "object" => actual.is_object(),
+        "array" => actual.is_array(),
+        "null" => actual.is_null(),
+        // An unknown type name can never match; say which field instead of
+        // leaving a bare "different value" that names nothing.
+        _ => {
+            return Some(RejectReason::JsonTypeMismatch {
+                field: describe_field_path(field_path),
+                expected: expected.to_string(),
+            })
+        }
+    };
+    if matches {
+        None
+    } else {
+        Some(RejectReason::JsonTypeMismatch {
+            field: describe_field_path(field_path),
+            expected: expected.to_string(),
+        })
+    }
+}
+
+/// Evaluate `$contains`: `actual` must be an array with **any** element
+/// partially matching the expected shape. The shape is a full `partial`
+/// subtree, so a matcher form may sit inside it (`{"$contains": {"sku":
+/// {"$regex": "^A-"}}}`). A non-array `actual` rejects.
+fn json_contains_form_reject_reason(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    field_path: &str,
+) -> Option<RejectReason> {
+    let Some(array) = actual.as_array() else {
+        return Some(RejectReason::JsonTypeMismatch {
+            field: describe_field_path(field_path),
+            expected: "array".to_string(),
+        });
+    };
+    // First matching element wins, in array order.
+    for element in array {
+        json_partial_reject_reason(element, expected, false, "")?;
+    }
+    Some(RejectReason::JsonContainsMissing {
+        field: describe_field_path(field_path),
+    })
 }
 
 /// Match text body
@@ -2199,6 +2377,8 @@ fn methods_registered_for_path(
 mod benches;
 #[cfg(test)]
 mod explanation_tests;
+#[cfg(test)]
+mod json_form_tests;
 #[cfg(test)]
 mod matching_cost;
 #[cfg(test)]

@@ -97,6 +97,53 @@ Match requests based on request body content:
 
 ---
 
+### JSON matcher forms (#143)
+
+Inside a JSON `partial`, an expected value that is an object with a **single
+`$`-prefixed key** is a matcher form rather than a literal. Real payloads
+carry values nobody can pin in advance — generated ids, timestamps, tokens —
+next to the few fields that actually choose the mock:
+
+```json
+{
+  "method": "POST",
+  "path": "/payments",
+  "status": 200,
+  "body": {
+    "type": "json",
+    "partial": {
+      "type": "payment",
+      "id":    {"$any": true},
+      "email": {"$regex": "^[^@]+@example\\.com$"},
+      "amount": {"$type": "number"},
+      "items": {"$contains": {"sku": "A-1"}}
+    }
+  },
+  "response": {"accepted": true}
+}
+```
+
+| Form | Meaning |
+|---|---|
+| `{"$any": true}` | the field exists; any value is accepted |
+| `{"$regex": "pattern"}` | the field is a string matching the regex |
+| `{"$type": "string\\|number\\|boolean\\|object\\|array\\|null"}` | the field has that JSON type |
+| `{"$contains": {…shape…}}` | the field is an array and **some** element partially matches the shape |
+
+Rules:
+
+- An object **without** a lone `$`-key — or with more keys — compares literally,
+  exactly as before, so existing mocks cannot change meaning.
+- A matcher form may sit at any depth, including inside a `$contains` shape.
+- A failing form produces a precise reason on the dashboard
+  (`/admin/requests` → the request's rejection explanations).
+- An invalid `$regex` is rejected per request and reported by
+  `mimic validate` as a warning.
+- An unknown `$`-form matches nothing — a typo like `"$regx"` explains itself
+  instead of silently comparing as a literal.
+
+---
+
 ## Detailed Configuration
 
 ### Matcher values are written decoded
