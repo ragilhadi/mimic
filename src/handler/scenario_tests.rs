@@ -17,6 +17,7 @@ fn mock(method: &str, path: &str, marker: &str, tags: &[&str]) -> MockConfig {
         response_headers: None,
         source: None,
         source_index: None,
+        disabled: None,
         sequence: None,
         tags: tags.iter().map(|t| t.to_string()).collect(),
         response_file: None,
@@ -424,6 +425,15 @@ fn only_the_exact_pairs_mimic_answers_are_reserved() {
 
     assert!(routes.reservation_for("GET", "/health").is_some());
     assert!(routes.reservation_for("GET", "/admin/mocks").is_some());
+    // Runtime mock management (#153) added POST to /admin/mocks and the
+    // id-shaped routes; mocks can no longer declare those either.
+    assert!(routes.reservation_for("POST", "/admin/mocks").is_some());
+    assert!(routes
+        .reservation_for("DELETE", "/admin/mocks/r-1")
+        .is_some());
+    assert!(routes
+        .reservation_for("POST", "/admin/mocks/r-1/disable")
+        .is_some());
     assert!(routes.reservation_for("POST", "/admin/scenario").is_some());
     assert!(routes
         .reservation_for("DELETE", "/admin/requests")
@@ -432,9 +442,13 @@ fn only_the_exact_pairs_mimic_answers_are_reserved() {
     // These reach the fallback and are perfectly good mocks; warning about
     // them would be noise, and marking them unreachable would be a lie.
     assert_eq!(routes.reservation_for("POST", "/health"), None);
-    assert_eq!(routes.reservation_for("POST", "/admin/mocks"), None);
     assert_eq!(routes.reservation_for("GET", "/admin/users"), None);
     assert_eq!(routes.reservation_for("GET", "/healthz"), None);
+    // An id-shaped reservation must not swallow a deeper path.
+    assert_eq!(
+        routes.reservation_for("GET", "/admin/mocks/r-1/other"),
+        None
+    );
 }
 
 #[test]

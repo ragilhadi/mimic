@@ -11,14 +11,15 @@ mod types;
 mod validate;
 
 use axum::{
-    routing::{any, get, post},
+    routing::{any, get, post, put},
     Router,
 };
 use handler::{
     admin_dashboard, clear_requests, configured_active_tags, configured_bind_address,
-    configured_port_checked, count_requests, export_har, force_reload, get_scenario,
+    configured_port_checked, count_requests, create_runtime_mock, delete_runtime_mock,
+    disable_runtime_mock, enable_runtime_mock, export_har, force_reload, get_scenario,
     handle_request, health_check, list_mocks, list_requests, list_sequences, max_body_size,
-    max_log_entries, reset_all, reset_sequences, set_scenario, AppState,
+    max_log_entries, reset_all, reset_sequences, set_scenario, update_runtime_mock, AppState,
 };
 use loader::load_mocks;
 use std::collections::{HashMap, HashSet};
@@ -194,6 +195,11 @@ async fn run_server() {
     let redaction = handler::BodyRedaction::from_env();
     let admin_token = handler::configured_admin_token();
 
+    // Runtime mock management (#153) write routes: `MIMIC_ADMIN_READONLY`
+    // locks them off for deployments that want the dashboard without
+    // mutation. Read at startup like every other knob.
+    let admin_readonly = handler::configured_admin_readonly();
+
     info!("Configuration:");
     info!(
         "  Mocks directory: {} ({})",
@@ -295,6 +301,7 @@ async fn run_server() {
         .with_reserved(reserved)
         .with_redaction(redaction)
         .with_admin_token(admin_token)
+        .with_admin_readonly(admin_readonly)
         .with_mocks_dir(mocks_dir.path.clone())
         .with_proxy_config(proxy_config);
 
@@ -308,10 +315,13 @@ async fn run_server() {
     let reload_counters = state.sequence_counters.clone();
     let reload_hits = state.mock_hits.clone();
     let reload_reserved = state.reserved.clone();
+    // The runtime layer the install merges back in (#153): cloned before the
+    // spawn so the loop can read it without owning all of `state`.
+    let reload_runtime = state.runtime_mocks.clone();
     // Woken by `POST /admin/reload` to install a cycle immediately instead of
     // waiting out the polling interval (#149).
     let reload_trigger = std::sync::Arc::new(tokio::sync::Notify::new());
-    let state = state.with_reload_trigger(reload_trigger.clone());
+    let state_for_router = state.with_reload_trigger(reload_trigger.clone());
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(RELOAD_INTERVAL_SECS));
@@ -387,7 +397,11 @@ async fn run_server() {
             let live = {
                 let mut store = reload_mocks.write().await;
                 let old_len = store.len();
-                *store = apply_reload(&store, result);
+                let runtime_mocks = {
+                    let runtime = reload_runtime.read().await;
+                    runtime.clone()
+                };
+                *store = apply_reload(&store, result, &runtime_mocks);
                 let new_len = store.len();
                 if old_len != new_len {
                     info!(
@@ -417,10 +431,10 @@ async fn run_server() {
 
     // Read before `create_router` takes the state: the banner below has to
     // name the health path that was actually registered.
-    let health_path = state.reserved.health.clone();
+    let health_path = state_for_router.reserved.health.clone();
 
     // Build router
-    let app = create_router(state);
+    let app = create_router(state_for_router);
 
     // Create server address
     let addr = SocketAddr::new(bind_address, port);
@@ -655,14 +669,40 @@ fn reload_needs_install(changed: bool, has_errors: bool, had_errors: bool) -> bo
 ///
 /// Also the installer `POST /admin/reload` runs when no background reloader
 /// exists — one implementation, two callers.
+///
+/// Runtime mocks (#153) survive every cycle: `runtime` names the mocks
+/// registered via `POST /admin/mocks`, and the install re-merges them under
+/// their stable ids after the file-backed map is replaced, whatever the
+/// cycle's errors did. The `current` map (with its runtime mocks in place)
+/// is what the failed-file carry reads — the runtime layer must not be
+/// double-carried as "failed files" too.
 pub fn apply_reload(
+    current: &HashMap<String, Vec<types::MockConfig>>,
+    result: loader::LoadResult,
+    runtime: &HashMap<String, types::MockConfig>,
+) -> HashMap<String, Vec<types::MockConfig>> {
+    let mut merged = reload_file_layer(current, result);
+    // Runtime layer on top: one bucket entry per runtime mock, keyed by its
+    // own declared key. A runtime mock whose file-layer twin exists (the
+    // operator hand-wrote the same route) coexists — the two compete on
+    // score like any same-path mocks, and a runtime mock created to
+    // *override* a file mock outranks it via `disabled`/matchers as usual.
+    for mock in runtime.values() {
+        let key = types::create_mock_key(&mock.method, &mock.path);
+        merged.entry(key).or_default().push(mock.clone());
+    }
+    merged
+}
+
+/// The file-backed half of [`apply_reload`]: install the cycle's result,
+/// carrying last-known-good routes for the files that failed.
+fn reload_file_layer(
     current: &HashMap<String, Vec<types::MockConfig>>,
     result: loader::LoadResult,
 ) -> HashMap<String, Vec<types::MockConfig>> {
     if result.errors.is_empty() {
         return result.mocks;
     }
-
     let applied = result.mocks.len();
     let mut merged = result.mocks;
     let mut touched: HashSet<String> = HashSet::new();
@@ -770,7 +810,28 @@ fn create_router(state: AppState) -> Router {
             )
             .route(&at("/reset"), post(reset_all).fallback(handle_request))
             .route(&at("/reload"), post(force_reload).fallback(handle_request))
-            .route(&at("/mocks"), get(list_mocks).fallback(handle_request))
+            // Runtime mock management (#153): create/update/delete/toggle a
+            // mock without touching the filesystem.
+            .route(
+                &at("/mocks"),
+                get(list_mocks)
+                    .post(create_runtime_mock)
+                    .fallback(handle_request),
+            )
+            .route(
+                &at("/mocks/{id}"),
+                put(update_runtime_mock)
+                    .delete(delete_runtime_mock)
+                    .fallback(handle_request),
+            )
+            .route(
+                &at("/mocks/{id}/disable"),
+                post(disable_runtime_mock).fallback(handle_request),
+            )
+            .route(
+                &at("/mocks/{id}/enable"),
+                post(enable_runtime_mock).fallback(handle_request),
+            )
             .route(
                 &at("/sequences"),
                 get(list_sequences).fallback(handle_request),
@@ -843,6 +904,8 @@ mod tests {
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
+    #[path = "runtime_mock_tests.rs"]
+    mod runtime_mocks;
     #[path = "verification_tests.rs"]
     mod verification;
 
@@ -1404,6 +1467,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1448,7 +1512,7 @@ mod tests {
         let current = map(vec![mock("GET", "/old", "old")]);
         let result = load_result(map(vec![mock("GET", "/new", "new")]), 0);
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert!(next.contains_key("GET:/new"));
         assert!(
@@ -1464,7 +1528,7 @@ mod tests {
         let current = map(vec![mock("GET", "/a", "a")]);
         let result = load_result(map(vec![mock("GET", "/a", "a"), mock("GET", "/b", "b")]), 1);
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert!(
             next.contains_key("GET:/b"),
@@ -1482,7 +1546,7 @@ mod tests {
         let current = map(vec![last_good, mock("GET", "/ok", "ok")]);
         let result = load_result(map(vec![mock("GET", "/ok", "ok-updated")]), 1);
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert_eq!(next["GET:/broken"][0].response["source"], "last-good");
         assert_eq!(next["GET:/ok"][0].response["source"], "ok-updated");
@@ -1529,7 +1593,7 @@ mod tests {
         let result = loader::load_mocks_map(dir.to_str().unwrap());
         let live = {
             let mut current = store.write().await;
-            *current = apply_reload(&current, result);
+            *current = apply_reload(&current, result, &HashMap::new());
             live_identities(&current)
         };
         prune_stale_state(&state.sequence_counters, &state.mock_hits, &live).await;
@@ -1832,7 +1896,7 @@ mod tests {
         let result = loader::load_mocks_map(dir.path().to_str().unwrap());
         assert_eq!(result.errors.len(), 1);
 
-        let next = apply_reload(&current.mocks, result);
+        let next = apply_reload(&current.mocks, result, &HashMap::new());
 
         assert!(next.contains_key("GET:/a"));
         assert!(
@@ -1869,7 +1933,7 @@ mod tests {
             files: 2,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert!(
             !next.contains_key("GET:/gone"),
@@ -1892,7 +1956,7 @@ mod tests {
             files: 2,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert!(next.contains_key("GET:/new"));
         assert!(!next.contains_key("GET:/old"));
@@ -1914,7 +1978,7 @@ mod tests {
             files: 0,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert!(next.contains_key("GET:/a"));
         assert!(!next.contains_key("GET:/b"));
@@ -1936,7 +2000,7 @@ mod tests {
             files: 3,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         let order: Vec<_> = next["GET:/x"]
             .iter()
@@ -1981,7 +2045,7 @@ mod tests {
             files: 1,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         let markers: Vec<_> = next["POST:/orders"]
             .iter()
@@ -2014,7 +2078,7 @@ mod tests {
             files: 1,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         let markers: Vec<_> = next["POST:/orders"]
             .iter()
@@ -2048,7 +2112,7 @@ mod tests {
             files: 1,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         let markers: Vec<_> = next["POST:/orders"]
             .iter()
@@ -2079,7 +2143,7 @@ mod tests {
             files: 1,
         };
 
-        let next = apply_reload(&current, result);
+        let next = apply_reload(&current, result, &HashMap::new());
 
         assert!(next.contains_key("GET:/orders"));
         assert!(next.contains_key("POST:/orders"));
@@ -2132,7 +2196,7 @@ mod tests {
             had_errors
         ));
         had_errors = has_errors;
-        store = apply_reload(&store, outcome.result);
+        store = apply_reload(&store, outcome.result, &HashMap::new());
         assert!(!store.contains_key("GET:/gone"));
 
         // The broken file is removed: nothing else changed.
@@ -2144,7 +2208,7 @@ mod tests {
             has_errors,
             had_errors
         ));
-        store = apply_reload(&store, outcome.result);
+        store = apply_reload(&store, outcome.result, &HashMap::new());
         assert!(store.contains_key("GET:/stay"));
         assert!(!store.contains_key("GET:/gone"));
     }
