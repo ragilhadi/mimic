@@ -514,6 +514,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     var matchLines = [];
     if(r.match_explanation) matchLines.push(escapeHtml(r.match_explanation));
     if(r.match_score !== undefined && r.match_score !== null) matchLines.push('score: '+r.match_score);
+    if(r.duration_ms !== undefined && r.duration_ms !== null) matchLines.push('duration: '+r.duration_ms+' ms');
     if(r.path_params && Object.keys(r.path_params).length){
       matchLines.push('path params: '+Object.keys(r.path_params).sort().map(function(k){
         return escapeHtml(k)+'='+escapeHtml(r.path_params[k]);

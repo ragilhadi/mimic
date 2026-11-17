@@ -604,6 +604,13 @@ pub struct RequestRecord {
     /// was rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_explanation: Option<String>,
+
+    /// Wall-clock milliseconds from the request being received to the
+    /// response being handed back — a matched mock's `delay_ms` included.
+    /// `None` only for entries deserialized from a log written by a Mimic
+    /// older than #149.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// The in-memory request log. A deque, because the bounded log drops its oldest

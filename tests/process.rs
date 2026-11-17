@@ -265,3 +265,95 @@ fn a_deleted_mock_stops_being_served_even_after_a_broken_sibling_goes_away() {
     assert_eq!(server.status("/gone"), 404);
     assert_eq!(server.status("/stay"), 200);
 }
+
+/// Verification API (#149) against the real binary: write a mock, force a
+/// reload instead of sleeping out the poll, hit it, count it, reset it.
+#[test]
+fn the_verification_api_round_trip_works_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("slow.json"),
+        r#"{"method":"GET","path":"/verified","status":200,"response":{"ok":true}}"#,
+    )
+    .unwrap();
+
+    let mut cmd = mimic();
+    cmd.env("MIMIC_MOCKS_DIR", dir.path());
+    let server = Server::start(cmd, free_port());
+
+    // Full-response HTTP helper (status line + headers + body).
+    let request = |port: u16, raw: &str| -> (u16, String) {
+        use std::io::Write;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "{}\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            raw
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        (status, response)
+    };
+
+    // 1. Force a reload after writing a NEW mock file no reload cycle has
+    //    seen — the endpoint must install it without waiting the 2s tick.
+    std::fs::write(
+        dir.path().join("late.json"),
+        r#"{"method":"GET","path":"/late","status":201,"response":{"late":true}}"#,
+    )
+    .unwrap();
+    let (status, _) = request(server.port, "POST /admin/reload HTTP/1.1");
+    assert_eq!(status, 200);
+    assert_eq!(
+        server.status("/late"),
+        201,
+        "forced reload must install the new mock immediately"
+    );
+
+    // 2. Hit the mock, then count.
+    server.status("/verified");
+    let (status, _) = request(
+        server.port,
+        "GET /admin/requests/count?path=/verified&method=GET&expect=1 HTTP/1.1",
+    );
+    assert_eq!(status, 200, "count?expect=1 after exactly one hit must 200");
+
+    let (status, body) = request(
+        server.port,
+        "GET /admin/requests/count?path=/verified&method=GET&expect=5 HTTP/1.1",
+    );
+    assert_eq!(status, 417, "a wrong expectation fails with 417: {body}");
+    assert!(body.contains("\"count\":1"));
+
+    // 3. duration_ms is on every recorded request.
+    let (_, requests_json) = request(server.port, "GET /admin/requests HTTP/1.1");
+    assert!(
+        requests_json.contains("\"duration_ms\":"),
+        "request log must carry duration_ms: {requests_json}"
+    );
+
+    // 4. HAR export parses as the browser would (status + version).
+    let (status, har) = request(server.port, "GET /admin/requests.har HTTP/1.1");
+    assert_eq!(status, 200);
+    assert!(
+        har.contains("application/har+json"),
+        "HAR content type: {har}"
+    );
+    assert!(har.contains("\"version\":\"1.2\""), "HAR body: {har}");
+
+    // 5. Reset wipes the log; the next count is zero.
+    let (status, _) = request(server.port, "POST /admin/reset HTTP/1.1");
+    assert_eq!(status, 200);
+    let (status, body) = request(server.port, "GET /admin/requests/count HTTP/1.1");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"count\":0"), "post-reset count: {body}");
+}
