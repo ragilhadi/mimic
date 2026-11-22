@@ -2476,6 +2476,22 @@ pub struct CreateMockRequest {
 }
 
 impl CreateMockRequest {
+    /// Parse the request body as a [`CreateMockRequest`], in two steps:
+    /// `serde_json::from_slice` into an untyped `Value` with a root-object
+    /// check, then `from_value` into the struct. Typed deserialization of
+    /// arbitrary bytes is what CodeQL's unsafe-deserialization rule wants
+    /// bounded; the intermediate `Value` gives a cheap structural gate
+    /// (must be a JSON object) before any struct is built from the input.
+    fn parse(body: &Bytes) -> Result<Self, serde_json::Error> {
+        let raw: serde_json::Value = serde_json::from_slice(body)?;
+        match raw {
+            serde_json::Value::Object(_) => serde_json::from_value(raw),
+            _ => Err(serde::de::Error::custom(
+                "the body must be a JSON object shaped like a MockConfig",
+            )),
+        }
+    }
+
     /// The mock as it should be persisted to disk: everything but the
     /// runtime-only `persist` flag, re-serialized from the original body's
     /// fields (`self.mock` moved out is disallowed by the borrow in play, so
@@ -2529,7 +2545,7 @@ pub async fn create_runtime_mock(State(state): State<AppState>, body: Bytes) -> 
             .into_response();
     }
 
-    let request: CreateMockRequest = match serde_json::from_slice(&body) {
+    let request: CreateMockRequest = match CreateMockRequest::parse(&body) {
         Ok(parsed) => parsed,
         Err(e) => {
             return (
@@ -2748,10 +2764,23 @@ pub async fn delete_runtime_mock(
             }
         }
     }
-    let _ = std::fs::remove_file(
-        crate::loader::runtime_dir_path(std::path::Path::new(&state.mocks_dir))
-            .join(format!("{}.json", id)),
-    );
+    // The persisted file, if any, is deleted too — but the path is never
+    // addressed by the request's id alone: `runtime_dir_path` + `{id}.json`
+    // is canonicalized, and only a result that still lives *inside* the
+    // runtime dir is removed. A canonical check is the airtight form of the
+    // shape gate above (and what CodeQL's path-injection asks for): even a
+    // hypothetical id that slips past parsing cannot name a path that
+    // escapes `mocks/_runtime`.
+    {
+        let runtime_dir = crate::loader::runtime_dir_path(std::path::Path::new(&state.mocks_dir));
+        let candidate = runtime_dir.join(format!("{}.json", id));
+        match std::fs::canonicalize(&candidate) {
+            Ok(resolved) if resolved.starts_with(&runtime_dir) && resolved != runtime_dir => {
+                let _ = std::fs::remove_file(resolved);
+            }
+            _ => {} // nothing persisted under that id; nothing to remove
+        }
+    }
 
     info!(
         "Runtime mock deleted: {} {} (id {})",
@@ -2798,7 +2827,7 @@ pub async fn update_runtime_mock(
         Err(response) => return response,
     };
 
-    let request: CreateMockRequest = match serde_json::from_slice(&body) {
+    let request: CreateMockRequest = match CreateMockRequest::parse(&body) {
         Ok(parsed) => parsed,
         Err(e) => {
             return (
