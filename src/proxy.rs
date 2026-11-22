@@ -758,6 +758,7 @@ fn build_recorded_mock(
         response_headers: recordable_response_headers(response_headers),
         delay_ms: None,
         sequence: None,
+        collection: None,
         tags: Vec::new(),
         disabled: None,
         source: None,

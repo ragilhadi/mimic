@@ -709,6 +709,7 @@ pub fn generate_mocks(
                         response_headers: None,
                         source: None,
                         sequence: None,
+                        collection: None,
                         tags: Vec::new(),
                         disabled: None,
                         response_file: None,
