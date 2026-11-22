@@ -2634,6 +2634,21 @@ pub async fn create_runtime_mock(State(state): State<AppState>, body: Bytes) -> 
         .into_response()
 }
 
+/// The shape a runtime id minted by [`mint_runtime_id`] has: `r-<digits>`.
+///
+/// `DELETE /admin/mocks/{id}` builds a filesystem path out of the id, so an
+/// id that could carry `..`, `/`, or `\` must never reach `remove_file` —
+/// a traversal in the id would delete files outside the mocks root.
+/// Validating the *shape* (rather than sanitizing the value) means only ids
+/// this server actually minted pass; anything else is a plain 404, the same
+/// as an unknown-but-well-formed id, and never touches the filesystem.
+pub fn is_runtime_id_shaped(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("r-") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// The runtime mock an `id` names, plus the index it occupies in its mock
 /// bucket — the tuple a delete needs to remove it from both layers without
 /// disturbing the file mocks around it.
@@ -2700,6 +2715,18 @@ pub async fn delete_runtime_mock(
     if let Err(response) = runtime_writes_allowed(&state) {
         return response;
     }
+    // The id flows into a filesystem path below (`remove_file`); anything
+    // this server didn't mint is rejected without touching the disk.
+    if !is_runtime_id_shaped(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "runtime mock not found",
+                "id": id,
+            })),
+        )
+            .into_response();
+    }
 
     let (mock, key, index) = match locate_runtime_mock(&state, &id).await {
         Ok(found) => found,
@@ -2752,6 +2779,18 @@ pub async fn update_runtime_mock(
 ) -> Response {
     if let Err(response) = runtime_writes_allowed(&state) {
         return response;
+    }
+    // Same contract as DELETE: only minted-shaped ids take part in the
+    // runtime registry (its persisted form would be `{id}.json` either way).
+    if !is_runtime_id_shaped(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "runtime mock not found",
+                "id": id,
+            })),
+        )
+            .into_response();
     }
 
     let (old, old_key, old_index) = match locate_runtime_mock(&state, &id).await {
@@ -2857,6 +2896,17 @@ pub async fn enable_runtime_mock(
 async fn toggle_runtime_mock_inner(state: AppState, id: &str, disabled: bool) -> Response {
     if let Err(response) = runtime_writes_allowed(&state) {
         return response;
+    }
+    // Same contract as DELETE/PUT (see `is_runtime_id_shaped`).
+    if !is_runtime_id_shaped(id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "runtime mock not found",
+                "id": id,
+            })),
+        )
+            .into_response();
     }
 
     let (mut mock, key, index) = match locate_runtime_mock(&state, id).await {

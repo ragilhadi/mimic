@@ -124,6 +124,47 @@ async fn test_delete_unknown_id_is_404() {
 }
 
 #[tokio::test]
+async fn test_unshaped_ids_are_rejected_untouched() {
+    // A minted id is always `r-<digits>`; anything else must never flow into
+    // a filesystem path (`..` segments, non-minted shapes), for DELETE, PUT
+    // and the toggles alike. The response differs by where the request dies:
+    // a single-segment id reaches the handler and gets the specific
+    // "runtime mock not found"; a path with separators never matches the
+    // `{id}` route at all and falls through to the mock pipeline's 404.
+    // Both are 404s and neither touches the filesystem.
+    for (method, uri) in [
+        ("DELETE", "/admin/mocks/.."),
+        ("DELETE", "/admin/mocks/x-1"),
+        ("PUT", "/admin/mocks/x-1"),
+        ("POST", "/admin/mocks/x-1/enable"),
+    ] {
+        let state = runtime_state(vec![]);
+        let (status, json) = call_method(
+            state,
+            method,
+            uri,
+            Some(r#"{"method":"GET","path":"/x","status":200}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.ends_with("mock not found")),
+            "{method} {uri}: {json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_well_shaped_but_unknown_id_also_404s() {
+    // Minted-shaped ids that simply don't exist behave like any other miss.
+    let state = runtime_state(vec![]);
+    let (status, _) = call_method(state, "DELETE", "/admin/mocks/r-42", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn test_put_mocks_updates_same_identity_and_can_move_paths() {
     let state = runtime_state(vec![]);
     let (_, created) = post_json(
