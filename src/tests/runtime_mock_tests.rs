@@ -276,7 +276,10 @@ async fn test_readonly_locks_the_write_routes() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_serving(vec![])
         .with_mocks_dir(dir.path().to_str().unwrap().to_string())
-        .with_admin_readonly(true);
+        .with_reserved(handler::ReservedRoutes {
+            admin_readonly: true,
+            ..Default::default()
+        });
 
     for (method, uri) in [
         ("POST", "/admin/mocks"),
@@ -291,8 +294,8 @@ async fn test_readonly_locks_the_write_routes() {
             Some(r#"{"method":"GET","path":"/x","status":200}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {json}");
-        assert_eq!(json["error"], "admin API is read-only");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {json}");
+        assert_eq!(json["error"], "mock not found");
     }
 }
 
@@ -363,4 +366,96 @@ async fn test_admin_route_matching_accepts_id_shaped_paths() {
         None
     );
     assert_eq!(routes.reservation_for("GET", "/admin/mocks/"), None);
+}
+
+#[tokio::test]
+async fn persisted_mock_updates_once_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let state = state_serving(vec![]).with_mocks_dir(root.to_string());
+    let (status, created) = post_json(
+        state.clone(),
+        "/admin/mocks?persist=true",
+        r#"{"method":"GET","path":"/old","status":200}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["persisted"], true);
+    let id = created["id"].as_str().unwrap();
+    let endpoint = format!("/admin/mocks/{id}");
+    assert_eq!(
+        call_method(
+            state.clone(),
+            "PUT",
+            &endpoint,
+            Some(r#"{"method":"GET","path":"/new","status":202}"#)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_method(state.clone(), "POST", &format!("{endpoint}/disable"), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_method(state.clone(), "POST", "/admin/reload", None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, list) = call_method(state.clone(), "GET", "/admin/mocks", None).await;
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["runtime_writes_enabled"], true);
+    assert_eq!(list["mocks"][0]["id"], id);
+    assert_eq!(list["mocks"][0]["disabled"], true);
+    assert_eq!(
+        call_method(state.clone(), "GET", "/new", None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call_method(state, "POST", &format!("{endpoint}/enable"), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let restarted =
+        handler::AppState::new(loader::load_mocks(root)).with_mocks_dir(root.to_string());
+    assert_eq!(
+        call_method(restarted.clone(), "GET", "/new", None).await.0,
+        StatusCode::ACCEPTED
+    );
+    let (_, next) = post_json(
+        restarted,
+        "/admin/mocks",
+        r#"{"method":"GET","path":"/other","status":200}"#,
+    )
+    .await;
+    assert_ne!(next["id"], id);
+}
+
+#[tokio::test]
+async fn runtime_write_routes_require_the_admin_token() {
+    let state = runtime_state(vec![]).with_admin_token(Some("expected".into()));
+    let app = create_router(state);
+    for (method, uri) in [
+        ("POST", "/admin/mocks"),
+        ("PUT", "/admin/mocks/r-1"),
+        ("DELETE", "/admin/mocks/r-1"),
+        ("POST", "/admin/mocks/r-1/disable"),
+        ("POST", "/admin/mocks/r-1/enable"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 }

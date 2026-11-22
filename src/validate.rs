@@ -314,7 +314,7 @@ fn check_reserved_route(
 /// A status the server cannot put on the wire — on the mock, and on every
 /// sequence step, since a step is the response when its turn comes.
 fn check_status(mock: &MockConfig, file: &str, findings: &mut Vec<Finding>) {
-    if !is_valid_status(mock.status) {
+    if mock.collection.is_none() && !is_valid_status(mock.status) {
         findings.push(Finding {
             file: file.to_string(),
             severity: Severity::Error,
@@ -341,6 +341,20 @@ fn check_status(mock: &MockConfig, file: &str, findings: &mut Vec<Finding>) {
                 ),
             });
         }
+    }
+}
+
+pub(crate) fn validate_runtime_mock(mock: &MockConfig, source: &str) -> Result<(), String> {
+    let mut findings = Vec::new();
+    check_status(mock, source, &mut findings);
+    check_path(mock, source, &mut findings);
+    check_templates(mock, source, &mut findings);
+    match findings
+        .into_iter()
+        .find(|finding| finding.severity == Severity::Error)
+    {
+        Some(finding) => Err(finding.message),
+        None => Ok(()),
     }
 }
 

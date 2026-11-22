@@ -184,87 +184,96 @@ pub const RUNTIME_DIR: &str = "_runtime";
 /// Fixtures (`response_file`) resolve against `mocks_root` (`path.parent()`
 /// for file mocks) and stay inside it, exactly the file-mock rule.
 pub fn prepare_runtime_mock(
-    mut mock: MockConfig,
+    mock: MockConfig,
     runtime_id: &str,
     mocks_root: &Path,
 ) -> Result<MockConfig, String> {
-    let label = format!("{}@{}", RUNTIME_SOURCE_PREFIX, runtime_id);
-
-    if mock.method.is_empty() {
-        return Err(format!("Empty method in {}", label));
-    }
-    if mock.path.is_empty() {
-        return Err(format!("Empty path in {}", label));
-    }
-
-    // Loader-owned identity: a runtime mock's source is minted here, never
-    // taken from the JSON body (the same misattribution guard file mocks get).
-    mock.source = Some(label.clone());
-    mock.source_index = None;
-    mock.response_bytes = None;
-
-    if let Some(collection) = &mock.collection {
-        if !mock.response.is_null() || mock.response_file.is_some() {
-            return Err(format!(
-                "{} declares a collection and a body; the collection defines the behaviour",
-                label
-            ));
-        }
-        if !collection.path.starts_with('/') || collection.name.is_empty() {
-            return Err(format!(
-                "{} collection needs a `/`-rooted path and a non-empty name",
-                label
-            ));
-        }
-    }
-
-    if let Some(file) = mock.response_file.clone() {
-        reject_both_bodies(&mock.response, &file, &label)?;
-        let mut cache = HashMap::new();
-        let (resolved, bytes) = read_response_file(
-            &file,
-            mocks_root,
-            &label,
-            mocks_root,
-            max_response_file_size(),
-            &mut cache,
-        )?;
-        mock.response_bytes = Some(bytes);
-        // Silence the unused fixture path: runtime mocks register in-place,
-        // no walk dedup applies.
-        let _ = resolved;
-    }
-
-    if !crate::types::is_valid_status(mock.status) {
-        // Same treatment as file mocks: warned at registration, tolerated —
-        // `is_valid_status` decides serving, not an error.
-    }
-
-    for step in mock.sequence.iter_mut().flatten() {
-        step.response_bytes = None;
-        if !crate::types::is_valid_status(step.status) {
-            // Warned by the same serving rule; nothing to fix here.
-        }
-        // A runtime mock may not claim a `response_file` on a sequence step:
-        // the fixture path would resolve against a file that doesn't exist.
-        // `reject_both_bodies` covers `response`+`response_file`; a bare
-        // step `response_file` would silently 200-empty on serve.
-        if step.response_file.is_some() {
-            return Err(format!(
-                "{} (sequence step): `response_file` is only supported in file-backed mocks; \
-                 use `response` instead",
-                label
-            ));
-        }
-    }
-
-    Ok(mock)
+    let root = mocks_root
+        .canonicalize()
+        .unwrap_or_else(|_| mocks_root.to_path_buf());
+    let source = format!("{RUNTIME_SOURCE_PREFIX}@{runtime_id}");
+    let mut loaded = load_mock_element(
+        mock,
+        &root.join(&source),
+        None,
+        &root,
+        max_response_file_size(),
+        &mut HashMap::new(),
+    )?
+    .mock;
+    crate::validate::validate_runtime_mock(&loaded, &source)?;
+    loaded.source = Some(source);
+    Ok(loaded)
 }
 
 /// The directory a runtime mock's persisted file lands in, inside the mocks
-/// root — returned pre-canonicalized for direct use as `mocks_root.parent()`.
+/// root.
 pub(crate) fn runtime_dir_path(mocks_root: &Path) -> PathBuf {
     mocks_root.join(RUNTIME_DIR)
+}
+
+fn validate_collection(mock: &MockConfig, label: &str) -> Result<(), String> {
+    if let Some(collection) = &mock.collection {
+        if !mock.response.is_null() {
+            return Err(format!(
+                "{} declares a collection and a `response`; the collection defines the behaviour",
+                label
+            ));
+        }
+        if mock.response_file.is_some() {
+            return Err(format!(
+                "{} declares a collection and a `response_file`; the collection defines the behaviour",
+                label
+            ));
+        }
+        if mock.sequence.is_some() {
+            return Err(format!(
+                "{} declares a collection and a `sequence`; the collection defines the behaviour",
+                label
+            ));
+        }
+        if mock.body.is_some() || mock.query_params.is_some() || mock.headers.is_some() {
+            return Err(format!(
+                "{} declares a collection and matchers; matching does not apply to collections",
+                label
+            ));
+        }
+        if !collection.path.starts_with('/') {
+            return Err(format!(
+                "{} collection path `{}` must start with `/`",
+                label, collection.path
+            ));
+        }
+        if collection.name.is_empty() {
+            return Err(format!("{} collection has an empty `name`", label));
+        }
+        let operations = &collection.operations;
+        for (name, operation, accepts_body) in [
+            ("list", &operations.list, false),
+            ("get", &operations.get, false),
+            ("create", &operations.create, true),
+            ("replace", &operations.replace, true),
+            ("patch", &operations.patch, true),
+            ("delete", &operations.delete, false),
+        ] {
+            let Some(operation) = operation else { continue };
+            if operation
+                .status
+                .is_some_and(|status| !(200..300).contains(&status))
+            {
+                return Err(format!(
+                    "{label} collection operation `{name}` needs a 2xx status"
+                ));
+            }
+            if !accepts_body && !operation.required_fields.is_empty() {
+                return Err(format!(
+                    "{label} collection operation `{name}` does not accept required fields"
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// One mock as it came off disk: the config, plus the fixture files it claims.
@@ -1047,44 +1056,7 @@ fn load_mock_element(
         return Err(format!("Empty path in {}", label));
     }
 
-    // A collection mock ignores the mock-shaped fields — declaring them
-    // alongside is almost certainly a mistake, and "silently ignored" is
-    // exactly the failure mode this loader exists to surface.
-    if let Some(collection) = &mock.collection {
-        if !mock.response.is_null() {
-            return Err(format!(
-                "{} declares a collection and a `response`; the collection defines the behaviour",
-                label
-            ));
-        }
-        if mock.response_file.is_some() {
-            return Err(format!(
-                "{} declares a collection and a `response_file`; the collection defines the behaviour",
-                label
-            ));
-        }
-        if mock.sequence.is_some() {
-            return Err(format!(
-                "{} declares a collection and a `sequence`; the collection defines the behaviour",
-                label
-            ));
-        }
-        if mock.body.is_some() || mock.query_params.is_some() || mock.headers.is_some() {
-            return Err(format!(
-                "{} declares a collection and matchers; matching does not apply to collections",
-                label
-            ));
-        }
-        if !collection.path.starts_with('/') {
-            return Err(format!(
-                "{} collection path `{}` must start with `/`",
-                label, collection.path
-            ));
-        }
-        if collection.name.is_empty() {
-            return Err(format!("{} collection has an empty `name`", label));
-        }
-    }
+    validate_collection(&mock, &label)?;
 
     // Response bodies read from disk. Also loader-owned: whatever a mock file
     // says about `response_bytes` is dropped by serde before we get here.
@@ -1099,7 +1071,7 @@ fn load_mock_element(
         fixtures.push(resolved);
     }
 
-    if !crate::types::is_valid_status(mock.status) {
+    if mock.collection.is_none() && !crate::types::is_valid_status(mock.status) {
         warn!(
             "{}: status {} is outside 100-599 and will be served as 200 OK",
             label, mock.status

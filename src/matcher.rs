@@ -2028,7 +2028,10 @@ fn scan_candidates_at(
 
     let base_key = crate::types::create_mock_key(method, path);
     if let Some(mock_list) = mocks.get(&base_key) {
-        for mock in mock_list.iter().filter(|m| m.is_active(active_tags)) {
+        for mock in mock_list
+            .iter()
+            .filter(|m| m.collection.is_none() && m.is_active(active_tags))
+        {
             scan.any_candidate = true;
             if probe(mock) {
                 scan.probe_hit = true;
@@ -2060,7 +2063,10 @@ fn scan_candidates_at(
             continue;
         }
 
-        for mock in mock_list.iter().filter(|m| m.is_active(active_tags)) {
+        for mock in mock_list
+            .iter()
+            .filter(|m| m.collection.is_none() && m.is_active(active_tags))
+        {
             scan.any_candidate = true;
             if probe(mock) {
                 scan.probe_hit = true;
@@ -2180,6 +2186,9 @@ fn find_matching_mock_at(
             // Note the index comes from the unfiltered list: it keys sequence
             // counters and hit counts, so it must not shift when a scenario
             // hides a sibling mock registered under the same path.
+            if mock.collection.is_some() {
+                continue;
+            }
             if !mock.is_active(active_tags) {
                 continue;
             }
@@ -2224,6 +2233,9 @@ fn find_matching_mock_at(
             };
 
             for (index, mock) in mock_list.iter().enumerate() {
+                if mock.collection.is_some() {
+                    continue;
+                }
                 if !mock.is_active(active_tags) {
                     continue;
                 }
@@ -2448,6 +2460,9 @@ fn accumulate_candidates_for(
 ) {
     let mut collect = |key: &str, mock_list: &[MockConfig]| {
         for (index, mock) in mock_list.iter().enumerate() {
+            if mock.collection.is_some() {
+                continue;
+            }
             if !mock.is_active(active_tags) {
                 // Would this mock have matched if its tags were active? Only
                 // then is it worth mentioning; a tagged mock whose matchers

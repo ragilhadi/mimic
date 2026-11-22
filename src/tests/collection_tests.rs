@@ -305,3 +305,45 @@ async fn test_loader_rejects_collection_with_mock_fields() {
         result.errors[0].message
     );
 }
+
+#[tokio::test]
+async fn collection_operation_overrides_validate_and_shape_success() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("users.json"),
+        r#"{
+        "method":"GET", "path":"/users",
+        "collection":{"path":"/users","name":"users","operations":{
+            "create":{"required_fields":["name"],"status":202,"response":{"accepted":true}},
+            "delete":{"status":200,"response":{"deleted":true}}
+        }}
+    }"#,
+    )
+    .unwrap();
+    let state = handler::AppState::new(loader::load_mocks(dir.path().to_str().unwrap()));
+    let (status, error, _) = http(&state, "POST", "/users", Some("{}")).await;
+    assert_eq!(status, 400);
+    assert_eq!(error["detail"], "missing required field: name");
+    let (status, body, location) = http(
+        &state,
+        "POST",
+        "/users",
+        Some(r#"{"id":"a/b","name":"Ada"}"#),
+    )
+    .await;
+    assert_eq!(status, 202);
+    assert_eq!(body, serde_json::json!({"accepted":true}));
+    let location = location.unwrap();
+    assert_eq!(location, "/users/a%2Fb");
+    let (status, stored, _) = http(&state, "GET", &location, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(stored["name"], "Ada");
+    let (status, body, _) = http(&state, "DELETE", &location, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::json!({"deleted":true}));
+    for method in ["GET", "PUT", "PATCH", "DELETE"] {
+        let (status, body, _) = http(&state, method, &location, None).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["collection"], "users");
+    }
+}
