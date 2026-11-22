@@ -1,0 +1,22 @@
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      # CreateMockRequest::parse deserializes the admin API body in two
+      # steps: `serde_json::from_slice` into an untyped `serde_json::Value`
+      # (memory-safe, no type resolution, no code execution), gated on the
+      # root being a JSON object, then `from_value` into a plain data
+      # struct. Input is size-capped upstream (MIMIC_MAX_BODY_SIZE → 413).
+      # The `rust/unsafe-deserialization` rule's threat model — gadget
+      # execution via polymorphic deserialization — does not apply to a
+      # serde_json data binding, and the root-object gate is the structural
+      # validation the rule asks for.
+      # NOTE: CodeQL does NOT honor inline Rust comments in YAML; the
+      # justification lives here instead.
+      - [
+          "<mimic::handler::CreateMockRequest>::parse",
+          "ReturnValue",
+          "unsafe-deserialization",
+          "manual",
+        ]
