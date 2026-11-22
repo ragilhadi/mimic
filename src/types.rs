@@ -269,6 +269,14 @@ pub struct MockConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 
+    /// Runtime toggle (`POST /admin/mocks/{id}/disable|enable`, #153): a
+    /// disabled mock stays registered and listed but is never matched, the
+    /// same effect a scenario filter that hides it would have. Off by
+    /// default; file mocks never carry one unless written by hand (the same
+    /// freedom `tags` has).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+
     /// Path of the file this mock was loaded from, filled in by the loader so
     /// `/admin/mocks` can name the file to edit. `None` for mocks built
     /// in-process (tests, generated fixtures) rather than read from disk; a
@@ -407,6 +415,11 @@ impl MockConfig {
     /// - a tagged mock is active only when the filter is off, or when one of
     ///   its tags is in the active set (exact, case-sensitive match).
     pub fn is_active(&self, active: Option<&HashSet<String>>) -> bool {
+        // A runtime-disabled mock (#153) is invisible to matching exactly as
+        // a tag-filtered one is: loaded, listed, never served.
+        if self.disabled.unwrap_or(false) {
+            return false;
+        }
         match active {
             None => true,
             Some(active_tags) => {
@@ -769,6 +782,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -852,6 +866,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -884,6 +899,7 @@ mod tests {
                 response_headers: None,
                 source: None,
                 source_index: None,
+                disabled: None,
                 sequence: None,
                 tags: Vec::new(),
                 response_file: None,
@@ -966,6 +982,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1059,6 +1076,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1081,6 +1099,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
@@ -1392,6 +1411,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             response_file: None,

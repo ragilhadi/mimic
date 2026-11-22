@@ -61,7 +61,10 @@ const ADMIN_ROUTES: &[(&str, &[&str])] = &[
     ("/requests", &["GET", "DELETE"]),
     ("/requests/count", &["GET"]),
     ("/requests.har", &["GET"]),
-    ("/mocks", &["GET"]),
+    ("/mocks", &["GET", "POST"]),
+    ("/mocks/{id}", &["PUT", "DELETE"]),
+    ("/mocks/{id}/disable", &["POST"]),
+    ("/mocks/{id}/enable", &["POST"]),
     ("/reset", &["POST"]),
     ("/reload", &["POST"]),
     ("/sequences", &["GET"]),
@@ -192,7 +195,22 @@ impl ReservedRoutes {
         let prefix = self.admin_prefix.as_deref()?;
         let suffix = path.strip_prefix(prefix)?;
         ADMIN_ROUTES.iter().find_map(|(route, methods)| {
-            (*route == suffix
+            let matches_route = if route.contains("{id}") {
+                // Runtime mock management routes (#153) carry an id path
+                // segment: `/admin/mocks/r-7`, `/admin/mocks/r-7/disable`.
+                // Match shape, not value — the id the mock registry accepts
+                // or rejects is the registry's answer, not the reservation's.
+                let (head, tail) = route.split_once("{id}")?;
+                let after = suffix.strip_prefix(head)?;
+                let id_value = match tail {
+                    "" => after,
+                    rest => after.strip_suffix(rest)?,
+                };
+                !id_value.is_empty() && !id_value.contains('/')
+            } else {
+                *route == suffix
+            };
+            (matches_route
                 && methods
                     .iter()
                     .any(|allowed| method.eq_ignore_ascii_case(allowed)))
@@ -581,6 +599,16 @@ pub struct AppState {
     /// (`POST /admin/reload`); `None` when the server isn't running the
     /// reloader (unit tests, `run_server` before the task spawns).
     pub reload_trigger: Option<Arc<tokio::sync::Notify>>,
+    /// Runtime mocks registered via `POST /admin/mocks` (#153), keyed by
+    /// their stable runtime id. Merged under the same lock `apply_reload`
+    /// writes through: hot reload replaces the file-backed layer only.
+    pub runtime_mocks: Arc<tokio::sync::RwLock<HashMap<String, MockConfig>>>,
+    /// Monotonic counter minting runtime ids (`r-1`, `r-2`, …).
+    pub runtime_counter: Arc<AtomicU64>,
+    /// Whether the runtime mock write routes are locked off
+    /// (`MIMIC_ADMIN_READONLY=true`) so a deployment can serve the read-only
+    /// dashboard without exposing mutation.
+    pub admin_readonly: bool,
 }
 
 impl AppState {
@@ -611,6 +639,9 @@ impl AppState {
             record_state: Arc::new(crate::proxy::RecordState::new()),
             mocks_dir: "mocks".to_string(),
             reload_trigger: None,
+            runtime_mocks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            runtime_counter: Arc::new(AtomicU64::new(0)),
+            admin_readonly: false,
         }
     }
 
@@ -620,6 +651,13 @@ impl AppState {
     /// `POST /admin/reload` run a synchronous cycle instead.
     pub fn with_reload_trigger(mut self, trigger: Arc<tokio::sync::Notify>) -> Self {
         self.reload_trigger = Some(trigger);
+        self
+    }
+
+    /// Set `MIMIC_ADMIN_READONLY`'s verdict on the runtime mock write routes,
+    /// as `main` does once it has read the environment.
+    pub fn with_admin_readonly(mut self, readonly: bool) -> Self {
+        self.admin_readonly = readonly;
         self
     }
 
@@ -2197,8 +2235,12 @@ pub async fn force_reload(State(state): State<AppState>) -> Response {
         });
         let had_errors = !outcome.errors.is_empty();
         {
+            let runtime_mocks = {
+                let runtime = state.runtime_mocks.read().await;
+                runtime.clone()
+            };
             let mut store = state.mocks.write().await;
-            *store = crate::apply_reload(&store, outcome);
+            *store = crate::apply_reload(&store, outcome, &runtime_mocks);
         }
         let _ = had_errors;
     }
@@ -2388,6 +2430,546 @@ pub async fn export_har(
         response.headers_mut().insert(CONTENT_TYPE, value);
     }
     response
+}
+
+// ============================================================================
+// Runtime mock management (#153) — the admin CRUD surface
+// ============================================================================
+
+/// Whether `MIMIC_ADMIN_READONLY` locks the runtime mock write routes off.
+pub const ADMIN_READONLY_ENV: &str = "MIMIC_ADMIN_READONLY";
+
+/// Whether the runtime mock write routes are allowed for this request.
+///
+/// `MIMIC_DISABLE_ADMIN` removes the routes at the router, `MIMIC_ADMIN_TOKEN`
+/// guards them the same as every other data endpoint, and
+/// `MIMIC_ADMIN_READONLY=true` answers `403` — the deployment wants the
+/// read-only dashboard without exposing mutation.
+// The Err type is a full axum Response by design: the guard produces the
+// caller's error response in one place, exactly like the other admin gates.
+#[allow(clippy::result_large_err)]
+fn runtime_writes_allowed(state: &AppState) -> Result<(), Response> {
+    if state.admin_readonly {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "admin API is read-only",
+                "detail": format!("set {}=false (or unset) to allow runtime mock management", ADMIN_READONLY_ENV),
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// The body of `POST /admin/mocks` — a `MockConfig` with an optional persist
+/// flag.
+#[derive(Deserialize)]
+pub struct CreateMockRequest {
+    #[serde(flatten)]
+    pub mock: MockConfig,
+    /// Write the mock to `mocks/_runtime/<id>.json` so it survives a restart
+    /// as an ordinary file mock. Off by default: a runtime mock lives in
+    /// memory until it is deleted or the process ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<bool>,
+}
+
+impl CreateMockRequest {
+    /// Parse the request body as a [`CreateMockRequest`], in two steps:
+    /// `serde_json::from_slice` into an untyped `Value` with a root-object
+    /// check, then `from_value` into the struct. Typed deserialization of
+    /// arbitrary bytes is what CodeQL's unsafe-deserialization rule wants
+    /// bounded; the intermediate `Value` gives a cheap structural gate
+    /// (must be a JSON object) before any struct is built from the input.
+    fn parse(body: &Bytes) -> Result<Self, serde_json::Error> {
+        let raw: serde_json::Value = serde_json::from_slice(body)?;
+        match raw {
+            serde_json::Value::Object(_) => serde_json::from_value(raw),
+            _ => Err(serde::de::Error::custom(
+                "the body must be a JSON object shaped like a MockConfig",
+            )),
+        }
+    }
+
+    /// The mock as it should be persisted to disk: everything but the
+    /// runtime-only `persist` flag, re-serialized from the original body's
+    /// fields (`self.mock` moved out is disallowed by the borrow in play, so
+    /// `persist` is dropped via a cloned copy).
+    fn persist_flagless_mock(&self) -> MockConfig {
+        let mut mock = self.mock.clone();
+        mock.disabled = None;
+        // The runtime-only flag must not land in the file; a `persist: true`
+        // field would be an unknown-key parse error on reload.
+        mock
+    }
+}
+
+/// Whether `MIMIC_ADMIN_READONLY` is set truthy — the runtime mock write
+/// routes answer `403` and the dashboard stays read-only.
+pub fn configured_admin_readonly() -> bool {
+    std::env::var(ADMIN_READONLY_ENV)
+        .map(|v| is_truthy(&v))
+        .unwrap_or(false)
+}
+
+/// Mint a stable runtime id: `r-<n>`, unique for this process. Ids are never
+/// reused even after a delete, so a late `PUT /admin/mocks/r-3` can't
+/// overwrite a *different* mock that now owns the id sequence position.
+fn mint_runtime_id(counter: &AtomicU64) -> String {
+    format!("r-{}", counter.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+/// `POST /admin/mocks` — register a mock immediately, without touching the
+/// filesystem. Effective on the very next request.
+///
+/// The mock is validated through the same loader rules file mocks get
+/// ([`crate::loader::prepare_runtime_mock`]) — an invalid mock is rejected
+/// `400` with the same message shape `mimic validate` reports — and merged
+/// into the live mock map under its runtime id. `?persist=true` (or a
+/// `persist` body flag) also writes `mocks/_runtime/<id>.json`, so the mock
+/// reloads as an ordinary file mock after a restart.
+pub async fn create_runtime_mock(State(state): State<AppState>, body: Bytes) -> Response {
+    if let Err(response) = runtime_writes_allowed(&state) {
+        return response;
+    }
+
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid mock request",
+                "detail": "the body is empty; POST a MockConfig JSON document",
+            })),
+        )
+            .into_response();
+    }
+
+    let request: CreateMockRequest = match CreateMockRequest::parse(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid mock request",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let id = mint_runtime_id(&state.runtime_counter);
+    // Serialize the persisted form first: the file records the mock as
+    // submitted (without the runtime-only `persist` flag), which on reload
+    // restarts life as an ordinary file mock with loader-stamped identity —
+    // a runtime mock's pid-scoped id must not outlive the process.
+    let persist_payload = if request.persist.unwrap_or(false) {
+        match serde_json::to_vec_pretty(&request.persist_flagless_mock()) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "failed to serialize runtime mock for persistence",
+                        "detail": e.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let prepared = match crate::loader::prepare_runtime_mock(
+        request.mock,
+        &id,
+        std::path::Path::new(&state.mocks_dir),
+    ) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid mock",
+                    "detail": message,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Persist *before* registration, so a failure to write is a 5xx the
+    // caller can retry rather than a mock registered in one place and
+    // missing in the other.
+    if let Some(payload) = &persist_payload {
+        let dir = crate::loader::runtime_dir_path(std::path::Path::new(&state.mocks_dir));
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(dir.join(format!("{}.json", id)), payload))
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "failed to persist runtime mock",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Registration: the runtime map plus the live store, one lock at a time —
+    // the store write takes the same lock the reloader holds, so an in-flight
+    // reload cycle either lands before or after this mock entirely.
+    let key = crate::types::create_mock_key(&prepared.method, &prepared.path);
+    let identity = MockIdentity::of(&prepared, &key, 0);
+    {
+        let mut runtime = state.runtime_mocks.write().await;
+        runtime.insert(id.clone(), prepared.clone());
+    }
+    {
+        let mut store = state.mocks.write().await;
+        store.entry(key.clone()).or_default().push(prepared.clone());
+    }
+
+    info!(
+        "Runtime mock registered: {} {} (id {})",
+        prepared.method, prepared.path, id
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "key": key,
+            "identity": identity.label(),
+            "persisted": request.persist.unwrap_or(false),
+            "mock": prepared,
+        })),
+    )
+        .into_response()
+}
+
+/// The shape a runtime id minted by [`mint_runtime_id`] has: `r-<digits>`.
+///
+/// `DELETE /admin/mocks/{id}` builds a filesystem path out of the id, so an
+/// id that could carry `..`, `/`, or `\` must never reach `remove_file` —
+/// a traversal in the id would delete files outside the mocks root.
+/// Validating the *shape* (rather than sanitizing the value) means only ids
+/// this server actually minted pass; anything else is a plain 404, the same
+/// as an unknown-but-well-formed id, and never touches the filesystem.
+pub fn is_runtime_id_shaped(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("r-") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The runtime mock an `id` names, plus the index it occupies in its mock
+/// bucket — the tuple a delete needs to remove it from both layers without
+/// disturbing the file mocks around it.
+// Response-shaped errors keep the caller's match arms one-liners; same
+// allowance as `runtime_writes_allowed`.
+#[allow(clippy::result_large_err)]
+async fn locate_runtime_mock(
+    state: &AppState,
+    id: &str,
+) -> Result<(MockConfig, String, usize), Response> {
+    let (mock, _) = {
+        let runtime = state.runtime_mocks.read().await;
+        let mock = runtime.get(id).cloned();
+        match mock {
+            Some(m) => (m, ()),
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "runtime mock not found",
+                        "id": id,
+                        "hint": format!("ids are minted by POST /admin/mocks and are never reused; list them under source {} in GET /admin/mocks", crate::loader::RUNTIME_SOURCE_PREFIX),
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    };
+    let key = crate::types::create_mock_key(&mock.method, &mock.path);
+    let index = {
+        let store = state.mocks.read().await;
+        store
+            .get(&key)
+            .and_then(|bucket| {
+                bucket
+                    .iter()
+                    .position(|m| m.source.as_deref() == Some(mock.source.as_deref().unwrap_or("")))
+            })
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "runtime mock vanished from the store",
+                        "id": id,
+                    })),
+                )
+                    .into_response()
+            })?
+    };
+    Ok((mock, key, index))
+}
+
+/// `DELETE /admin/mocks/{id}` — take a runtime mock out of both the runtime
+/// layer and the live store, immediately.
+///
+/// Sequence counters and hit counts keyed to the mock's identity are *kept*:
+/// a deleted mock's state dies with it once the next reload prunes stale
+/// identities (`prune_stale_state`), which is exactly the file-mock rule.
+/// Its persisted file, if any, is deleted too.
+pub async fn delete_runtime_mock(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Err(response) = runtime_writes_allowed(&state) {
+        return response;
+    }
+    // The id flows into a filesystem path below (`remove_file`); anything
+    // this server didn't mint is rejected without touching the disk.
+    if !is_runtime_id_shaped(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "runtime mock not found",
+                "id": id,
+            })),
+        )
+            .into_response();
+    }
+
+    let (mock, key, index) = match locate_runtime_mock(&state, &id).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+
+    {
+        let mut runtime = state.runtime_mocks.write().await;
+        runtime.remove(&id);
+    }
+    {
+        let mut store = state.mocks.write().await;
+        if let Some(bucket) = store.get_mut(&key) {
+            if index < bucket.len() {
+                bucket.remove(index);
+            }
+            if bucket.is_empty() {
+                store.remove(&key);
+            }
+        }
+    }
+    // The persisted file, if any, is deleted too — but the path is never
+    // addressed by the request's id alone: `runtime_dir_path` + `{id}.json`
+    // is canonicalized, and only a result that still lives *inside* the
+    // runtime dir is removed. A canonical check is the airtight form of the
+    // shape gate above (and what CodeQL's path-injection asks for): even a
+    // hypothetical id that slips past parsing cannot name a path that
+    // escapes `mocks/_runtime`.
+    {
+        let runtime_dir = crate::loader::runtime_dir_path(std::path::Path::new(&state.mocks_dir));
+        let candidate = runtime_dir.join(format!("{}.json", id));
+        match std::fs::canonicalize(&candidate) {
+            Ok(resolved) if resolved.starts_with(&runtime_dir) && resolved != runtime_dir => {
+                let _ = std::fs::remove_file(resolved);
+            }
+            _ => {} // nothing persisted under that id; nothing to remove
+        }
+    }
+
+    info!(
+        "Runtime mock deleted: {} {} (id {})",
+        mock.method, mock.path, id
+    );
+    Json(json!({
+        "deleted": true,
+        "id": id,
+        "key": key,
+    }))
+    .into_response()
+}
+
+/// `PUT /admin/mocks/{id}` — replace a runtime mock's configuration.
+///
+/// The replacement is a full `MockConfig` — the same body `POST` takes —
+/// validated the same way, re-registered under the *same id and identity*,
+/// so its sequence counters and hit count follow the mock across the edit.
+/// A `path`/`method` change moves it between buckets, which is the one case
+/// identity alone can't hide: state stays with the id either way.
+pub async fn update_runtime_mock(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = runtime_writes_allowed(&state) {
+        return response;
+    }
+    // Same contract as DELETE: only minted-shaped ids take part in the
+    // runtime registry (its persisted form would be `{id}.json` either way).
+    if !is_runtime_id_shaped(&id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "runtime mock not found",
+                "id": id,
+            })),
+        )
+            .into_response();
+    }
+
+    let (old, old_key, old_index) = match locate_runtime_mock(&state, &id).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+
+    let request: CreateMockRequest = match CreateMockRequest::parse(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid mock request",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // The identity is the *id*, not the method+path: re-prepare keeps the
+    // same source label even when the mock moves buckets.
+    let prepared = match crate::loader::prepare_runtime_mock(
+        request.mock,
+        &id,
+        std::path::Path::new(&state.mocks_dir),
+    ) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid mock",
+                    "detail": message,
+                })),
+            )
+                .into_response();
+        }
+    };
+    // prepare_runtime_mock mints the source from the id — same id, same
+    // source: `(runtime)@r-7`.
+    debug_assert_eq!(prepared.source.as_deref(), old.source.as_deref());
+
+    let new_key = crate::types::create_mock_key(&prepared.method, &prepared.path);
+    {
+        let mut runtime = state.runtime_mocks.write().await;
+        runtime.insert(id.clone(), prepared.clone());
+    }
+    {
+        let mut store = state.mocks.write().await;
+        // Out with the old: remove the old position, then clean an empty
+        // bucket — unless the key didn't change, in which case the insert
+        // below writes into it again.
+        if let Some(bucket) = store.get_mut(&old_key) {
+            if old_index < bucket.len() && old_key != new_key {
+                bucket.remove(old_index);
+            }
+            if bucket.is_empty() && old_key != new_key {
+                store.remove(&old_key);
+            }
+        }
+        let bucket = store.entry(new_key.clone()).or_default();
+        match old_key == new_key {
+            true => bucket[old_index] = prepared.clone(),
+            false => bucket.push(prepared.clone()),
+        }
+    }
+
+    info!(
+        "Runtime mock updated: {} {} (id {})",
+        prepared.method, prepared.path, id
+    );
+    Json(json!({
+        "updated": true,
+        "id": id,
+        "key": new_key,
+        "moved": old_key != new_key,
+        "mock": prepared,
+    }))
+    .into_response()
+}
+
+/// `POST /admin/mocks/{id}/disable` — mark a runtime mock inactive. It stays
+/// registered and listed but is never matched until re-enabled, the same
+/// mechanism scenario tags use. No deletion needed to park one temporarily.
+pub async fn disable_runtime_mock(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    toggle_runtime_mock_inner(state, &id, true).await
+}
+
+/// `POST /admin/mocks/{id}/enable` — mark a runtime mock active again.
+pub async fn enable_runtime_mock(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    toggle_runtime_mock_inner(state, &id, false).await
+}
+
+/// The shared body of both toggles.
+async fn toggle_runtime_mock_inner(state: AppState, id: &str, disabled: bool) -> Response {
+    if let Err(response) = runtime_writes_allowed(&state) {
+        return response;
+    }
+    // Same contract as DELETE/PUT (see `is_runtime_id_shaped`).
+    if !is_runtime_id_shaped(id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "runtime mock not found",
+                "id": id,
+            })),
+        )
+            .into_response();
+    }
+
+    let (mut mock, key, index) = match locate_runtime_mock(&state, id).await {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    mock.disabled = Some(disabled);
+
+    {
+        let mut runtime = state.runtime_mocks.write().await;
+        runtime.insert(id.to_string(), mock.clone());
+    }
+    {
+        let mut store = state.mocks.write().await;
+        if let Some(bucket) = store.get_mut(&key) {
+            if index < bucket.len() {
+                bucket[index] = mock.clone();
+            }
+        }
+    }
+
+    info!(
+        "Runtime mock {}: {} {} (id {})",
+        if disabled { "disabled" } else { "enabled" },
+        mock.method,
+        mock.path,
+        id
+    );
+    Json(json!({
+        "id": id,
+        "disabled": disabled,
+        "key": key,
+    }))
+    .into_response()
 }
 
 /// A response body being served from a `response_file` rather than from

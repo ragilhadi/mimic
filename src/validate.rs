@@ -1273,15 +1273,21 @@ mod tests {
                 br#"{"method":"GET","path":"/admin/mocks","status":200,"response":{}}"#,
             ),
             (
-                // `/admin/mocks` is reserved for GET; POST falls through to
-                // the mock fallback and is a perfectly good mock.
+                // Runtime mock management (#153) made POST /admin/mocks an
+                // admin route, so this mock is reserved too. POST /admin/none
+                // (no route registered) still falls through to the mock
+                // fallback and is a perfectly good mock.
                 "post_admin.json",
                 br#"{"method":"POST","path":"/admin/mocks","status":201,"response":{}}"#,
+            ),
+            (
+                "post_free.json",
+                br#"{"method":"POST","path":"/admin/none","status":201,"response":{}}"#,
             ),
         ]);
 
         let found = findings(&dir, None);
-        assert_eq!(found.len(), 2, "{:?}", found);
+        assert_eq!(found.len(), 3, "{:?}", found);
         assert!(found.iter().all(|finding| finding.kind == "reserved_route"));
         assert!(found
             .iter()
@@ -1289,7 +1295,7 @@ mod tests {
         assert!(
             found
                 .iter()
-                .all(|finding| !finding.file.ends_with("post_admin.json")),
+                .all(|finding| !finding.file.ends_with("post_free.json")),
             "only the reserved pairs are reported, not the free fallback: {:?}",
             found
         );

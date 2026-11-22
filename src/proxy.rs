@@ -759,6 +759,7 @@ fn build_recorded_mock(
         delay_ms: None,
         sequence: None,
         tags: Vec::new(),
+        disabled: None,
         source: None,
         source_index: None,
     }

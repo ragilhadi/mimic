@@ -61,7 +61,7 @@ pub struct LoadResult {
 /// dependency-free and turns an unconditional re-read into a re-read only
 /// when something plausibly changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileFingerprint {
+pub(crate) struct FileFingerprint {
     modified: std::time::SystemTime,
     len: u64,
 }
@@ -153,6 +153,103 @@ pub fn max_response_file_size() -> u64 {
         },
         Err(_) => DEFAULT_MAX_RESPONSE_FILE,
     })
+}
+
+// ============================================================================
+// Runtime mock management (#153) — the loader's share
+// ============================================================================
+
+/// The `source` label runtime mocks registered via `POST /admin/mocks` carry.
+/// The `@` suffix plus the id makes one distinguishable from two — the same
+/// convention an array file uses with `#2` — and lets `MockIdentity::of`
+/// treat each runtime mock as its own stable origin (the whole point of a
+/// stable id).
+pub const RUNTIME_SOURCE_PREFIX: &str = "(runtime)";
+
+/// The directory runtime `persist=true` mocks are written under, inside the
+/// mocks root.
+pub const RUNTIME_DIR: &str = "_runtime";
+
+/// Validate and prepare a `MockConfig` submitted via `POST /admin/mocks`.
+///
+/// The same checks file mocks get — non-empty method/path, one body per
+/// mock, status sanity, fixture resolution and reading — so a runtime mock
+/// can't do anything a file mock can't, and an invalid one is rejected with
+/// the same message shape `mimic validate` reports.
+///
+/// `runtime_id` is the caller-chosen stable id (`r-7f1c…`); it becomes the
+/// mock's `source`, `(runtime)@<id>`, which is what `MockIdentity::of` keys
+/// state on — the stable identity hot reload must carry across.
+///
+/// Fixtures (`response_file`) resolve against `mocks_root` (`path.parent()`
+/// for file mocks) and stay inside it, exactly the file-mock rule.
+pub fn prepare_runtime_mock(
+    mut mock: MockConfig,
+    runtime_id: &str,
+    mocks_root: &Path,
+) -> Result<MockConfig, String> {
+    let label = format!("{}@{}", RUNTIME_SOURCE_PREFIX, runtime_id);
+
+    if mock.method.is_empty() {
+        return Err(format!("Empty method in {}", label));
+    }
+    if mock.path.is_empty() {
+        return Err(format!("Empty path in {}", label));
+    }
+
+    // Loader-owned identity: a runtime mock's source is minted here, never
+    // taken from the JSON body (the same misattribution guard file mocks get).
+    mock.source = Some(label.clone());
+    mock.source_index = None;
+    mock.response_bytes = None;
+
+    if let Some(file) = mock.response_file.clone() {
+        reject_both_bodies(&mock.response, &file, &label)?;
+        let mut cache = HashMap::new();
+        let (resolved, bytes) = read_response_file(
+            &file,
+            mocks_root,
+            &label,
+            mocks_root,
+            max_response_file_size(),
+            &mut cache,
+        )?;
+        mock.response_bytes = Some(bytes);
+        // Silence the unused fixture path: runtime mocks register in-place,
+        // no walk dedup applies.
+        let _ = resolved;
+    }
+
+    if !crate::types::is_valid_status(mock.status) {
+        // Same treatment as file mocks: warned at registration, tolerated —
+        // `is_valid_status` decides serving, not an error.
+    }
+
+    for step in mock.sequence.iter_mut().flatten() {
+        step.response_bytes = None;
+        if !crate::types::is_valid_status(step.status) {
+            // Warned by the same serving rule; nothing to fix here.
+        }
+        // A runtime mock may not claim a `response_file` on a sequence step:
+        // the fixture path would resolve against a file that doesn't exist.
+        // `reject_both_bodies` covers `response`+`response_file`; a bare
+        // step `response_file` would silently 200-empty on serve.
+        if step.response_file.is_some() {
+            return Err(format!(
+                "{} (sequence step): `response_file` is only supported in file-backed mocks; \
+                 use `response` instead",
+                label
+            ));
+        }
+    }
+
+    Ok(mock)
+}
+
+/// The directory a runtime mock's persisted file lands in, inside the mocks
+/// root — returned pre-canonicalized for direct use as `mocks_root.parent()`.
+pub(crate) fn runtime_dir_path(mocks_root: &Path) -> PathBuf {
+    mocks_root.join(RUNTIME_DIR)
 }
 
 /// One mock as it came off disk: the config, plus the fixture files it claims.
@@ -980,7 +1077,11 @@ fn load_mock_element(
 
 /// `response` and `response_file` are two answers to one question, so a mock
 /// that gives both is rejected rather than having one silently win.
-fn reject_both_bodies(response: &serde_json::Value, file: &str, label: &str) -> Result<(), String> {
+pub(crate) fn reject_both_bodies(
+    response: &serde_json::Value,
+    file: &str,
+    label: &str,
+) -> Result<(), String> {
     if response.is_null() {
         return Ok(());
     }
@@ -1001,7 +1102,7 @@ fn reject_both_bodies(response: &serde_json::Value, file: &str, label: &str) -> 
 ///
 /// `label` is how the owning mock names itself in errors — `orders.json`, or
 /// `orders.json#2` when it is one element of an array file.
-fn read_response_file(
+pub(crate) fn read_response_file(
     file: &str,
     mock_path: &Path,
     label: &str,
@@ -1617,6 +1718,7 @@ mod tests {
             response_headers: None,
             source: None,
             source_index: None,
+            disabled: None,
             sequence: None,
             tags: Vec::new(),
             response_file: None,
