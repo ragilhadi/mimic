@@ -4,19 +4,9 @@
 [![Docker](https://img.shields.io/docker/v/ragilhadi/mimic?label=docker)](https://hub.docker.com/r/ragilhadi/mimic)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**Mock HTTP APIs with JSON or YAML.** Mimic is a lightweight server for local development and integration tests. Edit mock files while it runs, test retries with response sequences, switch scenarios to simulate errors, and inspect requests in the dashboard.
+**Mock HTTP APIs with JSON or YAML.** Mimic is a lightweight mock server for local development and integration tests. Run it in Docker, keep mock definitions alongside your tests, and change responses without restarting the server.
 
-**[Read the documentation](https://mimic.ragilhadi.com/)**
-
-## Resource usage
-
-A `docker stats --no-stream` snapshot from the local Compose playground.
-
-```text
-NAME                 CPU %    MEM USAGE / LIMIT
-mimic-test-mimic-1    2.52%    9.004 MiB / 31.27 GiB
-mimic-test-proxy-1    0.02%    2.254 MiB / 31.27 GiB
-```
+[Quick start](#quick-start) · [Features](#features) · [Documentation](https://mimic.ragilhadi.com/)
 
 ## Quick start
 
@@ -61,7 +51,27 @@ docker run --rm -d --name mimic \
 curl http://localhost:8080/hello
 ```
 
-Open the [local dashboard](http://localhost:8080/admin/dashboard) to inspect requests and loaded mocks. Stop the server with `docker stop mimic`.
+```json
+{"message":"Hello from Mimic"}
+```
+
+Stop the server with `docker stop mimic`.
+
+## Features
+
+- **Match requests** by method, path parameters, query parameters, headers, or body.
+- **Test failure and recovery** with response delays, sequences, and switchable scenarios.
+- **Verify requests** through the admin API, including call counts and explanations for unmatched requests.
+- **Reuse API definitions** by importing OpenAPI specs or recording and replaying upstream responses.
+
+## Resource usage
+
+A single `docker stats --no-stream mimic` sample with the quick-start mock loaded and the server idle.
+
+```text
+NAME      CPU %     MEM USAGE / LIMIT
+mimic     0.00%     2.137MiB / 31.27GiB
+```
 
 ## Documentation
 
