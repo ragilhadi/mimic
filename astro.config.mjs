@@ -41,7 +41,7 @@ export default defineConfig({
         },
       ],
       editLink: {
-        baseUrl: 'https://github.com/ragilhadi/mimic/edit/main/docs/',
+        baseUrl: 'https://github.com/ragilhadi/mimic/edit/docs/',
       },
       sidebar: [
         {
@@ -56,6 +56,8 @@ export default defineConfig({
           label: 'Guides',
           items: [
             { label: 'Mock Files', slug: 'guides/mock-files' },
+            { label: 'Runtime Mock Management', slug: 'guides/runtime-mocks' },
+            { label: 'Stateful CRUD Collections', slug: 'guides/collections' },
             { label: 'Hot Reload', slug: 'guides/hot-reload' },
             { label: 'File Uploads', slug: 'guides/file-uploads' },
             { label: 'Configuration', slug: 'guides/configuration' },

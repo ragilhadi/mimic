@@ -47,16 +47,20 @@ If one file has invalid JSON/YAML — an editor mid-save, a teammate's work-in-p
 
 The broken file's own route isn't dropped either — it keeps serving its **last successfully-loaded response** until the file parses again, so routes don't flap in and out of existence while somebody is editing. Each failure is logged with the file name and parse error, plus a summary of how many endpoints were applied and how many were carried forward.
 
-Deletions still take effect normally: on a clean cycle (no parse errors) the mock set is replaced outright, so removing a file removes its route.
+Deleting a file removes its routes even if a different file is broken. In a valid array file, an invalid element retains its previous mock at that index while valid siblings update.
 
 ## What happens to sequence state across a reload
 
-[Sequence](/dynamic-responses/sequences/) positions and hit counts belong to **the mock's file**, not to its position in the list of mocks sharing a `METHOD:path`. Across a reload:
+[Sequence](/dynamic-responses/sequences/) positions and hit counts belong to **the mock's file and, for arrays, its element index**, not to its position in the list of mocks sharing a `METHOD:path`. Across a reload:
 
 - **Editing a file** — including editing its `sequence` — leaves that mock's position and hit count where they were. Reset explicitly with `POST /admin/sequences/reset` when you want a clean run.
 - **Adding a mock** under a `METHOD:path` that already has one does not disturb the existing mock's counters, whichever order the two files sort in.
 - **Deleting a file** drops its counters. They are not carried over to whatever is loaded next.
 - **A file that stops parsing** keeps both its route and its counters, since its last-known-good response is still being served.
+
+## Force a reload
+
+Call [`POST /admin/reload`](/reference/admin-api/#verification-api) after editing a file to run a reload immediately and receive the resulting mock list.
 
 ## When hot reload might not work
 

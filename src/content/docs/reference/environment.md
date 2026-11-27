@@ -42,6 +42,7 @@ The bound address is always visible — it's printed in the startup log next to 
 | `MIMIC_HEALTH_PATH` | `/health` | Where the health check is served. Empty disables it, freeing the path for a mock. |
 | `MIMIC_ADMIN_PREFIX` | `/admin` | Prefix the admin API is mounted under. |
 | `MIMIC_DISABLE_ADMIN` | `false` | Switch the admin API off entirely. |
+| `MIMIC_ADMIN_READONLY` | `false` | Omit [runtime mock write routes](/guides/runtime-mocks/) and their dashboard controls. Other admin actions remain available. |
 | `MIMIC_ADMIN_TOKEN` | unset | Bearer token the admin API requires. Unset means no authentication. |
 
 See [Reserved Endpoints](/reference/reserved-endpoints/) for the exact routes these control, and [Admin Dashboard](/guides/admin-dashboard/#protecting-the-admin-api) for how the token is checked.

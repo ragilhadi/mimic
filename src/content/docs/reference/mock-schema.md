@@ -31,11 +31,12 @@ Mimic accepts this same shape as `.json`, `.yaml`, or `.yml` — see [Mock Files
 | Field          | Type    | Required | Description |
 |----------------|---------|----------|-------------|
 | `method`       | string  | yes      | HTTP method. Case-insensitive but conventionally uppercase: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`. |
-| `path`         | string  | yes      | URL path. Must start with `/`. May contain named parameters (`:id`, `{id}`) — see [Path Parameters](/matching/path-parameters/). No other wildcards are supported. |
-| `status`       | number  | yes      | HTTP status code returned for matching requests, `100`–`599`. An out-of-range value can't be put on the wire — Mimic serves `200 OK` instead, warns at load time, and marks the mock `"servable": false` in `GET /admin/mocks`. |
+| `path`         | string  | yes      | URL path. Must start with `/`. Supports named parameters, wildcards, constraints, and optional segments. See [Path Parameters](/matching/path-parameters/). |
+| `status`       | number  | no       | HTTP status code returned for matching requests, `100`–`599`. For regular mocks, an omitted or out-of-range status causes Mimic to serve `200 OK` instead, warns at load time, and marks the mock `"servable": false` in `GET /admin/mocks`. |
 | `response`     | any     | no       | The JSON value returned as the response body. Can be an object, array, string, number, boolean, or `null`. String values support [`{{ }}` templating](/dynamic-responses/templating/). Mutually exclusive with `response_file`. |
 | `response_file`| string  | no       | Serve the body from a file next to the mock instead of `response`. See [File-Backed Responses](/dynamic-responses/response-file/). |
 | `template`     | boolean | no       | If `true`, interpolate `{{ }}` templates inside a `response_file` body. Default: `false`. Ignored when `response_file` isn't set. |
+| `template_escape` | boolean | no | Escape values interpolated into a templated JSON, HTML, or XML fixture. Default: `true`. |
 | `consume_body` | boolean | no       | If `true`, Mimic reads and discards the request body before responding. Required for file uploads and large payloads. Default: `false`. |
 | `query_params` | object  | no       | Match against query string parameters. |
 | `headers`      | object  | no       | Match against request headers. |
@@ -44,6 +45,15 @@ Mimic accepts this same shape as `.json`, `.yaml`, or `.yml` — see [Mock Files
 | `delay_ms`     | number or object | no | Delay before responding: a fixed number of milliseconds, or `{ "min": number, "max": number }` for a random range. See [Response Delays](/dynamic-responses/delays/). |
 | `sequence`     | array   | no       | A list of `{ status, response, delay_ms?, repeat? }` steps served one per request. See [Stateful Sequences](/dynamic-responses/sequences/). |
 | `tags`         | string[] | no      | Scenario tags — the mock is only matchable when one of them is active, or always matchable if omitted. See [Scenario Tags](/guides/scenarios/). |
+
+## Runtime and collection fields
+
+| Field | Type | Description |
+|---|---|---|
+| `disabled` | boolean | When true, the mock stays loaded but is inactive. See [Runtime Mock Management](/guides/runtime-mocks/). |
+| `collection` | object | Configures a [stateful CRUD collection](/guides/collections/), which determines its own response and status. |
+
+JSON body `partial` values support [matcher forms](/matching/body/#json-matcher-forms).
 
 ## `query_params`
 

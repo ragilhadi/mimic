@@ -10,12 +10,19 @@ Mimic answers a handful of routes itself, and they are matched **ahead of** the 
 | `/health` | `GET` |
 | `/admin/dashboard` | `GET` |
 | `/admin/requests` | `GET`, `DELETE` |
-| `/admin/mocks` | `GET` |
+| `/admin/requests/count` | `GET` |
+| `/admin/requests.har` | `GET` |
+| `/admin/reset` | `POST` |
+| `/admin/reload` | `POST` |
+| `/admin/mocks` | `GET`, `POST` |
+| `/admin/mocks/{id}` | `PUT`, `DELETE` |
+| `/admin/mocks/{id}/enable` | `POST` |
+| `/admin/mocks/{id}/disable` | `POST` |
 | `/admin/sequences` | `GET` |
 | `/admin/sequences/reset` | `POST` |
 | `/admin/scenario` | `GET`, `POST` |
 
-Only these exact **method + path** pairs are reserved. `POST /health` and `GET /admin/users` reach the mock set normally and can be mocked.
+The reservation applies to these **method + path** pairs, including the parameterized runtime routes. Setting `MIMIC_ADMIN_READONLY=true` frees the runtime write routes. `POST /health` and `GET /admin/users` reach the mock set normally and can be mocked.
 
 ## Collisions are reported, not silent
 

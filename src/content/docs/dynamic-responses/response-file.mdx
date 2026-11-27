@@ -88,6 +88,8 @@ Set `"template": true` to interpolate `{{path.*}}`, `{{query.*}}`, `{{header.*}}
 
 Templating is **off by default** and never runs on a binary content type, so a PNG that happens to contain the bytes `{{` is still a PNG.
 
+For JSON, HTML, and XML fixtures, Mimic escapes interpolated values for the response content type by default. Set `"template_escape": false` to insert raw values, for example when the value is already escaped.
+
 ## Sequences
 
 A [sequence](/dynamic-responses/sequences/) step takes the same two fields, so a retry flow can end in a real file:

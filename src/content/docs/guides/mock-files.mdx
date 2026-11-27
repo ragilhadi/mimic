@@ -5,7 +5,7 @@ description: The anatomy of a Mimic mock file and how Mimic discovers them.
 
 import { Aside } from '@astrojs/starlight/components';
 
-A **mock file** is a single JSON or YAML file that describes one HTTP endpoint. Mimic reads every `.json`, `.yaml`, and `.yml` file in the mounted mocks directory and turns each one into a route.
+Mimic reads mock definitions from `.json`, `.yaml`, and `.yml` files. A file can contain one mock object or an array of mocks.
 
 ## File location
 
@@ -49,10 +49,10 @@ Here is a complete mock with every common field:
 |------------|--------|-------------|
 | `method`   | string | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, etc. |
 | `path`     | string | URL path the request must hit (e.g. `/users`, `/api/v1/orders`). |
-| `status`   | number | HTTP status code to return (`200`, `201`, `404`, `500`, …). |
-| `response` | any    | The JSON body to return. Can be an object, array, string, number, or `null`. |
 
 ### Optional fields
+
+Set `status` for regular mocks. If it is omitted or outside `100`–`599`, Mimic logs a warning and serves `200`. Use `response` for an inline JSON body or `response_file` for a fixture. [Collections](/guides/collections/) define their own status and body.
 
 | Field          | Type    | Default | Description |
 |----------------|---------|---------|-------------|
@@ -100,6 +100,51 @@ response:
 ```
 
 JSON stays the default and first-class format; YAML is an alternative for files where either of the above is worth it, not a replacement.
+
+## Multiple mocks in one file
+
+A file whose top level is an **array** holds several mocks instead of exactly
+one. Each element is a full `MockConfig`, so a resource's whole surface can
+live in one file:
+
+```json
+[
+  { "method": "GET",    "path": "/orders",     "status": 200, "response": { "orders": [] } },
+  { "method": "GET",    "path": "/orders/:id", "status": 200, "response": { "id": 1 } },
+  { "method": "POST",   "path": "/orders",     "status": 201, "response": { "id": 2 } },
+  { "method": "DELETE", "path": "/orders/:id", "status": 204 }
+]
+```
+
+The same shape as a YAML array (`- ` elements, or flow `[...]` syntax):
+
+```yaml
+- method: GET
+  path: /orders
+  status: 200
+  response:
+    orders: []
+- method: POST
+  path: /orders
+  status: 201
+  response:
+    id: 2
+```
+
+- **Identity is the file plus the element's position.** Sequence counters,
+  hit counts, and their admin listings report `orders.json#2` for an element.
+  Reordering elements changes which mock occupies each position. Reset counters after reordering if a test relies on them.
+- **Errors are per element where possible.** An element that fails
+  validation is reported as `orders.json#2` and its siblings still load; a
+  file that isn't valid JSON/YAML at all fails as a whole, as it always did.
+  `mimic validate` reports both shapes.
+- **`response_file` is unchanged.** A fixture referenced by an array element
+  resolves against the containing file's directory, and is served rather
+  than registered as a mock.
+- **Multiple single-mock files can't collide on identity.** Two elements in
+  one file share the file, so they get separate identities by index; two
+  mocks in one file can still declare the same `METHOD:path` — that tie is
+  broken by load order, like two files would be.
 
 ## Naming and organizing files
 

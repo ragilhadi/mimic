@@ -3,13 +3,22 @@ title: Admin API
 description: Full reference for every /admin/* endpoint Mimic exposes.
 ---
 
-All admin endpoints are read-only apart from the ones that say otherwise, and all return JSON — the [dashboard](/guides/admin-dashboard/) is just one client of them. They live under `MIMIC_ADMIN_PREFIX` (default `/admin`) and can be disabled entirely with `MIMIC_DISABLE_ADMIN=true`, or put behind a bearer token with `MIMIC_ADMIN_TOKEN` — see [Environment Variables](/reference/environment/).
+The dashboard returns HTML, the HAR export returns `application/har+json`, and the other admin endpoints return JSON. They live under `MIMIC_ADMIN_PREFIX` (default `/admin`) and can be disabled entirely with `MIMIC_DISABLE_ADMIN=true`, or put behind a bearer token with `MIMIC_ADMIN_TOKEN` — see [Environment Variables](/reference/environment/).
 
 ```
 GET    /admin/dashboard         # Web dashboard (Requests / Mocks / Sequences)
 GET    /admin/requests          # List recorded requests (see filters below)
 DELETE /admin/requests          # Clear recorded requests
 GET    /admin/mocks             # List every loaded mock, with matchers and hit counts
+GET    /admin/requests/count    # Count recorded requests and optionally assert the count
+GET    /admin/requests.har      # Export recorded requests as HAR 1.2
+POST   /admin/reset             # Clear log and counters, restore collection seeds
+POST   /admin/reload            # Run a reload and return the resulting mock list
+POST   /admin/mocks             # Create a runtime mock
+PUT    /admin/mocks/{id}        # Replace a runtime mock
+DELETE /admin/mocks/{id}        # Remove a runtime mock
+POST   /admin/mocks/{id}/enable # Enable a runtime mock
+POST   /admin/mocks/{id}/disable # Disable a runtime mock
 GET    /admin/sequences         # Current step of every in-progress sequence
 POST   /admin/sequences/reset   # Reset sequence counters (optional: ?path=/api/submit)
 GET    /admin/scenario          # Which scenario tags are currently active
@@ -102,7 +111,29 @@ Every field after `response_status` is additive and omitted when empty.
 }
 ```
 
-`source` is the file the mock was loaded from, and is absent for mocks not read from disk. `config` is the full mock configuration. `hits` counts requests served by that specific mock, so two mocks sharing a path stay distinguishable. `tags` and `active` describe the mock's [scenario](/guides/scenarios/) membership — `active: false` means the mock is loaded but filtered out by the current scenario, and so unmatchable.
+`source` identifies the file, array element, or runtime origin. Runtime entries include their `id` and `disabled` status. `config` is the full mock configuration. `hits` counts requests served by that specific mock, so two mocks sharing a path stay distinguishable. `tags` and `active` describe the mock's [scenario](/guides/scenarios/) membership — `active: false` means the mock is loaded but inactive because of the current scenario or its `disabled` flag.
+
+## Verification API
+
+`GET /admin/requests/count` counts matching entries in the retained request log. It accepts `path`, `method`, `status`, and `unmatched_only`. Supply a nonnegative integer `expect` to assert the count. A match returns `200`, and a mismatch returns `417`. The JSON includes `count`, `expect`, and `matched`.
+
+```bash
+curl --fail 'http://localhost:8080/admin/requests/count?path=/payments&method=POST&expect=1'
+curl -X POST http://localhost:8080/admin/reset
+curl -X POST http://localhost:8080/admin/reload
+curl --output log.har http://localhost:8080/admin/requests.har
+```
+
+- `POST /admin/reset` clears the request log, mock hit counts, and sequence counters, and restores [collection seeds](/guides/collections/).
+- `POST /admin/reload` waits for a reload cycle and returns the resulting mock list.
+- `GET /admin/requests.har` exports matching entries from the retained log as HAR 1.2 for tools such as browser DevTools.
+- `GET /admin/requests` reports `duration_ms` for each request. HAR entries expose the same duration as `time`, including any mock delay.
+
+## Runtime mock endpoints
+
+`POST /admin/mocks` accepts a mock definition and returns `201` with an `id`, which is also listed by `GET /admin/mocks`. Use `PUT /admin/mocks/{id}` to replace the full definition, `DELETE /admin/mocks/{id}` to remove it, and `POST /admin/mocks/{id}/enable` or `/disable` to toggle it. Unknown runtime IDs return `404`.
+
+Add `?persist=true` when creating a mock to write it under the mocks directory. See [Runtime Mock Management](/guides/runtime-mocks/) for persistence and restart behavior. `MIMIC_ADMIN_READONLY=true` omits these five write routes.
 
 ## `GET /admin/sequences`
 
