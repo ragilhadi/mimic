@@ -111,6 +111,12 @@ make test     # run the test suite
 
 See the [Makefile commands](https://github.com/ragilhadi/mimic/blob/main/Makefile) in the repo for the full list.
 
+## Running and stopping Mimic
+
+Use `mimic --help` for command usage and `mimic --version` to print the installed version. Unknown arguments exit with status `2`. An unusable `PORT` or `MIMIC_BIND_ADDRESS` exits with status `1` and reports the startup error.
+
+On SIGTERM or SIGINT, Mimic allows in-flight requests up to 10 seconds to finish.
+
 ## Verifying your installation
 
 Whichever method you used, confirm Mimic is up:

@@ -57,6 +57,12 @@ Explanations are produced by the matchers themselves, so an explanation can neve
 
 All of them are query parameters on [`/admin/requests`](/reference/admin-api/#get-adminrequests), so they work from `curl` too — the dashboard is a client of the same public API.
 
+## Managing runtime mocks
+
+The **Mocks** tab lets you enable or disable mocks created through the [runtime mock API](/guides/runtime-mocks/). Set `MIMIC_ADMIN_READONLY=true` to hide those controls.
+
+Use the [Verification API](/reference/admin-api/#verification-api) to count recorded requests, reset state between tests, reload mocks, or export a HAR.
+
 ## Other behaviour
 
 - **Auto-refresh appends** new rows rather than rebuilding the table, and **pauses while the pointer is over it** — new requests collect behind a "*N* new requests" banner instead of shifting the row you're reading.

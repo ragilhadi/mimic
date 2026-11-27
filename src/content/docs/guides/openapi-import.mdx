@@ -11,7 +11,7 @@ Already have an OpenAPI 3.x spec? Generate a whole `mocks/` directory from it in
 mimic import-openapi ./spec.yaml --out ./mocks/generated
 ```
 
-JSON and YAML specs are both accepted. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status. The output is plain mock-file JSON, so it [hot reloads](/guides/hot-reload/) like any other mock and can be hand-edited afterwards.
+JSON and YAML specs are both accepted. The importer writes one **live** mock file per operation — built from its primary response — plus an inert `.json.disabled` file for every other documented status. Use `--format yaml` to write YAML and `.yaml.disabled` alternatives. The output is plain mock-file data, so it [hot reloads](/guides/hot-reload/) like any other mock and can be hand-edited afterwards.
 
 The default output directory, `./mocks/generated`, sits inside the `./mocks` the server falls back to locally — so `mimic import-openapi ./spec.yaml && mimic` serves the generated mocks with nothing else to configure. When `--out` points elsewhere, the importer prints the exact command to start the server against it.
 
@@ -21,6 +21,9 @@ The default output directory, `./mocks/generated`, sits inside the `./mocks` the
 |--------|---------|-------------|
 | `--out <dir>` | `./mocks/generated` | Output directory |
 | `--status <code>` | `200` | Status treated as each operation's *primary* response; its file is the live one |
+| `--format <json\|yaml>` | `json` | Write JSON or YAML mock files. `yml` is an alias for `yaml`. |
+| `--bundle` | off | Group operations in one array file per path. |
+| `--base-path <path>` | from `servers[0]` | Prefix generated paths. Pass `--base-path ''` to omit the prefix. |
 | `--force` | off | Write into a non-empty output directory, overwriting files of the same name |
 | `--brace-params` | off | Emit path parameters as `{id}` instead of `:id` |
 | `-h`, `--help` | — | Show usage |
@@ -91,6 +94,16 @@ mv mocks/generated/get_users_id_404.json.disabled mocks/generated/get_users_id_4
 
 Hot reload picks the change up within a couple of seconds — no restart needed.
 
+## Bundling
+
+Use `--bundle` to group each path’s operations into one [array file](/guides/mock-files/#multiple-mocks-in-one-file). Other documented responses for the path go into a separate disabled array.
+
+```bash
+mimic import-openapi spec.yaml --out ./mocks/generated --bundle --format yaml
+```
+
+For example, `GET /users` and `POST /users` share `users.yaml`, while their alternative statuses go into `users_alt.yaml.disabled`. Removing `.disabled` activates the entire array. Keep the desired alternatives and adjust the corresponding live mocks to avoid ambiguous matches.
+
 ## Where the response body comes from
 
 For each response, the importer takes the first of these that the spec provides:
@@ -119,7 +132,7 @@ When there's no example, the schema is walked recursively and each field gets a 
 
 ## Semantics
 
-- **Multiple response codes become separate files, and only the primary one is live.** Alternatives share a path and method with the primary response and carry no matcher to tell them apart, so leaving them all enabled would make the served response depend on directory read order. They land as `.json.disabled` instead — rename to enable. They are alternative responses, not a call-order sequence, so they are also deliberately *not* folded into a single [`sequence`](/dynamic-responses/sequences/) mock.
+- **By default, multiple response codes become separate files, and only the primary one is live.** Alternatives share a path and method with the primary response and carry no matcher to tell them apart, so leaving them all enabled would make the served response depend on directory read order. They land as `.json.disabled` instead — rename to enable. They are alternative responses, not a call-order sequence, so they are also deliberately *not* folded into a single [`sequence`](/dynamic-responses/sequences/) mock.
 - **The primary response** is `--status` if the operation declares it, otherwise its lowest declared `2xx`, otherwise its lowest declared status. So a `POST` documenting only `201` gets a live `201`, and an operation documenting only errors still gets a live mock rather than an all-disabled route.
 - **OpenAPI's `default` key** maps to `--status` for its filename, but never outranks a declared success response — it usually documents an *error* shape, and serving that by default would be misleading. It becomes the live mock only when it's all an operation has.
 - **`$ref` is resolved** for schemas, responses, path items, and named examples. Circular references collapse to `{}` at the point of recursion rather than looping forever; external (`./other.yaml#/...`) and unresolvable refs degrade to `{}` with a warning.

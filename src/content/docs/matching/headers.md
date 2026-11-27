@@ -3,6 +3,8 @@ title: Header Matching
 description: Match requests based on HTTP header values, prefixes, regex patterns, or forbidden headers.
 ---
 
+If a request sends the same header more than once, Mimic joins the values with `, ` before matching.
+
 Use `headers` to match against HTTP request headers. The most common use case is **authentication** — returning different responses based on the presence and shape of an `Authorization` header.
 
 ## Basic shape
