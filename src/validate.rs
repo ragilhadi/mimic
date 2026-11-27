@@ -267,6 +267,7 @@ fn collect_findings(
         check_reserved_route(mock, &file, reserved, &mut findings);
         check_status(mock, &file, &mut findings);
         check_path(mock, &file, &mut findings);
+        check_query_conflicts(mock, &file, &mut findings);
         check_regexes(mock, &file, &mut findings);
         check_sequence(mock, &file, &mut findings);
         check_templates(mock, &file, &mut findings);
@@ -375,6 +376,23 @@ fn check_path(mock: &MockConfig, file: &str, findings: &mut Vec<Finding>) {
                 mock.method.to_uppercase()
             ),
         });
+    }
+}
+
+/// A required query parameter cannot also be forbidden.
+fn check_query_conflicts(mock: &MockConfig, file: &str, findings: &mut Vec<Finding>) {
+    let Some(query) = &mock.query_params else {
+        return;
+    };
+    for name in query.params.keys() {
+        if query.forbidden.contains(name) {
+            findings.push(Finding {
+                file: file.to_string(),
+                severity: Severity::Warning,
+                kind: "conflicting_query_param",
+                message: format!("query param `{name}` is both required and forbidden; this mock can never match"),
+            });
+        }
     }
 }
 
@@ -1401,6 +1419,27 @@ mod tests {
         assert_eq!(found[0].kind, "duplicate_route");
         assert!(found[0].file.ends_with("variants.json#8"));
         assert!(found[0].message.contains("variants.json#6"));
+    }
+
+    #[test]
+    fn a_required_and_forbidden_query_param_warns() {
+        let dir = mocks_dir(&[(
+            "search.json",
+            br#"{
+                "method": "GET",
+                "path": "/search",
+                "status": 200,
+                "query_params": {"params": {"q": "search"}, "forbidden": ["q", "other"]}
+            }"#,
+        )]);
+
+        let found = findings(&dir, None);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, Severity::Warning);
+        assert_eq!(found[0].kind, "conflicting_query_param");
+        assert!(found[0]
+            .message
+            .contains("`q` is both required and forbidden"));
     }
 
     #[test]

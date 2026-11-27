@@ -173,6 +173,7 @@ fn explain_no_match_names_an_absent_query_param() {
     params.insert("page".to_string(), QueryParamValue::Exact("1".to_string()));
     mock.query_params = Some(QueryParamMatcher {
         params,
+        forbidden: Vec::new(),
         strict: false,
     });
 
@@ -185,6 +186,59 @@ fn explain_no_match_names_an_absent_query_param() {
 }
 
 #[test]
+fn forbidden_query_params_reject_presence_and_explain_why() {
+    for strict in [false, true] {
+        let mock = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "path": "/browse",
+            "status": 200,
+            "query_params": {
+                "params": {"page": "2"},
+                "forbidden": ["q"],
+                "strict": strict
+            }
+        }))
+        .unwrap();
+        let mocks = store(vec![mock]);
+
+        let mut context = ctx("GET", "/browse");
+        context.query_params = parse_query_string(Some("page=2"));
+        let matched = find_matching_mock(&context, &mocks, None).unwrap();
+        assert_eq!(matched.breakdown.query_params, QUERY_PARAM_SCORE);
+
+        for query in [
+            "page=2&q=search",
+            "page=2&q=",
+            "page=2&q",
+            "page=2&q=&q=search",
+        ] {
+            context.query_params = parse_query_string(Some(query));
+            context.query_params_all = parse_query_string_multi(Some(query));
+            assert!(
+                find_matching_mock(&context, &mocks, None).is_none(),
+                "{query}"
+            );
+            let explanation = explain_no_match(&context, &mocks, None).unwrap();
+            assert!(
+                explanation.contains("forbidden query param `q` was present"),
+                "{explanation}"
+            );
+        }
+
+        context.query_params = parse_query_string(Some("page=2&Q=search"));
+        context.query_params_all = parse_query_string_multi(Some("page=2&Q=search"));
+        assert_eq!(find_matching_mock(&context, &mocks, None).is_none(), strict);
+        if strict {
+            let explanation = explain_no_match(&context, &mocks, None).unwrap();
+            assert!(
+                explanation.contains("undeclared param `Q`"),
+                "{explanation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn explain_no_match_describes_a_query_param_pattern() {
     let mut mock = plain_mock("GET", "/users");
     let mut params = HashMap::new();
@@ -194,6 +248,7 @@ fn explain_no_match_describes_a_query_param_pattern() {
     );
     mock.query_params = Some(QueryParamMatcher {
         params,
+        forbidden: Vec::new(),
         strict: false,
     });
 
@@ -587,6 +642,7 @@ fn the_breakdown_always_adds_up_to_the_score() {
     params.insert("v".to_string(), QueryParamValue::Exact("2".to_string()));
     mock.query_params = Some(QueryParamMatcher {
         params,
+        forbidden: Vec::new(),
         strict: false,
     });
     mock.headers = Some(header_matcher(

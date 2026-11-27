@@ -42,6 +42,9 @@ pub enum RejectReason {
     QueryParamMissing {
         name: String,
     },
+    QueryParamForbidden {
+        name: String,
+    },
     QueryParamMismatch {
         name: String,
         expected: String,
@@ -130,6 +133,9 @@ impl fmt::Display for RejectReason {
         match self {
             RejectReason::QueryParamMissing { name } => {
                 write!(f, "required query param `{}` was absent", name)
+            }
+            RejectReason::QueryParamForbidden { name } => {
+                write!(f, "forbidden query param `{}` was present", name)
             }
             RejectReason::QueryParamMismatch {
                 name,
@@ -546,6 +552,12 @@ pub fn query_params_reject_reason_all(
                 debug!("Required query param '{}' is missing", key);
                 return Some(RejectReason::QueryParamMissing { name: key.clone() });
             }
+        }
+    }
+
+    for name in &matcher.forbidden {
+        if request_params.contains_key(name) {
+            return Some(RejectReason::QueryParamForbidden { name: name.clone() });
         }
     }
 

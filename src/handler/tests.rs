@@ -554,6 +554,7 @@ async fn test_query_param_matching() {
                     "q".to_string(),
                     QueryParamValue::Exact("test".to_string()),
                 )]),
+                forbidden: Vec::new(),
                 strict: false,
             }),
             headers: None,
@@ -605,6 +606,7 @@ async fn test_query_param_regex_matching() {
                     "page".to_string(),
                     QueryParamValue::Pattern(QueryParamPattern::Regex("^[0-9]+$".to_string())),
                 )]),
+                forbidden: Vec::new(),
                 strict: false,
             }),
             headers: None,
@@ -898,6 +900,7 @@ async fn test_combined_matching() {
                     "type".to_string(),
                     QueryParamValue::Exact("user".to_string()),
                 )]),
+                forbidden: Vec::new(),
                 strict: false,
             }),
             headers: Some(HeaderMatcher {
@@ -1424,6 +1427,7 @@ async fn test_faker_is_never_used_for_matching() {
             consume_body: false,
             query_params: Some(QueryParamMatcher {
                 params,
+                forbidden: Vec::new(),
                 strict: false,
             }),
             headers: None,

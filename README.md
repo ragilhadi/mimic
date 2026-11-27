@@ -64,6 +64,8 @@ Stop the server with `docker stop mimic`.
 - **Verify requests** through the admin API, including call counts and explanations for unmatched requests.
 - **Reuse API definitions** by importing OpenAPI specs or recording and replaying upstream responses.
 
+For example, [this query matcher](mocks/advanced/get_query_without_search.json) uses `query_params.forbidden` to serve requests with no `q` parameter while still accepting parameters like `page`. An empty `?q=` still counts as present.
+
 ## Resource usage
 
 A single `docker stats --no-stream mimic` sample with the quick-start mock loaded and the server idle.
