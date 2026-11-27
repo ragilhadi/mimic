@@ -631,6 +631,7 @@ fn build_query_matcher(query_params: &HashMap<String, String>) -> Option<QueryPa
             .iter()
             .map(|(k, v)| (k.clone(), QueryParamValue::Exact(v.clone())))
             .collect(),
+        forbidden: Vec::new(),
         strict: false,
     })
 }

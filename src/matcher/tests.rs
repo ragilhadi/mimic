@@ -72,6 +72,7 @@ fn test_query_param_matcher_accepts_either_encoding_of_a_space() {
             "q".to_string(),
             QueryParamValue::Exact("hello world".to_string()),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
 
@@ -144,6 +145,7 @@ fn test_form_body_keeps_an_escaped_literal_plus() {
 fn test_match_query_params_exact() {
     let matcher = QueryParamMatcher {
         params: HashMap::from([("page".to_string(), QueryParamValue::Exact("1".to_string()))]),
+        forbidden: Vec::new(),
         strict: false,
     };
 
@@ -158,6 +160,7 @@ fn test_match_query_params_exact() {
 fn test_match_query_params_extra_ignored() {
     let matcher = QueryParamMatcher {
         params: HashMap::from([("page".to_string(), QueryParamValue::Exact("1".to_string()))]),
+        forbidden: Vec::new(),
         strict: false,
     };
 
@@ -172,6 +175,7 @@ fn test_match_query_params_extra_ignored() {
 fn test_match_query_params_strict() {
     let matcher = QueryParamMatcher {
         params: HashMap::from([("page".to_string(), QueryParamValue::Exact("1".to_string()))]),
+        forbidden: Vec::new(),
         strict: true,
     };
 
@@ -189,6 +193,7 @@ fn test_match_query_params_regex() {
             "page".to_string(),
             QueryParamValue::Pattern(QueryParamPattern::Regex("^[0-9]+$".to_string())),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
 
@@ -206,6 +211,7 @@ fn test_match_query_params_any() {
             "token".to_string(),
             QueryParamValue::Pattern(QueryParamPattern::Any),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
 
@@ -238,6 +244,7 @@ fn test_parse_query_string_keeps_the_first_value_of_a_repeated_key() {
 fn test_a_repeated_key_still_matches_ordinary_exact_against_its_first_value() {
     let matcher = QueryParamMatcher {
         params: HashMap::from([("tag".to_string(), QueryParamValue::Exact("a".to_string()))]),
+        forbidden: Vec::new(),
         strict: false,
     };
     let context = {
@@ -264,6 +271,7 @@ fn test_contains_matches_any_occurrence_of_a_repeated_key() {
             "tag".to_string(),
             QueryParamValue::Pattern(QueryParamPattern::Contains("b".to_string())),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
     let single = parse_query_string(Some("tag=a&tag=b"));
@@ -280,6 +288,7 @@ fn test_contains_matches_any_occurrence_of_a_repeated_key() {
             "tag".to_string(),
             QueryParamValue::Pattern(QueryParamPattern::Contains("c".to_string())),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
     assert!(query_params_reject_reason_all(&single, Some(&multi), &matcher_c).is_some());
@@ -298,6 +307,7 @@ fn test_list_matches_only_the_exact_ordered_set_of_values() {
                 "b".to_string(),
             ])),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
     assert_eq!(
@@ -313,6 +323,7 @@ fn test_list_matches_only_the_exact_ordered_set_of_values() {
                 "a".to_string(),
             ])),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
     assert!(query_params_reject_reason_all(&single, Some(&multi), &wrong_order).is_some());
@@ -322,6 +333,7 @@ fn test_list_matches_only_the_exact_ordered_set_of_values() {
             "tag".to_string(),
             QueryParamValue::Pattern(QueryParamPattern::List(vec!["a".to_string()])),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     };
     assert!(query_params_reject_reason_all(&single, Some(&multi), &missing_one).is_some());
@@ -331,6 +343,7 @@ fn test_list_matches_only_the_exact_ordered_set_of_values() {
 fn test_strict_mode_counts_a_repeated_key_once_not_once_per_value() {
     let matcher = QueryParamMatcher {
         params: HashMap::from([("tag".to_string(), QueryParamValue::Exact("a".to_string()))]),
+        forbidden: Vec::new(),
         strict: true,
     };
     let single = parse_query_string(Some("tag=a&tag=b&tag=c"));
@@ -1141,6 +1154,7 @@ fn test_head_fallback_evaluates_the_get_mock_matchers_against_the_request() {
     let mut query = plain_mock("GET", "/users", "users");
     query.query_params = Some(QueryParamMatcher {
         params: HashMap::from([("page".to_string(), QueryParamValue::Exact("1".to_string()))]),
+        forbidden: Vec::new(),
         strict: false,
     });
     let mocks = mock_map(vec![query.clone()]);
@@ -1322,6 +1336,7 @@ fn test_pattern_still_used_when_exact_key_exists_but_does_not_match() {
             "required".to_string(),
             QueryParamValue::Exact("yes".to_string()),
         )]),
+        forbidden: Vec::new(),
         strict: false,
     });
 

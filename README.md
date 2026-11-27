@@ -64,6 +64,14 @@ Stop the server with `docker stop mimic`.
 - **Verify requests** through the admin API, including call counts and explanations for unmatched requests.
 - **Reuse API definitions** by importing OpenAPI specs or recording and replaying upstream responses.
 
+## Example mocks
+
+| Browse | Examples |
+| --- | --- |
+| [Routes](mocks/routes/) | [List users](mocks/routes/get_users.json), [group several order routes in one file](mocks/routes/orders.json) |
+| [Request matching](mocks/matching/) | [Match a header](mocks/matching/headers/get_api_with_header_regex.json), [require a query parameter to be absent](mocks/matching/query/get_query_without_search.json), [match a JSON body](mocks/matching/body/post_json_exact_match.json) |
+| [Responses](mocks/responses/) | [Serve a CSV file](mocks/responses/files/get_report_export.json), [render a response template](mocks/responses/templates/post_users_templated.json), [test retries with a response sequence](mocks/responses/timing/post_sequence_retry.json) |
+
 ## Resource usage
 
 A single `docker stats --no-stream mimic` sample with the quick-start mock loaded and the server idle.

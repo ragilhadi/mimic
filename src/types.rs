@@ -35,6 +35,10 @@ pub struct QueryParamMatcher {
     #[serde(default)]
     pub params: HashMap<String, QueryParamValue>,
 
+    /// Case-sensitive parameter names that must be absent, even with empty values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden: Vec<String>,
+
     /// If true, request must not have extra params beyond those specified
     #[serde(default)]
     pub strict: bool,

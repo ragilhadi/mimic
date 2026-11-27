@@ -1,0 +1,12 @@
+{
+  "method": "GET",
+  "path": "/browse",
+  "status": 200,
+  "query_params": {
+    "forbidden": ["q"]
+  },
+  "response": {
+    "mode": "browse",
+    "items": [{"id": 1, "title": "Example item"}]
+  }
+}
