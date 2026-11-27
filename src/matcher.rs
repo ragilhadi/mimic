@@ -1436,7 +1436,7 @@ fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
     let mut param_names = Vec::new();
     let mut regex_parts = Vec::new();
 
-    for segment in &segments {
+    for (position, segment) in segments.iter().enumerate() {
         match segment {
             PathSegment::Literal(escaped) => regex_parts.push(escaped.clone()),
             PathSegment::Star => {
@@ -1459,7 +1459,12 @@ fn build_path_pattern(path: &str) -> Option<CompiledPathPattern> {
                 if *optional {
                     // The optional segment's `/` rides inside the group: an
                     // absent segment must not leave an empty `//` behind.
-                    regex_parts.push(format!("(?:/({}))?", group));
+                    if path.starts_with('/') && position == 1 {
+                        // A root-level optional parameter still needs the root slash.
+                        regex_parts.push(format!("/(?:({}))?", group));
+                    } else {
+                        regex_parts.push(format!("(?:/({}))?", group));
+                    }
                 } else {
                     regex_parts.push(format!("({})", group));
                 }
@@ -1699,35 +1704,27 @@ fn parse_param_segment(segment: &str) -> Option<ParsedParam> {
     })
 }
 
-/// A cheap necessary condition for `template` (a declared pattern path) to
-/// match `request_path`: the template has no more segments than the request
-/// (a template can only ever be narrower than the request when it carries a
-/// rest segment, which adds none), and the same first segment whenever the
-/// template's first segment is a literal.
-///
-/// A request is checked against every pattern route registered for its method,
-/// so this runs once per route; rejecting the great majority here keeps the cache
-/// lookup and the regex off that loop. It never rejects a path the template
-/// would match.
+/// Whether the final path segment declares an optional parameter.
+pub(crate) fn has_optional_final_segment(path: &str) -> bool {
+    let segment = path.rsplit('/').next().unwrap_or("");
+    (segment.ends_with('?') || segment.ends_with("?}"))
+        && is_param_segment(segment)
+        && parse_param_segment(segment).is_some_and(|param| param.optional)
+}
+
+/// Reject obvious segment-count and literal-prefix mismatches before
+/// consulting the compiled pattern cache.
 fn template_may_match(template: &str, request_path: &str) -> bool {
     let slash_count = |s: &str| s.bytes().filter(|&b| b == b'/').count();
-    let is_wildcard_template = template.contains("**")
-        || template
-            .split('/')
-            .any(|segment| segment == "*" || is_wildcard_segment(segment));
     let template_slashes = slash_count(template);
     let request_slashes = slash_count(request_path);
-    if !is_wildcard_template && template_slashes != request_slashes {
-        return false;
-    }
-    // A wildcard template (rest or `*` segments) can only need *fewer or the
-    // same* number of request segments than the template declares, minus the
-    // segments the rest swallows; conservatively, any request with at least
-    // as many segments as the prefix before the rest can still match. The
-    // regex itself decides — this prefilter is about keeping the worst case
-    // bounded, not correctness.
-    if is_wildcard_template && template_slashes > request_slashes + 1 {
-        return false;
+    if template_slashes != request_slashes {
+        let has_wildcard = template.contains("**") || template.split('/').any(is_wildcard_segment);
+        let omits_optional =
+            template_slashes == request_slashes + 1 && has_optional_final_segment(template);
+        if !(omits_optional || has_wildcard && template_slashes <= request_slashes + 1) {
+            return false;
+        }
     }
     let template_first = template
         .trim_start_matches('/')
@@ -2026,7 +2023,7 @@ fn scan_candidates_at(
         probe_hit: false,
     };
 
-    let base_key = crate::types::create_mock_key(method, path);
+    let base_key = crate::types::create_request_key(method, path);
     if let Some(mock_list) = mocks.get(&base_key) {
         for mock in mock_list
             .iter()
@@ -2158,7 +2155,7 @@ fn find_matching_mock_at(
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> Option<MatchResult> {
-    let base_key = crate::types::create_mock_key(&context.method, lookup_path);
+    let base_key = crate::types::create_request_key(&context.method, lookup_path);
 
     debug!(
         "Looking for mock: {} (key: {})",
@@ -2478,7 +2475,7 @@ fn accumulate_candidates_for(
         }
     };
 
-    let key = crate::types::create_mock_key(&context.method, lookup_path);
+    let key = crate::types::create_request_key(&context.method, lookup_path);
     if let Some(mock_list) = mocks.get(&key) {
         collect(&key, mock_list);
     }
@@ -2532,7 +2529,7 @@ pub fn explain_no_match(
     mocks: &HashMap<String, Vec<MockConfig>>,
     active_tags: Option<&HashSet<String>>,
 ) -> Option<String> {
-    let base_key = crate::types::create_mock_key(&context.method, &context.path);
+    let base_key = crate::types::create_request_key(&context.method, &context.path);
     let mut candidates: Vec<(String, RejectReason)> = Vec::new();
     let mut tag_filtered: Vec<String> = Vec::new();
 

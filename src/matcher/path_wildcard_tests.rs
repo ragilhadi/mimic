@@ -217,6 +217,25 @@ fn test_static_file_wildcard_route_serves() {
 }
 
 #[test]
+fn test_optional_route_serves_with_and_without_a_parameter() {
+    let _env = crate::types::env_lock().blocking_lock();
+    for template in ["/demo/optional/:id?", "/demo/optional/{id?}"] {
+        let mocks = store(vec![mock("GET", template)]);
+        for path in ["/demo/optional", "/demo/optional/"] {
+            let result = find_matching_mock(&context("GET", path), &mocks, None).unwrap();
+            assert!(result.path_params.is_empty(), "{template} vs {path}");
+        }
+        let result =
+            find_matching_mock(&context("GET", "/demo/optional/42"), &mocks, None).unwrap();
+        assert_eq!(result.path_params.get("id").map(String::as_str), Some("42"));
+    }
+
+    let mocks = store(vec![mock("GET", "/:id?")]);
+    let result = find_matching_mock(&context("GET", "/"), &mocks, None).unwrap();
+    assert!(result.path_params.is_empty());
+}
+
+#[test]
 fn test_numeric_constraint_wins_only_for_numeric_requests() {
     let mocks = store(vec![mock("GET", "/users/:id(\\d+)")]);
     assert!(find_matching_mock(&context("GET", "/users/42"), &mocks, None).is_some());

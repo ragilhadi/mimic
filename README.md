@@ -4,13 +4,15 @@
 [![Docker](https://img.shields.io/docker/v/ragilhadi/mimic?label=docker)](https://hub.docker.com/r/ragilhadi/mimic)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Mimic is a lightweight HTTP mock server for development and testing. Define responses in JSON or YAML and edit them while the server is running.
+**Mock HTTP APIs with JSON or YAML.** Mimic is a lightweight mock server for local development and integration tests. Run it in Docker, keep mock definitions alongside your tests, and change responses without restarting the server.
 
-**[Read the documentation](https://mimic.ragilhadi.com/)**
+[Quick start](#quick-start) · [Features](#features) · [Documentation](https://mimic.ragilhadi.com/)
 
 ## Quick start
 
-Create a mock and start Mimic with Docker:
+### 1. Create a mock
+
+Save a request method and path, a status code, and a response body in `mocks/hello.json`.
 
 ```sh
 mkdir -p mocks
@@ -22,14 +24,54 @@ cat > mocks/hello.json <<'JSON'
   "response": {"message": "Hello from Mimic"}
 }
 JSON
+```
 
+Prefer YAML? Save the same mock as `mocks/hello.yaml` or `mocks/hello.yml`.
+
+```yaml
+method: GET
+path: /hello
+status: 200
+response:
+  message: Hello from Mimic
+```
+
+Use one file for `GET /hello`. You can mix JSON and YAML for different mocks in the same directory. Mimic reloads them when you save.
+
+### 2. Start Mimic and call the mock
+
+```sh
 docker run --rm -d --name mimic \
   -p 127.0.0.1:8080:8080 \
   -v "$(pwd)/mocks:/app/mocks:ro" \
   ragilhadi/mimic:latest
 ```
 
-Call the mock with `curl http://localhost:8080/hello`. Open the [local dashboard](http://localhost:8080/admin/dashboard) to inspect requests and loaded mocks. Stop the server with `docker stop mimic`.
+```sh
+curl http://localhost:8080/hello
+```
+
+```json
+{"message":"Hello from Mimic"}
+```
+
+Stop the server with `docker stop mimic`.
+
+## Features
+
+- **Match requests** by method, path parameters, query parameters, headers, or body.
+- **Test failure and recovery** with response delays, sequences, and switchable scenarios.
+- **Verify requests** through the admin API, including call counts and explanations for unmatched requests.
+- **Reuse API definitions** by importing OpenAPI specs or recording and replaying upstream responses.
+
+## Resource usage
+
+A single `docker stats --no-stream mimic` sample with the quick-start mock loaded and the server idle.
+
+```text
+NAME      CPU %     MEM USAGE / LIMIT
+mimic     0.00%     2.137MiB / 31.27GiB
+```
 
 ## Documentation
 
