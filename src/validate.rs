@@ -19,8 +19,8 @@
 //!   both `response` and `response_file`, a `response_file` that is missing,
 //!   oversized or outside the mocks root, a file that does not parse, a path
 //!   that cannot be requested, a route Mimic reserves for itself);
-//! - a **warning** means it is suspicious but legal (a duplicate route whose
-//!   tie the file name breaks, an uncompilable matcher regex, an unreachable
+//! - a **warning** means it is suspicious but legal (a duplicate route with identical
+//!   matchers and scenario tags, an uncompilable matcher regex, an unreachable
 //!   sequence step, a `{{…}}` expression Mimic renders as an empty string,
 //!   an activated tag no mock declares).
 //!
@@ -686,34 +686,43 @@ fn scan_text_for_template_problems(text: &str, context: &str, problems: &mut Vec
     }
 }
 
-/// Several files claiming one `METHOD:path` are legal — `find_matching_mock`
-/// breaks the tie. But the tie is broken by file name (the winner is
-/// whichever sorted first), so the loser deserves a line saying so, not a
-/// dashboard row with `hits: 0` and no explanation.
+/// Warn when a route repeats the same request matchers and scenario tags.
 fn check_duplicates(result: &LoadResult, findings: &mut Vec<Finding>) {
-    let mut buckets: Vec<(&String, &Vec<MockConfig>)> = result.mocks.iter().collect();
+    let mut buckets: Vec<_> = result.mocks.iter().collect();
     buckets.sort_by(|a, b| a.0.cmp(b.0));
 
     for (key, bucket) in buckets {
         if bucket.len() < 2 {
             continue;
         }
-        let winner = source_of(&bucket[0]);
-        let (method, path) = match key.split_once(':') {
-            Some((method, path)) => (method, path),
-            None => continue,
+        let Some((method, path)) = key.split_once(':') else {
+            continue;
         };
-        for mock in &bucket[1..] {
-            findings.push(Finding {
-                file: source_of(mock),
-                severity: Severity::Warning,
-                kind: "duplicate_route",
-                message: format!(
-                    "duplicate {} {} (also: {}) — ties are broken by file name, so \
-                     this copy only serves when the first one is inactive",
-                    method, path, winner
-                ),
-            });
+        let mut earlier = Vec::<(&MockConfig, HashSet<&str>)>::new();
+        for mock in bucket {
+            if mock.collection.is_some() || !mock.is_active(None) {
+                continue;
+            }
+            let tags: HashSet<_> = mock.tags.iter().map(String::as_str).collect();
+            if let Some((winner, _)) = earlier.iter().find(|(other, other_tags)| {
+                tags == *other_tags
+                    && mock.query_params == other.query_params
+                    && mock.headers == other.headers
+                    && mock.body == other.body
+            }) {
+                findings.push(Finding {
+                    file: source_of(mock),
+                    severity: Severity::Warning,
+                    kind: "duplicate_route",
+                    message: format!(
+                        "duplicate {} {} (also: {}) — identical request matchers and scenario tags; \
+                         the earlier mock wins the tie when both are enabled",
+                        method, path, source_of(winner)
+                    ),
+                });
+            } else {
+                earlier.push((mock, tags));
+            }
         }
     }
 }
@@ -1367,6 +1376,31 @@ mod tests {
             "{}",
             finding.message
         );
+    }
+
+    #[test]
+    fn overlapping_routes_warn_only_for_repeated_matchers_and_tags() {
+        let dir = mocks_dir(&[(
+            "variants.json",
+            br#"[
+                {"method":"GET","path":"/items","status":200},
+                {"method":"GET","path":"/items","status":200,"query_params":{"params":{"q":"a"}}},
+                {"method":"GET","path":"/items","status":200,"query_params":{"params":{"q":"b"}}},
+                {"method":"GET","path":"/items","status":200,"headers":{"required":{"x-mode":"a"}}},
+                {"method":"GET","path":"/items","status":200,"body":{"type":"empty"}},
+                {"method":"GET","path":"/items","status":200,"tags":["normal"]},
+                {"method":"GET","path":"/items","status":503,"tags":["down","retry"]},
+                {"method":"GET","path":"/items","status":429,"tags":["retry","down"],
+                 "disabled":true},
+                {"method":"GET","path":"/items","status":429,"tags":["retry","down","down"]}
+            ]"#,
+        )]);
+
+        let found = findings(&dir, None);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, "duplicate_route");
+        assert!(found[0].file.ends_with("variants.json#8"));
+        assert!(found[0].message.contains("variants.json#6"));
     }
 
     #[test]

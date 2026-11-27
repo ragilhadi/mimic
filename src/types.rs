@@ -29,7 +29,7 @@ pub fn is_sensitive_header(name: &str) -> bool {
 // ============================================================================
 
 /// Matcher for URL query parameters
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct QueryParamMatcher {
     /// Parameters that must match
     #[serde(default)]
@@ -41,7 +41,7 @@ pub struct QueryParamMatcher {
 }
 
 /// Value matcher for a single query parameter
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum QueryParamValue {
     /// Exact value match (simple string)
@@ -52,7 +52,7 @@ pub enum QueryParamValue {
 }
 
 /// Pattern matching options for query parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum QueryParamPattern {
     /// Regex pattern match
@@ -73,7 +73,7 @@ pub enum QueryParamPattern {
 // ============================================================================
 
 /// Matcher for HTTP headers
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct HeaderMatcher {
     /// Headers that must be present and match
     #[serde(default)]
@@ -89,7 +89,7 @@ pub struct HeaderMatcher {
 }
 
 /// Value matcher for a single header
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum HeaderValue {
     /// Exact value match (simple string)
@@ -100,7 +100,7 @@ pub enum HeaderValue {
 }
 
 /// Pattern matching options for headers
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum HeaderPattern {
     /// Regex pattern match
@@ -118,7 +118,7 @@ pub enum HeaderPattern {
 // ============================================================================
 
 /// Matcher for request body
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BodyMatcher {
     /// Match JSON body
@@ -138,7 +138,7 @@ pub enum BodyMatcher {
 }
 
 /// JSON body matcher with multiple strategies
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct JsonBodyMatcher {
     /// Exact JSON match (deep equality)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,7 +154,7 @@ pub struct JsonBodyMatcher {
 }
 
 /// Text body matcher
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TextBodyMatcher {
     /// Exact text match
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,7 +170,7 @@ pub struct TextBodyMatcher {
 }
 
 /// Form data matcher
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct FormBodyMatcher {
     /// Form fields that must match
     #[serde(default)]
@@ -793,7 +793,14 @@ pub fn is_valid_status(status: u16) -> bool {
 
 /// Create a lookup key from method and path (without query string)
 pub fn create_mock_key(method: &str, path: &str) -> String {
-    // Strip query string if present for the key
+    if crate::matcher::has_optional_final_segment(path) {
+        return format!("{}:{}", method.to_uppercase(), path);
+    }
+    create_request_key(method, path)
+}
+
+pub(crate) fn create_request_key(method: &str, path: &str) -> String {
+    // Strip query string if present for the key.
     let path_only = path.split('?').next().unwrap_or(path);
     format!("{}:{}", method.to_uppercase(), path_only)
 }
