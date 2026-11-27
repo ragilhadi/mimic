@@ -1,5 +1,4 @@
-//! Coarse micro-benchmarks backing the numbers in `ADVANCED_MATCHING.md`'s
-//! "Performance Notes". Excluded from the normal suite; reproduce with:
+//! Matcher micro-benchmarks. Run them explicitly with:
 //!
 //! ```text
 //! cargo test --release -- --ignored --nocapture

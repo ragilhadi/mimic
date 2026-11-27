@@ -160,10 +160,7 @@ Restart server: `docker compose restart mimic`
 
 ### Advanced Matching
 
-See [ADVANCED_MATCHING.md](ADVANCED_MATCHING.md) for:
-- Query parameter matching (exact, regex, any value)
-- Header matching (prefix, contains, regex)
-- Body matching (JSON, text, form)
+See the [Advanced Matching documentation](https://mimic.ragilhadi.com/matching/overview/) for query parameter, header, and request body matchers.
 
 ### Extending Agents
 
