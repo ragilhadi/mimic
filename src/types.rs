@@ -210,6 +210,43 @@ pub struct CollectionConfig {
     /// Rows the collection starts with. Copied on reset.
     #[serde(default)]
     pub seed: Vec<serde_json::Value>,
+    /// Optional validation and success response overrides for each operation.
+    #[serde(default, skip_serializing_if = "CollectionOperations::is_empty")]
+    pub operations: CollectionOperations,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectionOperations {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list: Option<CollectionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub get: Option<CollectionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create: Option<CollectionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace: Option<CollectionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<CollectionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete: Option<CollectionOperation>,
+}
+
+impl CollectionOperations {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionOperation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<serde_json::Value>,
 }
 
 fn default_id_field() -> String {

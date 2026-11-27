@@ -73,12 +73,14 @@ impl CollectionState {
                 return id;
             }
         }
-        let next = self
-            .next_id
-            .as_u64()
-            .unwrap_or(0)
-            .checked_add(1)
-            .unwrap_or(1);
+        let mut next = self.next_id.as_u64().unwrap_or(0).wrapping_add(1).max(1);
+        while self
+            .rows
+            .iter()
+            .any(|row| row_id_matches(row, &config.id_field, &next.to_string()))
+        {
+            next = next.wrapping_add(1).max(1);
+        }
         self.next_id = serde_json::Number::from(next);
         let assigned = Value::Number(serde_json::Number::from(next));
         row.as_object_mut()
@@ -125,7 +127,7 @@ pub async fn answer_collection(
     body: Option<&[u8]>,
 ) -> Option<CollectionResponse> {
     let base = config.path.trim_end_matches('/');
-    let rest = path.strip_prefix(base)?;
+    let rest = path.trim_end_matches('/').strip_prefix(base)?;
     // The path is either the base itself (`/users`), or `<base>/<id>`.
     // Anything deeper (`/users/1/posts`) is none of the collection's business.
     let id_part = match rest {
@@ -136,7 +138,7 @@ pub async fn answer_collection(
             if id.is_empty() || id.contains('/') {
                 return None;
             }
-            Some(id.to_string())
+            Some(urlencoding::decode(id).ok()?.into_owned())
         }
     };
 
@@ -159,7 +161,16 @@ pub async fn answer_collection(
 
     let state = rows.get_mut(&config.name)?;
 
-    match (method.as_str(), id_part.as_deref()) {
+    let operation = match (method.as_str(), id_part.is_some()) {
+        ("GET", false) => config.operations.list.as_ref(),
+        ("GET", true) => config.operations.get.as_ref(),
+        ("POST", false) => config.operations.create.as_ref(),
+        ("PUT", true) => config.operations.replace.as_ref(),
+        ("PATCH", true) => config.operations.patch.as_ref(),
+        ("DELETE", true) => config.operations.delete.as_ref(),
+        _ => None,
+    };
+    let response = match (method.as_str(), id_part.as_deref()) {
         // GET list
         ("GET", None) => Some(CollectionResponse {
             status: 200,
@@ -169,39 +180,29 @@ pub async fn answer_collection(
 
         // POST create
         ("POST", None) => {
-            let mut new_row: Value = match body {
-                Some(bytes) if !bytes.is_empty() => match serde_json::from_slice(bytes) {
-                    Ok(value @ Value::Object(_)) => value,
-                    Ok(_) => {
-                        return Some(CollectionResponse {
-                            status: 400,
-                            body: json!({
-                                "error": "invalid request",
-                                "detail": "the body must be a JSON object",
-                            }),
-                            location: None,
-                        });
-                    }
-                    Err(e) => {
-                        return Some(CollectionResponse {
-                            status: 400,
-                            body: json!({
-                                "error": "invalid request",
-                                "detail": e.to_string(),
-                            }),
-                            location: None,
-                        });
-                    }
-                },
-                _ => json!({}),
+            let mut new_row = match parse_row(body, operation) {
+                Ok(row) => row,
+                Err(response) => return Some(response),
             };
+            if let Some(id) = new_row.get(&config.id_field).filter(|id| !id.is_null()) {
+                if !id.is_number() && !id.as_str().is_some_and(|id| !id.is_empty()) {
+                    return Some(collection_error(
+                        400,
+                        "id must be a non-empty string or a number",
+                    ));
+                }
+                let requested = id_text(id);
+                if state
+                    .rows
+                    .iter()
+                    .any(|row| row_id_matches(row, &config.id_field, &requested))
+                {
+                    return Some(collection_error(409, "id already exists"));
+                }
+            }
             let id = state.assign_id(&mut new_row, config);
             state.rows.push(new_row.clone());
-            let id_string = match &id {
-                Value::Number(number) => number.to_string(),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
+            let id_string = urlencoding::encode(&id_text(&id)).into_owned();
             Some(CollectionResponse {
                 status: 201,
                 body: new_row,
@@ -223,81 +224,39 @@ pub async fn answer_collection(
 
         // PUT/PATCH replace-merge
         ("PUT" | "PATCH", Some(id)) => {
-            let mut incoming: Value = match body {
-                Some(bytes) if !bytes.is_empty() => match serde_json::from_slice(bytes) {
-                    Ok(value @ Value::Object(_)) => value,
-                    Ok(_) => {
-                        return Some(CollectionResponse {
-                            status: 400,
-                            body: json!({
-                                "error": "invalid request",
-                                "detail": "the body must be a JSON object",
-                            }),
-                            location: None,
-                        });
-                    }
-                    Err(e) => {
-                        return Some(CollectionResponse {
-                            status: 400,
-                            body: json!({
-                                "error": "invalid request",
-                                "detail": e.to_string(),
-                            }),
-                            location: None,
-                        });
-                    }
-                },
-                _ => json!({}),
-            };
-            let position = state
+            let Some(position) = state
                 .rows
                 .iter()
-                .position(|row| row_id_matches(row, &config.id_field, id))?;
-            match method.as_str() {
-                // PUT replaces everything but the id itself
-                "PUT" => {
-                    if let Some(object) = incoming.as_object_mut() {
-                        let id_value = state.rows[position].get(&config.id_field).cloned();
-                        if !object.contains_key(&config.id_field) {
-                            object.insert(config.id_field.clone(), id_value.unwrap_or(Value::Null));
-                        } else {
-                            // A row that claims a *different* id is refused:
-                            // PUT /users/12 with id 14 is not a legal move.
-                            let claimed =
-                                object.get(&config.id_field).cloned().unwrap_or(Value::Null);
-                            let existing = state.rows[position]
-                                .get(&config.id_field)
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            if claimed != existing {
-                                return Some(CollectionResponse {
-                                    status: 409,
-                                    body: json!({
-                                        "error": "id mismatch",
-                                        "detail": format!(
-                                            "PUT cannot change the id from {} to {}",
-                                            existing, claimed
-                                        ),
-                                    }),
-                                    location: None,
-                                });
-                            }
-                        }
-                    }
-                    state.rows[position] = incoming;
-                }
-                // PATCH merges fields onto the existing row
-                "PATCH" => {
-                    if let (Some(existing_object), Some(patch_object)) = (
-                        state.rows[position].as_object_mut(),
-                        incoming.as_object_mut(),
-                    ) {
-                        for (key, value) in patch_object {
-                            existing_object.insert(key.clone(), value.clone());
-                        }
-                    }
-                }
-                _ => unreachable!("method matched PUT|PATCH"),
+                .position(|row| row_id_matches(row, &config.id_field, id))
+            else {
+                return Some(not_found());
+            };
+            let mut incoming = match parse_row(body, operation) {
+                Ok(row) => row,
+                Err(response) => return Some(response),
+            };
+            let existing_id = state.rows[position]
+                .get(&config.id_field)
+                .cloned()
+                .unwrap_or(Value::Null);
+            if incoming
+                .get(&config.id_field)
+                .is_some_and(|claimed| claimed != &existing_id)
+            {
+                return Some(CollectionResponse {
+                    status: 409,
+                    body: json!({"error": "id mismatch", "detail": "cannot change the resource id"}),
+                    location: None,
+                });
+            }
+            if method == "PUT" {
+                incoming[&config.id_field] = existing_id;
+                state.rows[position] = incoming;
+            } else if let (Some(existing), Some(patch)) = (
+                state.rows[position].as_object_mut(),
+                incoming.as_object_mut(),
+            ) {
+                existing.append(patch);
             }
             Some(CollectionResponse {
                 status: 200,
@@ -308,10 +267,13 @@ pub async fn answer_collection(
 
         // DELETE
         ("DELETE", Some(id)) => {
-            let position = state
+            let Some(position) = state
                 .rows
                 .iter()
-                .position(|row| row_id_matches(row, &config.id_field, id))?;
+                .position(|row| row_id_matches(row, &config.id_field, id))
+            else {
+                return Some(not_found());
+            };
             state.rows.remove(position);
             Some(CollectionResponse {
                 status: 204,
@@ -338,26 +300,62 @@ pub async fn answer_collection(
                 location: None,
             })
         }
+    };
+    response.map(|mut response| {
+        if (200..300).contains(&response.status) {
+            if let Some(operation) = operation {
+                response.status = operation.status.unwrap_or(response.status);
+                if let Some(body) = &operation.response {
+                    response.body = body.clone();
+                }
+            }
+        }
+        response
+    })
+}
+
+fn parse_row(
+    body: Option<&[u8]>,
+    operation: Option<&crate::types::CollectionOperation>,
+) -> Result<Value, CollectionResponse> {
+    let value = match body.filter(|body| !body.is_empty()) {
+        Some(body) => serde_json::from_slice(body)
+            .map_err(|error| collection_error(400, &error.to_string()))?,
+        None => json!({}),
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| collection_error(400, "the body must be a JSON object"))?;
+    if let Some(operation) = operation {
+        for field in &operation.required_fields {
+            if !object.contains_key(field) {
+                return Err(collection_error(
+                    400,
+                    &format!("missing required field: {field}"),
+                ));
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn collection_error(status: u16, detail: &str) -> CollectionResponse {
+    CollectionResponse {
+        status,
+        body: json!({"error": "invalid request", "detail": detail}),
+        location: None,
     }
 }
 
-/// Whether `row[config.id_field]` names the same id as the path segment.
-///
-/// Compare the *string* form: `42` and `"42"` are the same resource, and a
-/// percent-decoded segment arrives as text.
+fn id_text(id: &Value) -> String {
+    match id {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn row_id_matches(row: &Value, id_field: &str, requested: &str) -> bool {
-    row.get(id_field)
-        .map(|value| match value {
-            Value::String(s) => s.as_str() == requested,
-            Value::Number(number) => number.to_string() == requested,
-            // `true`/`false`/`null` ids would compare by their JSON text;
-            // clippy's `other == requested` is type-false for those, so the
-            // owned form stays — the exotic branch never runs for the ids
-            // collections actually mint (numbers, strings).
-            #[allow(clippy::cmp_owned)]
-            other => other.to_string() == requested,
-        })
-        .unwrap_or(false)
+    row.get(id_field).is_some_and(|id| id_text(id) == requested)
 }
 
 /// Return every live collection to its seed. Returns how many collections

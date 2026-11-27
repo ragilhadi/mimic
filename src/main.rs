@@ -196,11 +196,6 @@ async fn run_server() {
     let redaction = handler::BodyRedaction::from_env();
     let admin_token = handler::configured_admin_token();
 
-    // Runtime mock management (#153) write routes: `MIMIC_ADMIN_READONLY`
-    // locks them off for deployments that want the dashboard without
-    // mutation. Read at startup like every other knob.
-    let admin_readonly = handler::configured_admin_readonly();
-
     info!("Configuration:");
     info!(
         "  Mocks directory: {} ({})",
@@ -302,7 +297,6 @@ async fn run_server() {
         .with_reserved(reserved)
         .with_redaction(redaction)
         .with_admin_token(admin_token)
-        .with_admin_readonly(admin_readonly)
         .with_mocks_dir(mocks_dir.path.clone())
         .with_proxy_config(proxy_config);
 
@@ -683,11 +677,28 @@ pub fn apply_reload(
     runtime: &HashMap<String, types::MockConfig>,
 ) -> HashMap<String, Vec<types::MockConfig>> {
     let mut merged = reload_file_layer(current, result);
-    // Runtime layer on top: one bucket entry per runtime mock, keyed by its
-    // own declared key. A runtime mock whose file-layer twin exists (the
-    // operator hand-wrote the same route) coexists — the two compete on
-    // score like any same-path mocks, and a runtime mock created to
-    // *override* a file mock outranks it via `disabled`/matchers as usual.
+    // A persisted runtime mock also appears in the file scan. Keep one
+    // live entry, and ignore a scan result whose backing file was deleted
+    // while the scan was running.
+    merged.retain(|_, bucket| {
+        bucket.retain(|mock| {
+            let Some(path) = mock.source.as_deref().map(std::path::Path::new) else {
+                return true;
+            };
+            let Some(id) = path.file_stem().and_then(|id| id.to_str()) else {
+                return true;
+            };
+            if path.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new(loader::RUNTIME_DIR))
+                && path.extension() == Some(std::ffi::OsStr::new("json"))
+                && handler::is_runtime_id_shaped(id)
+            {
+                return !runtime.contains_key(id) && path.exists();
+            }
+            true
+        });
+        !bucket.is_empty()
+    });
     for mock in runtime.values() {
         let key = types::create_mock_key(&mock.method, &mock.path);
         merged.entry(key).or_default().push(mock.clone());
@@ -811,28 +822,6 @@ fn create_router(state: AppState) -> Router {
             )
             .route(&at("/reset"), post(reset_all).fallback(handle_request))
             .route(&at("/reload"), post(force_reload).fallback(handle_request))
-            // Runtime mock management (#153): create/update/delete/toggle a
-            // mock without touching the filesystem.
-            .route(
-                &at("/mocks"),
-                get(list_mocks)
-                    .post(create_runtime_mock)
-                    .fallback(handle_request),
-            )
-            .route(
-                &at("/mocks/{id}"),
-                put(update_runtime_mock)
-                    .delete(delete_runtime_mock)
-                    .fallback(handle_request),
-            )
-            .route(
-                &at("/mocks/{id}/disable"),
-                post(disable_runtime_mock).fallback(handle_request),
-            )
-            .route(
-                &at("/mocks/{id}/enable"),
-                post(enable_runtime_mock).fallback(handle_request),
-            )
             .route(
                 &at("/sequences"),
                 get(list_sequences).fallback(handle_request),
@@ -848,6 +837,30 @@ fn create_router(state: AppState) -> Router {
                     .post(set_scenario)
                     .fallback(handle_request),
             );
+        let mocks = get(list_mocks);
+        if reserved.admin_readonly {
+            router = router.route(&at("/mocks"), mocks.fallback(handle_request));
+        } else {
+            router = router
+                .route(
+                    &at("/mocks"),
+                    mocks.post(create_runtime_mock).fallback(handle_request),
+                )
+                .route(
+                    &at("/mocks/{id}"),
+                    put(update_runtime_mock)
+                        .delete(delete_runtime_mock)
+                        .fallback(handle_request),
+                )
+                .route(
+                    &at("/mocks/{id}/disable"),
+                    post(disable_runtime_mock).fallback(handle_request),
+                )
+                .route(
+                    &at("/mocks/{id}/enable"),
+                    post(enable_runtime_mock).fallback(handle_request),
+                );
+        }
     }
 
     let app = router
@@ -1174,6 +1187,7 @@ mod tests {
             handler::ReservedRoutes {
                 health: None,
                 admin_prefix: Some("/admin".to_string()),
+                admin_readonly: false,
             },
         );
         let (status, body) = call(create_router(state), "GET", "/health").await;
@@ -1189,6 +1203,7 @@ mod tests {
             handler::ReservedRoutes {
                 health: Some("/health".to_string()),
                 admin_prefix: Some("/_mimic".to_string()),
+                admin_readonly: false,
             },
         );
         let app = create_router(state.clone());
@@ -1210,6 +1225,7 @@ mod tests {
         let state = state_serving(vec![]).with_reserved(handler::ReservedRoutes {
             health: Some("/health".to_string()),
             admin_prefix: None,
+            admin_readonly: false,
         });
         let (status, body) = call(create_router(state), "GET", "/admin/requests").await;
 
@@ -1378,6 +1394,7 @@ mod tests {
         let freed = handler::ReservedRoutes {
             health: None,
             admin_prefix: None,
+            admin_readonly: false,
         };
 
         assert!(shadowed_mocks(&store, &freed).is_empty());

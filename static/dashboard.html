@@ -173,6 +173,7 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
       <div class="stat"><div class="stat-label">Loaded</div><div class="stat-value" id="stat-mocks">0</div></div>
       <div class="stat"><div class="stat-label">Total hits</div><div class="stat-value" id="stat-hits">0</div></div>
     </div>
+    <p id="mock-action-error" role="alert" hidden></p>
     <div id="mocks-container"></div>
   </section>
 
@@ -330,6 +331,8 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
   var pendingTotal = 0;
   var lastRecords = [];
   var mocksCache = [];
+  var runtimeWritesEnabled = false;
+  var pendingMockActions = new Set();
   // How many of the most recent matching requests to fetch. Grows via "Load
   // older requests" rather than jumping straight to everything (#111) — a
   // filter change resets it back to the default.
@@ -810,18 +813,30 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
       var source = m.source ? '<span class="mono">'+escapeHtml(m.source)+'</span>' : dash();
       html += '<tbody data-mock="'+i+'"><tr>'
         + '<td><span class="'+methodClass(m.method)+'">'+escapeHtml(m.method)+'</span></td>'
-        + '<td class="path-cell">'+escapeHtml(m.path)+tagBadges(m)+unreachableBadge(m)+'</td>'
+        + '<td class="path-cell">'+escapeHtml(m.path)+(m.disabled ? ' <span class="badge">disabled</span>' : tagBadges(m))+unreachableBadge(m)+'</td>'
         + '<td><span class="status '+statusClass(m.status)+'">'+m.status+'</span></td>'
         + '<td>'+matcherBadges(m)+'</td>'
         + '<td>'+escapeHtml(delay)+'</td>'
         + '<td>'+escapeHtml(seq)+'</td>'
         + '<td>'+(m.hits||0)+'</td>'
         + '<td>'+source+'</td>'
-        + '<td><button class="details-toggle" data-mock-toggle="'+i+'">Config</button></td>'
+        + '<td><button class="details-toggle" data-mock-toggle="'+i+'">Config</button>'
+        + (runtimeWritesEnabled && m.id
+          ? ' <button class="details-toggle" data-mock-action="'+i+'"'
+            + (pendingMockActions.has(m.id) ? ' disabled' : '') + '>'
+            + (m.disabled ? 'Enable' : 'Disable') + '</button>'
+          : '') + '</td>'
         + '</tr></tbody>';
     });
     html += '</table>';
     container.innerHTML = html;
+
+    container.querySelectorAll('button[data-mock-action]').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var mock = list[Number(btn.dataset.mockAction)];
+        toggleRuntimeMock(mock);
+      });
+    });
 
     container.querySelectorAll('button[data-mock-toggle]').forEach(function(btn){
       btn.addEventListener('click', function(){
@@ -840,10 +855,39 @@ tbody td{padding:.55rem 1rem;font-size:.83rem;vertical-align:top}
     });
   }
 
+  function toggleRuntimeMock(mock){
+    if(pendingMockActions.has(mock.id)) return;
+    var error = qs('mock-action-error');
+    error.hidden = true;
+    pendingMockActions.add(mock.id);
+    renderMocks();
+    var action = mock.disabled ? 'enable' : 'disable';
+    authFetch(API_MOCKS + '/' + encodeURIComponent(mock.id) + '/' + action, {method:'POST'})
+      .then(function(response){
+        if(!response.ok) throw new Error('HTTP ' + response.status);
+        mocksCache.forEach(function(entry){
+          if(entry.id === mock.id) entry.disabled = action === 'disable';
+        });
+        return fetchMocks();
+      })
+      .catch(function(err){
+        error.textContent = 'Could not ' + action + ' ' + mock.path + ' (' + err.message + ').';
+        error.hidden = false;
+      })
+      .finally(function(){
+        pendingMockActions.delete(mock.id);
+        renderMocks();
+      });
+  }
+
   function fetchMocks(){
     return authFetch(API_MOCKS)
       .then(function(r){ return r.json(); })
-      .then(function(data){ mocksCache = data.mocks || []; renderMocks(); })
+      .then(function(data){
+        mocksCache = data.mocks || [];
+        runtimeWritesEnabled = data.runtime_writes_enabled === true;
+        renderMocks();
+      })
       .catch(function(err){ console.error('Failed to fetch mocks:', err); });
   }
 

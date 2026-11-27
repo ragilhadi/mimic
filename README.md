@@ -153,6 +153,9 @@ MIMIC_ADMIN_PREFIX=/admin
 # Switch the admin API off entirely (default: false)
 MIMIC_DISABLE_ADMIN=false
 
+# Omit the runtime mock write endpoints (default: false)
+MIMIC_ADMIN_READONLY=false
+
 # Bearer token the admin API requires (default: unset = no authentication)
 MIMIC_ADMIN_TOKEN=
 
@@ -2348,6 +2351,63 @@ included — visible in `/admin/requests` and in each HAR entry's `time`.
 
 All four endpoints are ordinary admin routes: `MIMIC_ADMIN_PREFIX` moves them,
 `MIMIC_DISABLE_ADMIN` removes them, and `MIMIC_ADMIN_TOKEN` guards them.
+
+### Runtime mock management
+
+Create a mock immediately with the admin API:
+
+```sh
+curl -X POST localhost:8080/admin/mocks \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"GET","path":"/ready","status":200,"response":{"ready":true}}'
+```
+
+`POST /admin/mocks` returns the runtime mock's `id`, also shown by
+`GET /admin/mocks`. Use `PUT /admin/mocks/{id}` with a full replacement config,
+`DELETE /admin/mocks/{id}` to remove it, or
+`POST /admin/mocks/{id}/disable` and `POST /admin/mocks/{id}/enable` to toggle it.
+The dashboard's **Mocks** tab also exposes the toggles for runtime mocks.
+
+Runtime mocks survive hot reload. Add `?persist=true` on creation to write the
+mock under `mocks/_runtime/`. Edits and toggles update the file, and deleting
+the mock removes it. After restart, the file is loaded as a file-backed mock
+and can be edited on disk. Relative response fixtures submitted through the
+API resolve from the mocks root. A directory is needed for persistence.
+
+`MIMIC_ADMIN_TOKEN` protects these API calls. Set `MIMIC_ADMIN_READONLY=true`
+to omit the runtime mock write routes and dashboard toggles. Set
+`MIMIC_DISABLE_ADMIN=true` to remove the entire admin API.
+
+### Stateful CRUD collections
+
+This mock file declares an in-memory collection at `/users`:
+
+```json
+{
+  "method": "GET",
+  "path": "/users",
+  "collection": {
+    "name": "users",
+    "path": "/users",
+    "id_field": "id",
+    "seed": [{"id": 1, "name": "Ada"}],
+    "operations": {
+      "create": {"required_fields": ["name"], "status": 201}
+    }
+  }
+}
+```
+
+A collection serves list and create at its base path and get, replace, patch,
+and delete at `/{id}`. Create assigns an ID when omitted and returns `201`
+with a `Location` header. A missing row returns `404`. Delete defaults to
+`204`. Collection names should be unique. Rows survive hot reload and
+`POST /admin/reset` restores the seed.
+
+The optional `operations` keys are `list`, `get`, `create`, `replace`, `patch`,
+and `delete`. Each can set a success `status` in the 2xx range and a fixed JSON
+`response`. The three body-writing operations can also require fields by
+name. A missing required field returns `400` before changing the collection.
 
 ### Other behaviour
 
