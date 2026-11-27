@@ -4,13 +4,15 @@
 [![Docker](https://img.shields.io/docker/v/ragilhadi/mimic?label=docker)](https://hub.docker.com/r/ragilhadi/mimic)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Mimic is a lightweight HTTP mock server for development and testing. Define responses in JSON or YAML and edit them while the server is running.
+Mimic is a lightweight HTTP mock server for local development and integration tests. Define responses in JSON or YAML and edit them while the server is running. Match on paths, query parameters, headers, or request bodies. Use response sequences to test retries, switch scenarios to simulate errors, and inspect requests in the dashboard.
+
+In a Docker Compose review of v1.24.0, the main server used about **6 MiB of RAM** and the proxy instance used about **3.4 MiB**. An earlier idle Docker run sampled **0.02% CPU**. These are point-in-time measurements from separate runs.
 
 **[Read the documentation](https://mimic.ragilhadi.com/)**
 
 ## Quick start
 
-Create a mock and start Mimic with Docker:
+Create `mocks/hello.json` with a request method and path, a status code, and a response body. Then start Mimic with Docker.
 
 ```sh
 mkdir -p mocks
@@ -30,6 +32,18 @@ docker run --rm -d --name mimic \
 ```
 
 Call the mock with `curl http://localhost:8080/hello`. Open the [local dashboard](http://localhost:8080/admin/dashboard) to inspect requests and loaded mocks. Stop the server with `docker stop mimic`.
+
+You can also define the same mock in `mocks/hello.yaml` or `mocks/hello.yml`.
+
+```yaml
+method: GET
+path: /hello
+status: 200
+response:
+  message: Hello from Mimic
+```
+
+Use one file for `GET /hello`. You can mix JSON and YAML for different mocks in the same directory. Mimic reloads them when you save.
 
 ## Documentation
 
